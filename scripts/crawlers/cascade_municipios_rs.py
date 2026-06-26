@@ -652,6 +652,12 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
 
     candidates = []
     seen: set[str] = set()
+    host_base = host.lower().lstrip("www.")
+
+    def _host_ok(h: str) -> bool:
+        h = h.lower().lstrip("www.")
+        return h == host_base or h.endswith("." + host_base)
+
     for ch in chunks:
         uri = (ch.get("web", {}) or {}).get("uri", "") if isinstance(ch, dict) else ""
         if not uri:
@@ -663,7 +669,7 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
             real = clean_url(uri)
         if real and real not in seen:
             h = urlparse(real).netloc.lower()
-            if not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(real):
+            if _host_ok(h) and not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(real):
                 seen.add(real)
                 candidates.append(Candidate(url=real, source="directed_grounding"))
 
@@ -671,7 +677,7 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
         url = clean_url(raw.rstrip(".,;:"))
         if url and url not in seen:
             h = urlparse(url).netloc.lower()
-            if not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(url):
+            if _host_ok(h) and not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(url):
                 seen.add(url)
                 candidates.append(Candidate(url=url, source="directed_grounding"))
 
@@ -743,9 +749,12 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         "- Queremos pagina INDICE/LISTAGEM, NAO edital individual, PDF ou noticia.\n"
         "- Prefira o INDICE CANONICO: a listagem mais ampla e estavel. Entre uma\n"
         "  vista de TODOS os anos e uma filtrada por um ano so, escolha a de todos\n"
-        "  os anos. Entre a raiz da listagem e uma sub-vista filtrada, escolha a raiz.\n"
+        "  os anos.\n"
         "- Se existem paginas SEPARADAS para concursos e para PSS, use a especifica\n"
         "  de cada bucket; so use uma pagina combinada se nao houver separadas.\n"
+        "- Uma pagina de CATEGORIA especifica (ex: /concurso/categoria/25/concurso)\n"
+        "  e MELHOR que a pagina raiz generica (/concurso) porque filtra exatamente\n"
+        "  o tipo desejado, mesmo que tenha menos itens.\n"
         "- Se duas sao parecidas, escolha a mais completa e atualizada.\n"
         "- Rejeite licitacao/pregao/compras e concurso cultural (soberanas/rainhas).\n"
         "- Se nenhuma serve, deixe vazio. NAO invente URLs.\n\n"
@@ -1169,11 +1178,7 @@ def process_municipio(session: requests.Session, municipio: str,
                     picked = tier3_classify_and_pick(
                         session, model, municipio, fetchable_d, timeout,
                     )
-                    if picked.get(bucket_key):
-                        chosen[bucket_key] = picked[bucket_key]
-                        bucket_tier[bucket_key] = "t2dir"
-                        if picked.get("razao"):
-                            razones.append(f"[t2dir] {picked['razao']}")
+                    _record(picked, "t2dir")
                 tiers_used.append("t2dir")
             except Exception as e:
                 print(f"    Directed grounding error: {e}", flush=True)
