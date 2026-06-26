@@ -44,6 +44,33 @@ Golden-set evaluation:
 python scripts/eval/medir_golden_set.py --golden authority_first/data/golden_set_v1.csv --pipeline <output.csv> --detalle
 ```
 
+## Local Runs (scraping from Brazil)
+
+Many `*.rs.gov.br` sites geo-block non-Brazil traffic (and use Cloudflare / 429),
+so the heavy fase 2 scraping is run from a **local environment in Brazil**, while
+code edits and commits happen in the main (web) conversation. Full guide:
+`authority_first/docs/RUNBOOK_corridas_locales.md`. Non-negotiable rules:
+
+- **Always run on the corrected code.** Before any local run: `git fetch && git pull`
+  the working branch. Code changes are made and committed from the main conversation,
+  never diverged locally.
+- **Accumulate, don't re-run.** The fase 2 output CSV is cumulative. Run by letters
+  with `--append`, and add `--skip-existing` from the second batch on so already
+  *confirmed* municipalities are not re-scraped or re-sent to Gemini (saves cost).
+  Municipalities left `sin resultado`/`revisar` are still retried.
+- **Bring back three blocks** after each local run (paste into the main conversation):
+  the console `Summary`, the golden-set evaluator output, and a `sin resultado/revisar`
+  diagnosis labeling each as network block (403/429/SSL/Cloudflare/geo) vs real miss.
+
+```bash
+# first batch
+python scripts/fase2_municipios/cascade_municipios_rs.py --all --letras ab --append \
+  --output data/fase2/municipios_rs.csv
+# later batches (skip already-confirmed, keep appending)
+python scripts/fase2_municipios/cascade_municipios_rs.py --all --letras cd --append \
+  --skip-existing --output data/fase2/municipios_rs.csv
+```
+
 ## Current Phase: Municipality Resource Discovery
 
 The current focus is **finding the stable index/listing page** for concursos and processos seletivos in each RS municipality. This phase does NOT extract individual editals, PDFs, or event details — that is a later phase.

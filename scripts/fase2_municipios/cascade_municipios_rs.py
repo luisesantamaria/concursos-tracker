@@ -1625,6 +1625,12 @@ def main() -> int:
                         help="Merge into the existing output CSV instead of "
                              "overwriting it (rows for the same municipality are "
                              "replaced; new ones are appended)")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip municipalities already settled in the output "
+                             "CSV (at least one confirmed bucket) so they are not "
+                             "re-scraped or re-sent to Gemini. Municipalities that "
+                             "were 'sin resultado' or 'revisar' ARE re-processed, "
+                             "so a code fix gets another shot. Combine with --append.")
     args = parser.parse_args()
 
     session = make_session()
@@ -1639,6 +1645,20 @@ def main() -> int:
     if args.letras:
         wanted = {c for c in norm(args.letras) if c.isalnum()}
         municipios = [m for m in municipios if norm(m)[:1] in wanted]
+
+    if args.skip_existing:
+        existing = _read_existing_rows(args.output)
+        settled = {
+            key for key, row in existing.items()
+            if row.get("confianza_concursos") == "confirmado"
+            or row.get("confianza_processos") == "confirmado"
+        }
+        before = len(municipios)
+        municipios = [m for m in municipios if norm(m) not in settled]
+        skipped = before - len(municipios)
+        if skipped:
+            print(f"Skipping {skipped} already-confirmed municipalities "
+                  f"(--skip-existing); re-processing {len(municipios)}", flush=True)
 
     if args.limit > 0:
         municipios = municipios[:args.limit]
@@ -1718,7 +1738,8 @@ def main() -> int:
         print(f"  Verified: {confirmed}/{len(verdicts)} upgraded to confirmado",
               flush=True)
 
-    write_results(results, args.output, append=args.append)
+    # --skip-existing implies append: the skipped rows must be preserved.
+    write_results(results, args.output, append=args.append or args.skip_existing)
 
     # --- Summary ---
     found_c = sum(1 for r in results if r.url_concursos)
