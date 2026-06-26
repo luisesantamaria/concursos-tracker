@@ -368,23 +368,27 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
             c.fetchable = False
 
     # Drill-down: a bucket parent page (e.g. /concurso) often links to more
-    # specific sub-indexes (e.g. /concurso/categoria/25/concurso). Harvest those
-    # so Tier 3 can prefer the canonical bucket page over the parent. General:
-    # we only follow links that match bucket keywords and live deeper on the
-    # same host -- no portal-specific routes.
+    # specific sub-indexes (e.g. /concurso/categoria/25/concurso). Also follows
+    # same-level siblings (same path depth, different leaf) so that a concursos
+    # page can lead to the processos page beside it.
     drill: list[Candidate] = []
     for c in [c for c in candidates if c.fetchable and c.page]:
         parent_path = urlparse(c.url).path.rstrip("/")
         parent_host = urlparse(c.url).netloc.lower()
+        parent_parent = "/".join(parent_path.split("/")[:-1]) if "/" in parent_path.lstrip("/") else ""
         for href, link_text in c.page.links:
-            if href in seen_urls or len(drill) >= 8:
+            if href in seen_urls or len(drill) >= 12:
                 continue
             pu = urlparse(href)
             if pu.netloc.lower() != parent_host:
                 continue
             child_path = pu.path.rstrip("/")
-            # Must be strictly deeper than the parent and match a bucket keyword.
-            if not child_path.startswith(parent_path + "/"):
+            is_child = child_path.startswith(parent_path + "/")
+            is_sibling = (parent_parent
+                          and child_path.startswith(parent_parent + "/")
+                          and child_path != parent_path
+                          and child_path.count("/") == parent_path.count("/"))
+            if not is_child and not is_sibling:
                 continue
             if is_pdf_or_file(href) or is_broad_landing(href):
                 continue
@@ -405,6 +409,28 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
         else:
             c.fetchable = False
     candidates.extend(drill)
+
+    # Parameter normalization: if a candidate has ano=YYYY, add ano=0 variant
+    # (all years) so Tier 3 can pick the canonical unfiltered view.
+    param_variants: list[Candidate] = []
+    for c in [c for c in candidates if c.fetchable]:
+        if "ano=" in c.url and not re.search(r"[?&]ano=0(?:&|$)", c.url):
+            variant_url = re.sub(r"([?&]ano=)\d{4}", r"\g<1>0", c.url)
+            if variant_url not in seen_urls:
+                seen_urls.add(variant_url)
+                param_variants.append(Candidate(
+                    url=variant_url, source="param_variant",
+                    menu_text=f"{c.menu_text} (all years)",
+                ))
+    for c in param_variants:
+        page = fetch_page(session, c.url, min(timeout, 10))
+        if page.ok and not is_soft_404(page):
+            c.page = page
+            c.content_preview = page.text[:1200]
+            c.fetchable = True
+        else:
+            c.fetchable = False
+    candidates.extend(param_variants)
 
     return candidates
 
@@ -591,6 +617,79 @@ def tier2_find_site_grounded(session: requests.Session, model: str,
         migrated = _check_migration(session, best, timeout)
         return migrated or best
     return None
+
+
+def tier2_directed_bucket_search(session: requests.Session, model: str,
+                                 municipio: str, host: str,
+                                 bucket_name: str,
+                                 timeout: int = 15) -> list[Candidate]:
+    """Targeted grounding search for a specific missing bucket on a known host."""
+    prompt = (
+        f"Encontre a pagina INDICE/LISTAGEM de {bucket_name} da Prefeitura de "
+        f"{municipio} ({UF_NOME}, {UF_SIGLA}, Brasil).\n"
+        f"Busque: {bucket_name} site:{host}\n"
+        "Queremos a pagina que LISTA VARIOS editais/processos, "
+        "NAO um edital individual nem PDF.\n"
+        "Liste as URLs encontradas."
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
+    }
+    try:
+        data = gemini_post(session, model, payload, timeout=90)
+    except Exception as e:
+        print(f"      directed search error: {e}", flush=True)
+        return []
+
+    cand = (data.get("candidates") or [{}])[0]
+    text_response = "\n".join(
+        p.get("text", "") for p in (cand.get("content", {}) or {}).get("parts", [])
+        if isinstance(p, dict)
+    )
+    chunks = (cand.get("groundingMetadata", {}) or {}).get("groundingChunks", []) or []
+
+    candidates = []
+    seen: set[str] = set()
+    for ch in chunks:
+        uri = (ch.get("web", {}) or {}).get("uri", "") if isinstance(ch, dict) else ""
+        if not uri:
+            continue
+        try:
+            real = session.get(uri, allow_redirects=True, timeout=timeout).url
+            real = clean_url(real)
+        except Exception:
+            real = clean_url(uri)
+        if real and real not in seen:
+            h = urlparse(real).netloc.lower()
+            if not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(real):
+                seen.add(real)
+                candidates.append(Candidate(url=real, source="directed_grounding"))
+
+    for raw in re.findall(r"https?://[^\s\]\)\"'<>]+", text_response or ""):
+        url = clean_url(raw.rstrip(".,;:"))
+        if url and url not in seen:
+            h = urlparse(url).netloc.lower()
+            if not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(url):
+                seen.add(url)
+                candidates.append(Candidate(url=url, source="directed_grounding"))
+
+    print(f"      directed: {len(candidates)} candidates for {bucket_name}", flush=True)
+
+    for c in candidates:
+        if is_broad_landing(c.url):
+            c.fetchable = False
+            continue
+        page = fetch_page(session, c.url, timeout)
+        if page.ok and not is_soft_404(page):
+            c.page = page
+            c.content_preview = page.text[:1200]
+            c.fetchable = True
+        else:
+            c.fetchable = False
+
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +993,48 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
 
 
 # ---------------------------------------------------------------------------
+# Combined-page detection helper
+# ---------------------------------------------------------------------------
+CONCURSO_SIGNALS = ["concurso publico", "concursos publicos", "concurso público"]
+PSS_SIGNALS = [
+    "processo seletivo", "processos seletivos", "seletivo simplificado",
+    "selecao publica", "seleção pública", "pss",
+]
+
+
+def _try_combined_fill(session: requests.Session, chosen: dict,
+                       bucket_tier: dict, razones: list,
+                       candidates: list[Candidate]) -> None:
+    """If one bucket has a URL and the other doesn't, check if the filled
+    bucket's page content mentions both types — making it a combined page."""
+    filled_key = empty_key = None
+    if chosen["url_concursos"] and not chosen["url_processos_seletivos"]:
+        filled_key, empty_key = "url_concursos", "url_processos_seletivos"
+        signals = PSS_SIGNALS
+    elif chosen["url_processos_seletivos"] and not chosen["url_concursos"]:
+        filled_key, empty_key = "url_processos_seletivos", "url_concursos"
+        signals = CONCURSO_SIGNALS
+    else:
+        return
+
+    filled_url = chosen[filled_key]
+    page = None
+    for c in candidates:
+        if c.url == filled_url and c.page:
+            page = c.page
+            break
+    if not page:
+        return
+
+    content = norm(page.title + " " + page.text[:3000])
+    if any(s in content for s in signals):
+        chosen[empty_key] = filled_url
+        bucket_tier[empty_key] = bucket_tier.get(filled_key, "") + "_combined"
+        razones.append(f"[combined] Page also contains {empty_key.split('_')[1]} content")
+        print(f"      combined: {empty_key} filled from {filled_key}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline: process one municipality
 # ---------------------------------------------------------------------------
 @dataclass
@@ -966,6 +1107,11 @@ def process_municipio(session: requests.Session, municipio: str,
         _record(picked, "t1")
         tiers_used.append("t3")
 
+    # --- Combined-page detection ---
+    # If Tier 3 filled one bucket but not the other, check if the chosen
+    # page's content mentions both types. If so, it's a combined page.
+    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
+
     # --- TIER 2: Grounded search (only for missing buckets) ---
     missing_buckets = []
     if not chosen["url_concursos"]:
@@ -995,6 +1141,46 @@ def process_municipio(session: requests.Session, municipio: str,
             print(f"    Tier 2 error: {e}", flush=True)
             tiers_used.append("t2_err")
 
+    # Combined-page check again after Tier 2
+    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
+
+    # --- Directed grounding per bucket ---
+    # If general grounding didn't find a bucket, search specifically for it
+    # on the known host (e.g. "processos seletivos site:pmpf.rs.gov.br").
+    dir_missing = []
+    if not chosen["url_concursos"]:
+        dir_missing.append(("url_concursos", "concursos publicos"))
+    if not chosen["url_processos_seletivos"]:
+        dir_missing.append(("url_processos_seletivos", "processos seletivos"))
+
+    if dir_missing and result.site_base and gemini_api_key():
+        host = urlparse(result.site_base).netloc
+        for bucket_key, bucket_name in dir_missing:
+            print(f"    Directed grounding: {bucket_name} on {host}...", flush=True)
+            try:
+                t2d = tier2_directed_bucket_search(
+                    session, model, municipio, host, bucket_name, timeout,
+                )
+                existing_urls = {c.url for c in all_candidates}
+                new_d = [c for c in t2d if c.url not in existing_urls]
+                all_candidates.extend(new_d)
+                fetchable_d = [c for c in new_d if c.fetchable]
+                if fetchable_d:
+                    picked = tier3_classify_and_pick(
+                        session, model, municipio, fetchable_d, timeout,
+                    )
+                    if picked.get(bucket_key):
+                        chosen[bucket_key] = picked[bucket_key]
+                        bucket_tier[bucket_key] = "t2dir"
+                        if picked.get("razao"):
+                            razones.append(f"[t2dir] {picked['razao']}")
+                tiers_used.append("t2dir")
+            except Exception as e:
+                print(f"    Directed grounding error: {e}", flush=True)
+
+    # Combined check after directed grounding
+    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
+
     # --- TIER 4: Playwright (last resort for still-missing buckets) ---
     still_missing = []
     if not chosen["url_concursos"]:
@@ -1018,6 +1204,9 @@ def process_municipio(session: requests.Session, municipio: str,
                 _record(picked, "t4")
         except Exception as e:
             print(f"    Tier 4 error: {e}", flush=True)
+
+    # Final combined-page check after all tiers
+    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- Assemble result ---
     result.url_concursos = chosen.get("url_concursos", "")
