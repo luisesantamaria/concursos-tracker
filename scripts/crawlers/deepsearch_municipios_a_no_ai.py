@@ -23,7 +23,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-AUTH_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MUNICIPIOS_URL = "https://dados.tce.rs.gov.br/dados/auxiliar/municipios.csv"
 
 FIELDS = [
@@ -625,7 +625,7 @@ def build_row(args: argparse.Namespace, row: dict[str, str], index: int, total: 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=AUTH_ROOT / "data" / "municipios_resources_a_deep_no_ai.csv")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "data" / "municipios_resources_a_deep_no_ai.csv")
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--debug", action="store_true")
