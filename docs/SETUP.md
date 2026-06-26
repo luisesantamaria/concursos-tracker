@@ -2,46 +2,25 @@
 
 ## 1. Prerequisites
 
-- Windows PowerShell or a Unix-like shell.
 - Python 3.12.
 - Git.
 - Optional: GitHub CLI (`gh`) for private repo creation.
-- Optional: Google/Gemini API key for AI-assisted search/review.
+- Optional: Gemini API key for AI-assisted search/audit.
 
-## 2. Clone or Open the Project
+## 2. Create Environment
 
-```powershell
-cd "C:\path\to\Concursos Tracker"
-```
-
-If using the current local folder:
-
-```powershell
-cd "C:\Users\Luis Santamaria\Documents\PC\iCloud_Duplicate_Cleanup_Hold\Concursos Tracker local-only pending 20260625-145747"
-```
-
-## 3. Create Environment
-
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate   # Linux/Mac
+# .\.venv\Scripts\Activate.ps1  # Windows PowerShell
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-If `python` opens the Microsoft Store or fails, use the real installed Python path or install Python 3.12.
+## 3. Configure Environment Variables
 
-Known local path on this PC:
-
-```powershell
-& "C:\Users\Luis Santamaria\AppData\Local\Programs\PythonEmbed312\python.exe" --version
-```
-
-## 4. Configure Environment Variables
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
+```bash
+cp .env.example .env
 ```
 
 Fill only what you need:
@@ -53,73 +32,46 @@ GEMINI_MODEL=gemini-2.5-flash
 
 Do not commit `.env`.
 
-## 5. Smoke Checks
+## 4. Smoke Checks
 
-```powershell
-python authority_first\scripts\crawlers\crawl_bancas_base_rs.py --help
-python authority_first\scripts\crawlers\crawl_municipios_resources_rs.py --help
-python authority_first\scripts\crawlers\grounded_deepsearch_municipios_a.py --help
-python authority_first\scripts\review\ai_repair_bancas_rs.py --help
-python authority_first\scripts\eval\medir_golden_set.py --help
+```bash
+python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --help
+python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --help
+python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --help
+python authority_first/scripts/review/ai_repair_bancas_rs.py --help
+python authority_first/scripts/eval/medir_golden_set.py --help
 ```
 
-## 6. Small Runs
+## 5. Small Runs
 
-Banca sample:
+```bash
+# Banca sample
+python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --year 2026 --max-total 50 --debug
 
-```powershell
-python authority_first\scripts\crawlers\crawl_bancas_base_rs.py --year 2026 --max-total 50 --debug
+# Municipality resources sample
+python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --limit 10 --debug
+
+# Grounded deep search sample
+python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --limit 5 --offset 0
 ```
 
-Municipio resources sample:
+## 6. Golden-Set Evaluation
 
-```powershell
-python authority_first\scripts\crawlers\crawl_municipios_resources_rs.py --limit 10 --debug
+```bash
+python authority_first/scripts/eval/medir_golden_set.py \
+  --golden authority_first/data/golden_set_v1.csv \
+  --pipeline <output.csv> \
+  --detalle
 ```
 
-Grounded deep search sample:
+The `--detalle` flag shows per-municipality verdict breakdown. Run after any change to verification or selection logic.
 
-```powershell
-python authority_first\scripts\crawlers\grounded_deepsearch_municipios_a.py --limit 5 --offset 0 --ai-route-validator
-```
+## 7. Troubleshooting
 
-## 7. Golden-Set Evaluation
-
-```powershell
-python authority_first\scripts\eval\medir_golden_set.py --golden authority_first\data\golden_set_v1.csv --pipeline <output.csv> --detalle
-```
-
-## 8. GitHub Private Repo
-
-If Git and GitHub CLI are installed and authenticated:
-
-```powershell
-git init
-git checkout -B main
-git add .
-git commit -m "Initial project setup with agent docs"
-gh repo create "$(Split-Path -Leaf (Get-Location))" --private --source=. --remote=origin --push
-```
-
-If the folder name is too long or awkward for GitHub, use:
-
-```powershell
-gh repo create "Concursos-Tracker" --private --source=. --remote=origin --push
-```
-
-If a remote already exists:
-
-```powershell
-git push -u origin main
-```
-
-## 9. Troubleshooting
-
-- Store Python stub: install Python 3.12 or call the real executable path.
 - Playwright errors: run `playwright install chromium`.
 - Rate limits/blocks: lower concurrency and host delay; La Salle/Wordfence is sensitive.
-- iCloud sync issues: work from the local backup folder until sync is stable.
 - Gemini errors: retry with `gemini-2.5-flash`; avoid Flash Lite for critical review runs.
+- HTTP 406 from municipal sites: ensure requests sessions use real browser User-Agent headers, not bot-like identifiers.
 
 ## Pending
 
