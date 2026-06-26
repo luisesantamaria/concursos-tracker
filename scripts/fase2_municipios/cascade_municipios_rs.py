@@ -1434,24 +1434,32 @@ def process_municipio(session: requests.Session, municipio: str,
             result.confianza_processos = "revisar"
 
     # --- Collect extra valid URLs (others Tier 3 could have picked) ---
-    # Any fetchable candidate on the same host that wasn't chosen
-    chosen_urls = {result.url_concursos, result.url_processos_seletivos}
-    concurso_kw = {"concurso", "concursos"}
-    pss_kw = {"seletivo", "seletivos", "pss", "selecao"}
-    extras_c: list[str] = []
-    extras_p: list[str] = []
-    for c in all_candidates:
-        if not c.fetchable or c.url in chosen_urls:
-            continue
-        text_lower = (c.menu_text or "").lower() + " " + c.url.lower()
-        if c.page and c.page.title:
-            text_lower += " " + c.page.title.lower()
-        if any(k in text_lower for k in concurso_kw):
-            extras_c.append(c.url)
-        if any(k in text_lower for k in pss_kw):
-            extras_p.append(c.url)
-    result.urls_extras_concursos = " | ".join(extras_c[:5])
-    result.urls_extras_processos = " | ".join(extras_p[:5])
+    # Only emitted for buckets a human will actually review: when the chosen URL
+    # is confirmado we trust it, so extras would just be unvalidated keyword
+    # matches (detail pages, news) cluttering the output. They are kept for
+    # revisar / not-found buckets, where alternates help the reviewer pick.
+    need_extras_c = result.confianza_concursos != "confirmado"
+    need_extras_p = result.confianza_processos != "confirmado"
+    if need_extras_c or need_extras_p:
+        chosen_urls = {result.url_concursos, result.url_processos_seletivos}
+        concurso_kw = {"concurso", "concursos"}
+        pss_kw = {"seletivo", "seletivos", "pss", "selecao"}
+        extras_c: list[str] = []
+        extras_p: list[str] = []
+        for c in all_candidates:
+            if not c.fetchable or c.url in chosen_urls:
+                continue
+            text_lower = (c.menu_text or "").lower() + " " + c.url.lower()
+            if c.page and c.page.title:
+                text_lower += " " + c.page.title.lower()
+            if need_extras_c and any(k in text_lower for k in concurso_kw):
+                extras_c.append(c.url)
+            if need_extras_p and any(k in text_lower for k in pss_kw):
+                extras_p.append(c.url)
+        if need_extras_c:
+            result.urls_extras_concursos = " | ".join(extras_c[:5])
+        if need_extras_p:
+            result.urls_extras_processos = " | ".join(extras_p[:5])
 
     notes_parts = []
     total = len(all_candidates)
