@@ -367,6 +367,45 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
         else:
             c.fetchable = False
 
+    # Drill-down: a bucket parent page (e.g. /concurso) often links to more
+    # specific sub-indexes (e.g. /concurso/categoria/25/concurso). Harvest those
+    # so Tier 3 can prefer the canonical bucket page over the parent. General:
+    # we only follow links that match bucket keywords and live deeper on the
+    # same host -- no portal-specific routes.
+    drill: list[Candidate] = []
+    for c in [c for c in candidates if c.fetchable and c.page]:
+        parent_path = urlparse(c.url).path.rstrip("/")
+        parent_host = urlparse(c.url).netloc.lower()
+        for href, link_text in c.page.links:
+            if href in seen_urls or len(drill) >= 8:
+                continue
+            pu = urlparse(href)
+            if pu.netloc.lower() != parent_host:
+                continue
+            child_path = pu.path.rstrip("/")
+            # Must be strictly deeper than the parent and match a bucket keyword.
+            if not child_path.startswith(parent_path + "/"):
+                continue
+            if is_pdf_or_file(href) or is_broad_landing(href):
+                continue
+            text_n = norm(link_text)
+            href_n = norm(unquote(pu.path))
+            if any(kw in text_n or kw in href_n for kw in all_keywords):
+                seen_urls.add(href)
+                drill.append(Candidate(
+                    url=href, source="drilldown",
+                    menu_text=f"{c.menu_text} > {link_text}",
+                ))
+    for c in drill:
+        page = fetch_page(session, c.url, min(timeout, 10))
+        if page.ok and not is_soft_404(page):
+            c.page = page
+            c.content_preview = page.text[:1200]
+            c.fetchable = True
+        else:
+            c.fetchable = False
+    candidates.extend(drill)
+
     return candidates
 
 
@@ -603,8 +642,12 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         f"(listagem de VARIOS editais) para concursos publicos e para processos seletivos (PSS).\n\n"
         "Regras:\n"
         "- Queremos pagina INDICE/LISTAGEM, NAO edital individual, PDF ou noticia.\n"
+        "- Prefira o INDICE CANONICO: a listagem mais ampla e estavel. Entre uma\n"
+        "  vista de TODOS os anos e uma filtrada por um ano so, escolha a de todos\n"
+        "  os anos. Entre a raiz da listagem e uma sub-vista filtrada, escolha a raiz.\n"
+        "- Se existem paginas SEPARADAS para concursos e para PSS, use a especifica\n"
+        "  de cada bucket; so use uma pagina combinada se nao houver separadas.\n"
         "- Se duas sao parecidas, escolha a mais completa e atualizada.\n"
-        "- Se uma pagina lista ambos, use-a para os dois.\n"
         "- Rejeite licitacao/pregao/compras e concurso cultural (soberanas/rainhas).\n"
         "- Se nenhuma serve, deixe vazio. NAO invente URLs.\n\n"
         "Candidatos:\n"
@@ -617,14 +660,16 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
             f"      preview: {item['content_preview'][:300]}\n\n"
         )
     prompt += (
-        "Responda JSON: {\"url_concursos\": \"url ou vazio\", "
+        "Responda JSON com as URLs PRIMEIRO e a razao por ultimo "
+        "(uma frase curta, max 20 palavras): "
+        "{\"url_concursos\": \"url ou vazio\", "
         "\"url_processos_seletivos\": \"url ou vazio\", \"razao\": \"curto\"}"
     )
 
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.0, "maxOutputTokens": 2048,
+            "temperature": 0.0, "maxOutputTokens": 4096,
             "responseMimeType": "application/json",
         },
     }
