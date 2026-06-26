@@ -1921,7 +1921,8 @@ def clean_edital_prefix(value: str) -> str:
     text = fix_common_mojibake(value).strip()
     match = re.search(r"(?:n[º°ÂºÂ°o.]*)\s*(\d{1,4}\s*/\s*20\d{2})", text, re.I)
     if match:
-        return f"nº {re.sub(r'\\s+', '', match.group(1))}"
+        cleaned = re.sub(r'\\s+', '', match.group(1))
+        return f"nº {cleaned}"
     match = re.fullmatch(r"\s*(\d{1,4})\s*/\s*(20\d{2})\s*", text)
     if match:
         return f"nº {int(match.group(1)):02d}/{match.group(2)}"
