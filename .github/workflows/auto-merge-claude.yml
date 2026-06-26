@@ -1,0 +1,21 @@
+name: Auto merge Claude PRs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'claude/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Enable auto-merge for Claude PR
+        run: gh pr merge "$PR_URL" --auto --squash --delete-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
