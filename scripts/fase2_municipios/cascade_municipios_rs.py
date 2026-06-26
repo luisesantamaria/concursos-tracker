@@ -1430,31 +1430,55 @@ OUTPUT_FIELDS = [
 ]
 
 
-def write_results(results: list[MunicipioResult], path: Path) -> None:
+def _read_existing_rows(path: Path) -> dict[str, dict]:
+    """Read an existing output CSV into a {norm(municipio): row} map."""
+    rows: dict[str, dict] = {}
+    if not path.exists():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                muni = (row.get("municipio") or "").strip()
+                if muni:
+                    rows[norm(muni)] = row
+    except Exception as e:
+        print(f"Could not read existing CSV for append: {e}", flush=True)
+    return rows
+
+
+def write_results(results: list[MunicipioResult], path: Path,
+                  append: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
+
+    # Start from existing rows when appending, then overlay this run.
+    merged: dict[str, dict] = _read_existing_rows(path) if append else {}
+    for r in results:
+        merged[norm(r.municipio)] = {
+            "uf": UF_SIGLA,
+            "municipio": r.municipio,
+            "site_base": r.site_base,
+            "url_concursos": r.url_concursos,
+            "confianza_concursos": r.confianza_concursos,
+            "url_processos_seletivos": r.url_processos_seletivos,
+            "confianza_processos": r.confianza_processos,
+            "urls_extras_concursos": r.urls_extras_concursos,
+            "urls_extras_processos": r.urls_extras_processos,
+            "tier_concursos": r.tier_concursos,
+            "tier_processos": r.tier_processos,
+            "method": r.method,
+            "razao": r.razao,
+            "notes": r.notes,
+            "checked_at": now,
+        }
+
+    ordered = sorted(merged.values(), key=lambda d: norm(d.get("municipio", "")))
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()
-        for r in results:
-            writer.writerow({
-                "uf": UF_SIGLA,
-                "municipio": r.municipio,
-                "site_base": r.site_base,
-                "url_concursos": r.url_concursos,
-                "confianza_concursos": r.confianza_concursos,
-                "url_processos_seletivos": r.url_processos_seletivos,
-                "confianza_processos": r.confianza_processos,
-                "urls_extras_concursos": r.urls_extras_concursos,
-                "urls_extras_processos": r.urls_extras_processos,
-                "tier_concursos": r.tier_concursos,
-                "tier_processos": r.tier_processos,
-                "method": r.method,
-                "razao": r.razao,
-                "notes": r.notes,
-                "checked_at": now,
-            })
-    print(f"\nCSV written to {path}", flush=True)
+        for row in ordered:
+            writer.writerow({k: row.get(k, "") for k in OUTPUT_FIELDS})
+    print(f"\nCSV written to {path} ({len(ordered)} rows)", flush=True)
 
     # --- Excel output with proper formatting ---
     xlsx_path = path.with_suffix(".xlsx")
@@ -1505,14 +1529,14 @@ def write_results(results: list[MunicipioResult], path: Path) -> None:
             cell.border = thin_border
             ws.column_dimensions[cell.column_letter].width = width
 
-        for row_idx, r in enumerate(results, 2):
+        for row_idx, row in enumerate(ordered, 2):
             vals = [
-                r.municipio, r.site_base,
-                r.url_concursos, r.confianza_concursos,
-                r.url_processos_seletivos, r.confianza_processos,
-                r.urls_extras_concursos, r.urls_extras_processos,
-                r.tier_concursos, r.tier_processos,
-                r.razao, r.notes, now,
+                row.get("municipio", ""), row.get("site_base", ""),
+                row.get("url_concursos", ""), row.get("confianza_concursos", ""),
+                row.get("url_processos_seletivos", ""), row.get("confianza_processos", ""),
+                row.get("urls_extras_concursos", ""), row.get("urls_extras_processos", ""),
+                row.get("tier_concursos", ""), row.get("tier_processos", ""),
+                row.get("razao", ""), row.get("notes", ""), row.get("checked_at", now),
             ]
             for col_idx, val in enumerate(vals, 1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=val)
@@ -1556,9 +1580,12 @@ def load_municipios_from_tce(session: requests.Session,
     try:
         resp = session.get(DEFAULT_MUNICIPIOS_URL, timeout=timeout)
         resp.raise_for_status()
-        reader = csv.DictReader(resp.text.splitlines(), delimiter=";")
+        # Sniff the delimiter (the TCE export is comma-separated).
+        sample = resp.text[:512]
+        delim = ";" if sample.count(";") > sample.count(",") else ","
+        reader = csv.DictReader(resp.text.splitlines(), delimiter=delim)
         return sorted(set(
-            row["NOME_MUNICIPIO"]
+            (row["NOME_MUNICIPIO"] or "").strip().title()
             for row in reader
             if (row.get("UF") or row.get("SIGLA_UF", "")) == "RS"
             and row.get("NOME_MUNICIPIO")
@@ -1591,6 +1618,13 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=15)
     parser.add_argument("--limit", type=int, default=0,
                         help="Limit number of municipalities")
+    parser.add_argument("--letras", type=str, default="",
+                        help="Only process municipalities whose name starts with "
+                             "one of these letters (accent-insensitive), e.g. 'ab'")
+    parser.add_argument("--append", action="store_true",
+                        help="Merge into the existing output CSV instead of "
+                             "overwriting it (rows for the same municipality are "
+                             "replaced; new ones are appended)")
     args = parser.parse_args()
 
     session = make_session()
@@ -1601,6 +1635,10 @@ def main() -> int:
         municipios = load_municipios_from_tce(session)
     else:
         municipios = load_municipios_from_golden(args.golden)
+
+    if args.letras:
+        wanted = {c for c in norm(args.letras) if c.isalnum()}
+        municipios = [m for m in municipios if norm(m)[:1] in wanted]
 
     if args.limit > 0:
         municipios = municipios[:args.limit]
@@ -1680,7 +1718,7 @@ def main() -> int:
         print(f"  Verified: {confirmed}/{len(verdicts)} upgraded to confirmado",
               flush=True)
 
-    write_results(results, args.output)
+    write_results(results, args.output, append=args.append)
 
     # --- Summary ---
     found_c = sum(1 for r in results if r.url_concursos)
