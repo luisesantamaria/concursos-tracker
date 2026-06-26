@@ -63,7 +63,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-AUTH_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 # Estado: SIEMPRE presente para evitar municipios homonimos de otro estado.
@@ -1755,7 +1755,7 @@ def print_run_stats(rows: list[dict]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=AUTH_ROOT / "data" / "municipios_resources_a_grounded.csv")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "data" / "municipios_resources_a_grounded.csv")
     parser.add_argument("--model", default="gemini-2.5-flash")
     parser.add_argument("--timeout", type=int, default=8)
     parser.add_argument("--ai-timeout", type=int, default=60)

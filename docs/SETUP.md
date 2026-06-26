@@ -35,31 +35,31 @@ Do not commit `.env`.
 ## 4. Smoke Checks
 
 ```bash
-python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --help
-python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --help
-python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --help
-python authority_first/scripts/review/ai_repair_bancas_rs.py --help
-python authority_first/scripts/eval/medir_golden_set.py --help
+python scripts/crawlers/crawl_bancas_base_rs.py --help
+python scripts/crawlers/crawl_municipios_resources_rs.py --help
+python scripts/crawlers/grounded_deepsearch_municipios_a.py --help
+python scripts/review/ai_repair_bancas_rs.py --help
+python scripts/eval/medir_golden_set.py --help
 ```
 
 ## 5. Small Runs
 
 ```bash
 # Banca sample
-python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --year 2026 --max-total 50 --debug
+python scripts/crawlers/crawl_bancas_base_rs.py --year 2026 --max-total 50 --debug
 
 # Municipality resources sample
-python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --limit 10 --debug
+python scripts/crawlers/crawl_municipios_resources_rs.py --limit 10 --debug
 
 # Grounded deep search sample
-python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --limit 5 --offset 0
+python scripts/crawlers/grounded_deepsearch_municipios_a.py --limit 5 --offset 0
 ```
 
 ## 6. Golden-Set Evaluation
 
 ```bash
-python authority_first/scripts/eval/medir_golden_set.py \
-  --golden authority_first/data/golden_set_v1.csv \
+python scripts/eval/medir_golden_set.py \
+  --golden data/golden_set_v1.csv \
   --pipeline <output.csv> \
   --detalle
 ```

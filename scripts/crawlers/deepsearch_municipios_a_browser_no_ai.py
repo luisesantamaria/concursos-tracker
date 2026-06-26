@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deepsearch_municipios_a_no_ai import (
-    AUTH_ROOT,
+    PROJECT_ROOT,
     FIELDS,
     Page,
     clean_url,
@@ -247,7 +247,7 @@ def build_row(args, row: dict[str, str], browser_page, session, index: int, tota
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=AUTH_ROOT / "data" / "municipios_resources_a_browser_no_ai.csv")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "data" / "municipios_resources_a_browser_no_ai.csv")
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--browser-timeout-ms", type=int, default=9000)
     parser.add_argument("--limit", type=int, default=0)

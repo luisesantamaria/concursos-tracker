@@ -5,7 +5,7 @@ Read this file before editing the project.
 ## Project Orientation
 
 - Work from the repository root.
-- Treat `authority_first/` as the canonical implementation.
+- Treat `scripts/` as the canonical implementation.
 - Treat `laboratorio/`, old `scripts/`, `data/`, `output/`, and `logs/` as legacy/reference unless the user explicitly asks otherwise.
 - The pilot scope is RS only. Do not expand to other states unless the user explicitly changes the scope.
 
@@ -56,7 +56,7 @@ Playwright is the Tier 4 last resort. Rules:
 
 ## Golden Set
 
-The golden set (`authority_first/data/golden_set_v1.csv`) is the independent ground truth. It was built by hand, not by the pipeline.
+The golden set (`data/golden_set_v1.csv`) is the independent ground truth. It was built by hand, not by the pipeline.
 
 - Run the evaluator after ANY change to verification, selection, or cascade logic.
 - The metric to optimize is **precision** (zero false positives), not coverage.
@@ -77,11 +77,11 @@ The golden set (`authority_first/data/golden_set_v1.csv`) is the independent gro
 ## Useful Commands
 
 ```bash
-python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --help
-python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --help
-python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --help
-python authority_first/scripts/review/ai_repair_bancas_rs.py --help
-python authority_first/scripts/eval/medir_golden_set.py --help
+python scripts/crawlers/crawl_bancas_base_rs.py --help
+python scripts/crawlers/crawl_municipios_resources_rs.py --help
+python scripts/crawlers/grounded_deepsearch_municipios_a.py --help
+python scripts/review/ai_repair_bancas_rs.py --help
+python scripts/eval/medir_golden_set.py --help
 ```
 
 ## Final Checklist

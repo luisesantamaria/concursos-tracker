@@ -25,9 +25,8 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-AUTH_ROOT = Path(__file__).resolve().parents[2]
-PROJECT_ROOT = AUTH_ROOT.parent
-CRAWLER_PATH = AUTH_ROOT / "scripts" / "crawlers" / "crawl_bancas_base_rs.py"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CRAWLER_PATH = PROJECT_ROOT / "scripts" / "crawlers" / "crawl_bancas_base_rs.py"
 
 
 BASE_FIELDS = [
@@ -1294,9 +1293,9 @@ def safe_cache_label(value: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI audit/repair for RS banca layer rows.")
-    parser.add_argument("--input", type=Path, default=AUTH_ROOT / "data" / "exports" / "bancas_base_rs_2020_2026_final.csv")
-    parser.add_argument("--out-review", type=Path, default=AUTH_ROOT / "data" / "exports" / "bancas_base_rs_2020_2026_ai_review.csv")
-    parser.add_argument("--out-applied", type=Path, default=AUTH_ROOT / "data" / "exports" / "bancas_base_rs_2020_2026_ai_applied.csv")
+    parser.add_argument("--input", type=Path, default=PROJECT_ROOT / "data" / "exports" / "bancas_base_rs_2020_2026_final.csv")
+    parser.add_argument("--out-review", type=Path, default=PROJECT_ROOT / "data" / "exports" / "bancas_base_rs_2020_2026_ai_review.csv")
+    parser.add_argument("--out-applied", type=Path, default=PROJECT_ROOT / "data" / "exports" / "bancas_base_rs_2020_2026_ai_applied.csv")
     parser.add_argument("--llm-provider", choices=["ollama", "openai", "gemini", "runpod-queue"], default="ollama")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
@@ -1323,7 +1322,7 @@ def main() -> int:
     parser.add_argument("--num-ctx", type=int, default=2048)
     parser.add_argument("--num-predict", type=int, default=260)
     parser.add_argument("--ollama-timeout", type=int, default=180)
-    parser.add_argument("--cache-dir", type=Path, default=AUTH_ROOT / "data" / "cache" / "ai_review")
+    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "data" / "cache" / "ai_review")
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--max-pages-per-row", type=int, default=4)
     parser.add_argument("--max-docs-per-row", type=int, default=5)

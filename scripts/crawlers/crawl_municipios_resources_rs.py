@@ -28,7 +28,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-AUTH_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MUNICIPIOS_URL = "https://dados.tce.rs.gov.br/dados/auxiliar/municipios.csv"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_LOCK = threading.Lock()
@@ -507,8 +507,8 @@ def build_row(args: argparse.Namespace, municipio_row: dict[str, str]) -> dict[s
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--municipios-csv", type=Path)
-    parser.add_argument("--output", type=Path, default=AUTH_ROOT / "data" / "municipios_resources_rs.csv")
-    parser.add_argument("--cache-dir", type=Path, default=AUTH_ROOT / "data" / "cache")
+    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "data" / "municipios_resources_rs.csv")
+    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "data" / "cache")
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--inner-workers", type=int, default=8)

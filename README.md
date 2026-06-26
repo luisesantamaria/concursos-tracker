@@ -39,18 +39,16 @@ Key principles:
 ## Project Structure
 
 ```text
-authority_first/              Current canonical pipeline and docs.
-authority_first/scripts/
-  crawlers/                   Crawlers for bancas, municipios, grounded deep search.
-  review/                     AI-assisted audit/repair.
-  eval/                       Golden-set evaluation (medir_golden_set.py).
-authority_first/data/         Golden set, seed data.
-authority_first/config/       Authority matrix, schema, scope rules.
-authority_first/docs/         Architecture, roadmap, base table spec.
-docs/                         Root-level project documentation.
-laboratorio/                  Historical experiments and prototypes.
-PLAN_CODEX.md                 Older master plan with important project context.
-requirements.txt              Python dependencies.
+scripts/
+  crawlers/       Crawlers for bancas, municipios, grounded deep search.
+  review/         AI-assisted audit/repair.
+  eval/           Golden-set evaluation (medir_golden_set.py).
+  shared/         Shared utilities (scope_rs).
+  pipeline/       Pipeline orchestration.
+config/           Authority matrix, schema, scope rules (YAML).
+data/             Golden set, pipeline outputs, seed data.
+docs/             Project documentation (architecture, roadmap, decisions).
+.github/          CI workflows.
 ```
 
 ## Install
@@ -78,16 +76,16 @@ Never commit `.env`, API keys, service-account files, model weights, generated l
 
 ```bash
 # Show crawler help
-python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --help
-python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --help
-python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --help
+python scripts/crawlers/crawl_bancas_base_rs.py --help
+python scripts/crawlers/crawl_municipios_resources_rs.py --help
+python scripts/crawlers/grounded_deepsearch_municipios_a.py --help
 
 # Run grounded deep search sample
-python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --limit 5 --offset 0
+python scripts/crawlers/grounded_deepsearch_municipios_a.py --limit 5 --offset 0
 
 # Evaluate against golden set
-python authority_first/scripts/eval/medir_golden_set.py \
-  --golden authority_first/data/golden_set_v1.csv \
+python scripts/eval/medir_golden_set.py \
+  --golden data/golden_set_v1.csv \
   --pipeline <output.csv> --detalle
 ```
 

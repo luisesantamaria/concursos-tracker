@@ -1,7 +1,7 @@
 """Hard RS scope guard for the authority-first pipeline.
 
 Every crawler that reads a national banca must pass candidates through this
-module before writing them to authority_first/data/raw.
+module before writing them to data/raw.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = PROJECT_ROOT / "data" / "sites_municipios_rs.csv"
 OTHER_UFS = {
     "AC",

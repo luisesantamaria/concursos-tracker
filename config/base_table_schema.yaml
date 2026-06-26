@@ -60,7 +60,7 @@ columns:
 
 validation_rules:
   - id: rs_only
-    description: Candidate must pass authority_first/scripts/shared/scope_rs.py.
+    description: Candidate must pass scripts/shared/scope_rs.py.
   - id: stable_official_page
     description: pagina_oficial must not be a generic homepage if a certame-specific page exists.
   - id: opening_edital_only
