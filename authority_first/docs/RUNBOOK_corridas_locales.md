@@ -102,6 +102,31 @@ Después de cada corrida, pega **estos tres bloques** en la conversación princi
 Con eso, desde la conversación principal se diagnostica, se corrige el código, se
 commitea, y la siguiente corrida local ya usa la versión arreglada.
 
+## Tres modos de corrida (cuándo congelar y cuándo re-correr)
+
+`--skip-existing` congela **solo los confirmados**; los `revisar`/`sin resultado`
+siempre se reintentan. Eso es lo correcto para avanzar barato, pero no detecta si un
+cambio de código rompió un confirmado que ya estaba fuera del golden set. Por eso se
+usan tres modos según el objetivo:
+
+| Objetivo | Comando | Costo |
+|----------|---------|-------|
+| Avanzar / iterar misses (día a día) | `--all --letras X --append --skip-existing` | Bajo |
+| Gate de regresión (tras CADA cambio de lógica) | `--golden --output /tmp/check.csv` (sin skip) + evaluador | ~24 munis |
+| Regresión total (antes de un hito) | `--all --letras X --append` (sin skip-existing) | Alto |
+
+Política:
+1. Trabajo normal → `--skip-existing` (congela confirmados, reintenta misses).
+2. Después de tocar lógica de verify/select/tier → re-corre el **golden set (24)** sin
+   skip a un CSV temporal y pásale el evaluador. Si aguanta, el núcleo no se rompió.
+3. Antes de un hito → corrida total sin `--skip-existing` para cazar regresiones fuera
+   del golden.
+
+Hueco conocido: el golden solo cubre 24 municipios, así que no protege a un confirmado
+externo cuya URL "se pudra". Mitigación futura: un modo `--reverify-confirmed`
+solo-determinístico (re-baja las URLs confirmadas y marca las que ya no listan, sin
+llamar a Gemini).
+
 ## Gate de precisión (antes de escalar)
 
 Tras una corrida, valida contra el golden set (verdad de campo, 24 municipios):
