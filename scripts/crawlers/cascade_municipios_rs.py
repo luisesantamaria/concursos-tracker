@@ -1178,7 +1178,8 @@ def batch_gemini_verify(session: requests.Session, model: str,
             if 0 <= idx < len(to_verify):
                 item = to_verify[idx]
                 key = f"{item['municipio']}|{item['bucket']}"
-                veredicto = v.get("veredicto", "revisar")
+                raw_veredicto = v.get("veredicto", "revisar").lower().strip()
+                veredicto = "confirmado" if raw_veredicto.startswith("confirm") else "revisar"
                 motivo = v.get("motivo", "")
                 result[key] = (veredicto, motivo)
                 print(f"    verify [{idx}] {item['municipio']}/{item['bucket']}: "
