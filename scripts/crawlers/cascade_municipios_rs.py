@@ -685,21 +685,43 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
 _BROWSER = None
 
 
+def _find_chromium() -> str | None:
+    import glob
+    for pat in ("/opt/pw-browsers/chromium-*/chrome-linux/chrome",
+                "/opt/pw-browsers/chromium-*/chrome-linux/headless_shell"):
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[-1]
+    return None
+
+
 def _get_browser():
     global _BROWSER
     if _BROWSER is None:
         from playwright.sync_api import sync_playwright
         pw = sync_playwright().start()
-        chrome_path = "/opt/pw-browsers/chromium-1194/chrome-linux/chrome"
-        if not os.path.exists(chrome_path):
-            chrome_path = None
-        launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        chrome_path = _find_chromium()
+        # Hardening for proxied/headless environments. Secure DNS (DoH) probes
+        # to dns.google are unreachable behind an egress proxy and flood the
+        # net stack, so turn DoH and background networking off and let the
+        # proxy resolve names via CONNECT.
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--dns-over-https-mode=off",
+            "--disable-features=DnsOverHttps,DnsOverHttpsUpgrade",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--no-pings",
+        ]
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if proxy_url:
             launch_args.append(f"--proxy-server={proxy_url}")
+        # A re-terminating egress proxy presents a per-host forged chain rooted
+        # at the bundle CA; tell Chromium to accept it.
         ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS", "/root/.ccr/ca-bundle.crt")
         if os.path.exists(ca_bundle):
-            launch_args.append("--ignore-certificate-errors")
+            launch_args += ["--ignore-certificate-errors", "--test-type"]
         _BROWSER = pw.chromium.launch(
             headless=True,
             executable_path=chrome_path,
