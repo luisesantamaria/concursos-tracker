@@ -499,6 +499,17 @@ def tier2_grounded_search(session: requests.Session, model: str,
     candidates = []
     seen: set[str] = set()
 
+    # Host filter: only accept URLs from the official site's domain
+    hint_host = ""
+    if site_hint:
+        hint_host = urlparse(site_hint).netloc.lower().lstrip("www.")
+
+    def _t2_host_ok(h: str) -> bool:
+        if not hint_host:
+            return True
+        h = h.lower().lstrip("www.")
+        return h == hint_host or h.endswith("." + hint_host)
+
     # URLs from grounding metadata (real indexed URLs)
     for ch in chunks:
         uri = (ch.get("web", {}) or {}).get("uri", "") if isinstance(ch, dict) else ""
@@ -511,7 +522,7 @@ def tier2_grounded_search(session: requests.Session, model: str,
             real = clean_url(uri)
         if real and real not in seen:
             host = urlparse(real).netloc.lower()
-            if not any(bad in host for bad in BAD_HOSTS) and not is_pdf_or_file(real):
+            if _t2_host_ok(host) and not any(bad in host for bad in BAD_HOSTS) and not is_pdf_or_file(real):
                 seen.add(real)
                 candidates.append(Candidate(url=real, source="grounding"))
 
@@ -520,7 +531,7 @@ def tier2_grounded_search(session: requests.Session, model: str,
         url = clean_url(raw.rstrip(".,;:"))
         if url and url not in seen:
             host = urlparse(url).netloc.lower()
-            if not any(bad in host for bad in BAD_HOSTS) and not is_pdf_or_file(url):
+            if _t2_host_ok(host) and not any(bad in host for bad in BAD_HOSTS) and not is_pdf_or_file(url):
                 seen.add(url)
                 candidates.append(Candidate(url=url, source="grounding"))
 
@@ -1115,6 +1126,7 @@ def batch_gemini_verify(session: requests.Session, model: str,
     for i, item in enumerate(to_verify[:30]):
         items_text += (
             f"[{i}] Municipio: {item['municipio']}, Bucket: {item['bucket']}\n"
+            f"    Site oficial: {item.get('site_base', '')}\n"
             f"    URL: {item['url']}\n"
             f"    Titulo: {item['title'][:120]}\n"
             f"    Preview: {item['preview'][:250]}\n\n"
@@ -1128,12 +1140,14 @@ def batch_gemini_verify(session: requests.Session, model: str,
         "- A pagina lista MULTIPLOS editais/concursos/processos (nao so um)\n"
         "- O conteudo corresponde ao bucket (concursos OU processos seletivos)\n"
         "- E uma pagina de listagem, nao um edital individual ou PDF\n"
-        "- Paginas combinadas (ambos tipos) sao validas para ambos buckets\n\n"
+        "- Paginas combinadas (ambos tipos) sao validas para ambos buckets\n"
+        "- A URL pertence ao MESMO dominio do site oficial (ou subdominio)\n\n"
         "Criterios para REVISAR:\n"
         "- Pagina de um unico edital\n"
         "- Conteudo nao corresponde ao bucket\n"
         "- Pagina generica sem editais visiveis\n"
-        "- Licitacoes ou concursos culturais\n\n"
+        "- Licitacoes ou concursos culturais\n"
+        "- URL de dominio DIFERENTE do site oficial (ex: banca, fundacao, outro orgao)\n\n"
         f"Items a verificar:\n{items_text}\n"
         "Responda JSON array. Cada elemento: "
         "{\"id\": N, \"veredicto\": \"confirmado\" ou \"revisar\", "
@@ -1630,6 +1644,7 @@ def main() -> int:
                 to_verify.append({
                     "municipio": r.municipio, "bucket": bucket,
                     "url": url, "title": "", "preview": "",
+                    "site_base": r.site_base,
                 })
                 verify_index[f"{r.municipio}|{bucket}"] = r
 
