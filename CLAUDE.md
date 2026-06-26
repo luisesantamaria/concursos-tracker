@@ -12,11 +12,12 @@ The project began as an Ache Concursos radar prototype and evolved into a source
 
 ## Where to Work
 
-- Main code: `authority_first/`.
+- Scripts: `scripts/fase1_bancas/` (banca crawlers), `scripts/fase2_municipios/` (municipality cascade), `scripts/eval/` (golden set evaluator), `scripts/shared/` (RS scope library).
+- Data and config: `authority_first/data/` (golden set, registry CSVs).
 - Main plans/docs: root docs plus `authority_first/docs/`.
-- Legacy experiments: `laboratorio/`, old `scripts/`, generated `data/`, `logs/`, `output/`.
+- Legacy experiments: `laboratorio/`.
 
-Do not restart from scratch unless the user explicitly asks. Preserve what was learned in the lab, but implement durable logic in `authority_first/`.
+Do not restart from scratch unless the user explicitly asks. Preserve what was learned in the lab.
 
 ## Commands
 
@@ -32,16 +33,15 @@ playwright install chromium
 Smoke checks:
 
 ```bash
-python authority_first/scripts/crawlers/crawl_bancas_base_rs.py --help
-python authority_first/scripts/crawlers/crawl_municipios_resources_rs.py --help
-python authority_first/scripts/crawlers/grounded_deepsearch_municipios_a.py --help
-python authority_first/scripts/review/ai_repair_bancas_rs.py --help
+python scripts/fase1_bancas/crawl_bancas_base_rs.py --help
+python scripts/fase1_bancas/ai_repair_bancas_rs.py --help
+python scripts/fase2_municipios/cascade_municipios_rs.py --help
 ```
 
 Golden-set evaluation:
 
 ```bash
-python authority_first/scripts/eval/medir_golden_set.py --golden authority_first/data/golden_set_v1.csv --pipeline <output.csv> --detalle
+python scripts/eval/medir_golden_set.py --golden authority_first/data/golden_set_v1.csv --pipeline <output.csv> --detalle
 ```
 
 ## Current Phase: Municipality Resource Discovery

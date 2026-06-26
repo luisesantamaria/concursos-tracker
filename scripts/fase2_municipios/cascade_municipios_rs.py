@@ -1576,7 +1576,7 @@ def main() -> int:
         description="5-tier cascade for RS municipality resource discovery"
     )
     parser.add_argument("--golden", type=Path,
-                        default=PROJECT_ROOT / "data" / "golden_set_v1.csv",
+                        default=PROJECT_ROOT / "authority_first" / "data" / "golden_set_v1.csv",
                         help="Run only on golden set municipalities")
     parser.add_argument("--all", action="store_true",
                         help="Run on all 497 RS municipalities")

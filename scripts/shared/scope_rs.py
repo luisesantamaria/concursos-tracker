@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = PROJECT_ROOT / "data" / "sites_municipios_rs.csv"
 OTHER_UFS = {
     "AC",
