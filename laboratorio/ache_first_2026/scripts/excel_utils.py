@@ -14,6 +14,7 @@ from xml.sax.saxutils import escape
 
 MAX_EXCEL_TEXT = 32767
 SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_QUOT_MAP = {"\"": "&quot;"}
 URL_RE = re.compile(r"https?://[^\s<>\"|]+", re.IGNORECASE)
 
 
@@ -133,7 +134,7 @@ def write_xlsx(
                     '<Relationship '
                     f'Id="{rel_id}" '
                     'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
-                    f'Target="{escape(target, {"\"": "&quot;"})}" '
+                    f'Target="{escape(target, _QUOT_MAP)}" '
                     'TargetMode="External"/>'
                 )
         sheet_rows.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
