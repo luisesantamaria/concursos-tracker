@@ -1046,6 +1046,24 @@ def _try_combined_fill(session: requests.Session, chosen: dict,
 # ---------------------------------------------------------------------------
 # Main pipeline: process one municipality
 # ---------------------------------------------------------------------------
+def _assign_confidence(tier: str) -> str:
+    """Map tier label to confidence level for the user-facing CSV.
+
+    confirmado  — found via free HTML scanning (Tier 1), high trust.
+    probable    — found via AI search/classification (Tier 2, directed, Tier 4).
+    revisar     — ambiguous or combined-page inference, needs human eyes.
+    """
+    if not tier:
+        return ""
+    if tier in ("t1",):
+        return "confirmado"
+    if tier in ("t2", "t2dir", "t4"):
+        return "probable"
+    if tier.endswith("_combined"):
+        return "revisar"
+    return "probable"
+
+
 @dataclass
 class MunicipioResult:
     municipio: str
@@ -1054,11 +1072,13 @@ class MunicipioResult:
     url_processos_seletivos: str = ""
     method: str = ""
     notes: str = ""
-    # Observability: which tier resolved each bucket and Tier 3's reasoning,
-    # so the expensive run is fully diagnosable without re-spending Gemini.
     tier_concursos: str = ""
     tier_processos: str = ""
     razao: str = ""
+    confianza_concursos: str = ""
+    confianza_processos: str = ""
+    urls_extras_concursos: str = ""
+    urls_extras_processos: str = ""
 
 
 def process_municipio(session: requests.Session, municipio: str,
@@ -1221,6 +1241,36 @@ def process_municipio(session: requests.Session, municipio: str,
     result.tier_processos = bucket_tier["url_processos_seletivos"]
     result.razao = " | ".join(razones)
 
+    # --- Confidence assignment ---
+    result.confianza_concursos = _assign_confidence(result.tier_concursos)
+    result.confianza_processos = _assign_confidence(result.tier_processos)
+
+    # Downgrade to "revisar" when site not found or all tiers exhausted
+    if not result.url_concursos and not result.url_processos_seletivos:
+        if any(c.fetchable for c in all_candidates):
+            result.confianza_concursos = "revisar"
+            result.confianza_processos = "revisar"
+
+    # --- Collect extra valid URLs (others Tier 3 could have picked) ---
+    # Any fetchable candidate on the same host that wasn't chosen
+    chosen_urls = {result.url_concursos, result.url_processos_seletivos}
+    concurso_kw = {"concurso", "concursos"}
+    pss_kw = {"seletivo", "seletivos", "pss", "selecao"}
+    extras_c: list[str] = []
+    extras_p: list[str] = []
+    for c in all_candidates:
+        if not c.fetchable or c.url in chosen_urls:
+            continue
+        text_lower = (c.menu_text or "").lower() + " " + c.url.lower()
+        if c.page and c.page.title:
+            text_lower += " " + c.page.title.lower()
+        if any(k in text_lower for k in concurso_kw):
+            extras_c.append(c.url)
+        if any(k in text_lower for k in pss_kw):
+            extras_p.append(c.url)
+    result.urls_extras_concursos = " | ".join(extras_c[:5])
+    result.urls_extras_processos = " | ".join(extras_p[:5])
+
     notes_parts = []
     total = len(all_candidates)
     fetchable = len([c for c in all_candidates if c.fetchable])
@@ -1238,7 +1288,9 @@ def process_municipio(session: requests.Session, municipio: str,
 # ---------------------------------------------------------------------------
 OUTPUT_FIELDS = [
     "uf", "municipio", "site_base",
-    "url_concursos", "url_processos_seletivos",
+    "url_concursos", "confianza_concursos",
+    "url_processos_seletivos", "confianza_processos",
+    "urls_extras_concursos", "urls_extras_processos",
     "tier_concursos", "tier_processos",
     "method", "razao", "notes", "checked_at",
 ]
@@ -1256,7 +1308,11 @@ def write_results(results: list[MunicipioResult], path: Path) -> None:
                 "municipio": r.municipio,
                 "site_base": r.site_base,
                 "url_concursos": r.url_concursos,
+                "confianza_concursos": r.confianza_concursos,
                 "url_processos_seletivos": r.url_processos_seletivos,
+                "confianza_processos": r.confianza_processos,
+                "urls_extras_concursos": r.urls_extras_concursos,
+                "urls_extras_processos": r.urls_extras_processos,
                 "tier_concursos": r.tier_concursos,
                 "tier_processos": r.tier_processos,
                 "method": r.method,
