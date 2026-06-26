@@ -1047,12 +1047,7 @@ def _try_combined_fill(session: requests.Session, chosen: dict,
 # Main pipeline: process one municipality
 # ---------------------------------------------------------------------------
 def _assign_confidence(tier: str) -> str:
-    """Map tier label to confidence level for the user-facing CSV.
-
-    confirmado  — found via free HTML scanning (Tier 1), high trust.
-    probable    — found via AI search/classification (Tier 2, directed, Tier 4).
-    revisar     — ambiguous or combined-page inference, needs human eyes.
-    """
+    """Initial confidence from tier. May be upgraded later by verification."""
     if not tier:
         return ""
     if tier in ("t1",):
@@ -1062,6 +1057,122 @@ def _assign_confidence(tier: str) -> str:
     if tier.endswith("_combined"):
         return "revisar"
     return "probable"
+
+
+LISTING_SIGNALS = [
+    r"\b\d{1,3}/20[12]\d\b",       # edital numbers like 001/2024
+    r"edital\s+n",                  # "Edital Nº"
+    r"inscri[cç][oõ]es\s+(aberta|encerrada)",
+    r"resultado\s+(final|parcial|preliminar)",
+    r"homologa[cç][aã]o",
+    r"retifica[cç][aã]o",
+]
+LISTING_RE = re.compile("|".join(LISTING_SIGNALS), re.I)
+
+CONCURSO_VERIFY_KW = [
+    "concurso publico", "concursos publicos", "concurso público",
+    "concursos públicos",
+]
+PSS_VERIFY_KW = [
+    "processo seletivo", "processos seletivos", "seletivo simplificado",
+    "selecao publica", "seleção pública", "pss ",
+]
+
+
+def _deterministic_verify(url: str, bucket: str,
+                          all_candidates: list[Candidate]) -> bool:
+    """Check if URL content looks like a real listing page for this bucket.
+
+    Returns True if confident enough to upgrade probable→confirmado.
+    """
+    cand = next((c for c in all_candidates if c.url == url and c.page), None)
+    if not cand or not cand.page:
+        return False
+    page = cand.page
+    text = norm(page.title + " " + page.text[:2000])
+
+    kw_list = CONCURSO_VERIFY_KW if bucket == "concursos" else PSS_VERIFY_KW
+    has_keyword = any(k in text for k in kw_list)
+    listing_matches = len(LISTING_RE.findall(page.text[:3000]))
+    has_multiple_items = listing_matches >= 2
+
+    return has_keyword and has_multiple_items
+
+
+def batch_gemini_verify(session: requests.Session, model: str,
+                        to_verify: list[dict],
+                        timeout: int = 30) -> dict[str, str]:
+    """Verify uncertain URLs in a single Gemini call.
+
+    to_verify: list of {"municipio": str, "bucket": str, "url": str,
+                        "title": str, "preview": str}
+    Returns {f"{municipio}|{bucket}": "confirmado" or "revisar"}
+    """
+    if not to_verify or not gemini_api_key():
+        return {}
+
+    items_text = ""
+    for i, item in enumerate(to_verify[:30]):
+        items_text += (
+            f"[{i}] Municipio: {item['municipio']}, Bucket: {item['bucket']}\n"
+            f"    URL: {item['url']}\n"
+            f"    Titulo: {item['title'][:120]}\n"
+            f"    Preview: {item['preview'][:250]}\n\n"
+        )
+
+    prompt = (
+        "Voce e um verificador de paginas de concursos publicos municipais.\n"
+        "Para cada item abaixo, responda se a URL e uma pagina INDICE/LISTAGEM "
+        "valida para o bucket indicado (concursos ou processos seletivos).\n\n"
+        "Criterios para CONFIRMAR:\n"
+        "- A pagina lista MULTIPLOS editais/concursos/processos (nao so um)\n"
+        "- O conteudo corresponde ao bucket (concursos OU processos seletivos)\n"
+        "- E uma pagina de listagem, nao um edital individual ou PDF\n"
+        "- Paginas combinadas (ambos tipos) sao validas para ambos buckets\n\n"
+        "Criterios para REVISAR:\n"
+        "- Pagina de um unico edital\n"
+        "- Conteudo nao corresponde ao bucket\n"
+        "- Pagina generica sem editais visiveis\n"
+        "- Licitacoes ou concursos culturais\n\n"
+        f"Items a verificar:\n{items_text}\n"
+        "Responda JSON array. Cada elemento: "
+        "{\"id\": N, \"veredicto\": \"confirmado\" ou \"revisar\", "
+        "\"motivo\": \"frase curta\"}\n"
+    )
+
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0, "maxOutputTokens": 4096,
+            "responseMimeType": "application/json",
+        },
+    }
+    try:
+        data = gemini_post(session, model, payload, timeout=60)
+        text = "\n".join(
+            p.get("text", "") for p in data["candidates"][0]["content"]["parts"]
+        )
+        verdicts = json.loads(text)
+        if isinstance(verdicts, dict) and "items" in verdicts:
+            verdicts = verdicts["items"]
+        if not isinstance(verdicts, list):
+            verdicts = [verdicts]
+
+        result = {}
+        for v in verdicts:
+            idx = v.get("id", -1)
+            if 0 <= idx < len(to_verify):
+                item = to_verify[idx]
+                key = f"{item['municipio']}|{item['bucket']}"
+                veredicto = v.get("veredicto", "revisar")
+                motivo = v.get("motivo", "")
+                result[key] = (veredicto, motivo)
+                print(f"    verify [{idx}] {item['municipio']}/{item['bucket']}: "
+                      f"{veredicto} — {motivo}", flush=True)
+        return result
+    except Exception as e:
+        print(f"    batch verify error: {e}", flush=True)
+        return {}
 
 
 @dataclass
@@ -1245,6 +1356,14 @@ def process_municipio(session: requests.Session, municipio: str,
     result.confianza_concursos = _assign_confidence(result.tier_concursos)
     result.confianza_processos = _assign_confidence(result.tier_processos)
 
+    # Deterministic upgrade: probable→confirmado if content clearly matches
+    if result.confianza_concursos == "probable" and result.url_concursos:
+        if _deterministic_verify(result.url_concursos, "concursos", all_candidates):
+            result.confianza_concursos = "confirmado"
+    if result.confianza_processos == "probable" and result.url_processos_seletivos:
+        if _deterministic_verify(result.url_processos_seletivos, "processos", all_candidates):
+            result.confianza_processos = "confirmado"
+
     # Downgrade to "revisar" when site not found or all tiers exhausted
     if not result.url_concursos and not result.url_processos_seletivos:
         if any(c.fetchable for c in all_candidates):
@@ -1320,7 +1439,92 @@ def write_results(results: list[MunicipioResult], path: Path) -> None:
                 "notes": r.notes,
                 "checked_at": now,
             })
-    print(f"\nResults written to {path}", flush=True)
+    print(f"\nCSV written to {path}", flush=True)
+
+    # --- Excel output with proper formatting ---
+    xlsx_path = path.with_suffix(".xlsx")
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Concursos RS"
+
+        # Colors for confidence levels
+        fills = {
+            "confirmado": PatternFill("solid", fgColor="C6EFCE"),  # green
+            "probable":   PatternFill("solid", fgColor="FFEB9C"),  # yellow
+            "revisar":    PatternFill("solid", fgColor="FFC7CE"),  # red/pink
+        }
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        link_font = Font(color="0563C1", underline="single", size=10)
+        wrap_align = Alignment(wrap_text=True, vertical="top")
+        thin_border = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin"),
+        )
+
+        # User-friendly column names
+        excel_cols = [
+            ("Municipio", 22),
+            ("Site Base", 30),
+            ("URL Concursos", 45),
+            ("Confianza C", 14),
+            ("URL Processos Seletivos", 45),
+            ("Confianza P", 14),
+            ("URLs Extras Concursos", 40),
+            ("URLs Extras Processos", 40),
+            ("Tier C", 8),
+            ("Tier P", 8),
+            ("Razon IA", 60),
+            ("Notas", 35),
+            ("Fecha", 22),
+        ]
+        for col_idx, (name, width) in enumerate(excel_cols, 1):
+            cell = ws.cell(row=1, column=col_idx, value=name)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin_border
+            ws.column_dimensions[cell.column_letter].width = width
+
+        for row_idx, r in enumerate(results, 2):
+            vals = [
+                r.municipio, r.site_base,
+                r.url_concursos, r.confianza_concursos,
+                r.url_processos_seletivos, r.confianza_processos,
+                r.urls_extras_concursos, r.urls_extras_processos,
+                r.tier_concursos, r.tier_processos,
+                r.razao, r.notes, now,
+            ]
+            for col_idx, val in enumerate(vals, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=val)
+                cell.alignment = wrap_align
+                cell.border = thin_border
+
+            # Color-code confidence columns
+            for conf_col in (4, 6):
+                cell = ws.cell(row=row_idx, column=conf_col)
+                if cell.value in fills:
+                    cell.fill = fills[cell.value]
+
+            # Make URLs clickable
+            for url_col in (2, 3, 5):
+                cell = ws.cell(row=row_idx, column=url_col)
+                if cell.value and str(cell.value).startswith("http"):
+                    cell.font = link_font
+                    cell.hyperlink = str(cell.value)
+
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
+        wb.save(xlsx_path)
+        print(f"Excel written to {xlsx_path}", flush=True)
+    except ImportError:
+        print("openpyxl not installed, skipping Excel output", flush=True)
+    except Exception as e:
+        print(f"Excel write error: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1414,12 +1618,69 @@ def main() -> int:
             traceback.print_exc()
             results.append(MunicipioResult(municipio=muni, notes=f"error: {e}"))
 
+    # --- Batch Gemini verification for uncertain results ---
+    to_verify: list[dict] = []
+    verify_index: dict[str, MunicipioResult] = {}
+    for r in results:
+        for bucket, url, conf in [
+            ("concursos", r.url_concursos, r.confianza_concursos),
+            ("processos", r.url_processos_seletivos, r.confianza_processos),
+        ]:
+            if conf == "probable" and url:
+                to_verify.append({
+                    "municipio": r.municipio, "bucket": bucket,
+                    "url": url, "title": "", "preview": "",
+                })
+                verify_index[f"{r.municipio}|{bucket}"] = r
+
+    if to_verify and gemini_api_key():
+        print(f"\n{'='*60}", flush=True)
+        print(f"Batch verification: {len(to_verify)} uncertain URLs", flush=True)
+        # Re-fetch minimal content for verification
+        for item in to_verify:
+            try:
+                pg = fetch_page(session, item["url"], timeout=args.timeout)
+                item["title"] = pg.title[:150] if pg else ""
+                item["preview"] = pg.text[:400] if pg else ""
+            except Exception:
+                pass
+
+        verdicts = batch_gemini_verify(session, args.model, to_verify)
+        for key, (veredicto, motivo) in verdicts.items():
+            r = verify_index.get(key)
+            if not r:
+                continue
+            muni, bucket = key.split("|", 1)
+            if bucket == "concursos":
+                r.confianza_concursos = veredicto
+                if motivo:
+                    r.notes += f"; verify_c: {motivo}"
+            else:
+                r.confianza_processos = veredicto
+                if motivo:
+                    r.notes += f"; verify_p: {motivo}"
+
+        confirmed = sum(1 for _, (v, _) in verdicts.items() if v == "confirmado")
+        print(f"  Verified: {confirmed}/{len(verdicts)} upgraded to confirmado",
+              flush=True)
+
     write_results(results, args.output)
 
+    # --- Summary ---
     found_c = sum(1 for r in results if r.url_concursos)
     found_p = sum(1 for r in results if r.url_processos_seletivos)
+    conf_c = sum(1 for r in results if r.confianza_concursos == "confirmado")
+    conf_p = sum(1 for r in results if r.confianza_processos == "confirmado")
+    prob_c = sum(1 for r in results if r.confianza_concursos == "probable")
+    prob_p = sum(1 for r in results if r.confianza_processos == "probable")
+    rev_c = sum(1 for r in results if r.confianza_concursos == "revisar")
+    rev_p = sum(1 for r in results if r.confianza_processos == "revisar")
     print(f"\nSummary: {found_c}/{len(results)} concursos, "
           f"{found_p}/{len(results)} processos found", flush=True)
+    print(f"  Concursos  — confirmado: {conf_c}, probable: {prob_c}, revisar: {rev_c}",
+          flush=True)
+    print(f"  Processos  — confirmado: {conf_p}, probable: {prob_p}, revisar: {rev_p}",
+          flush=True)
     return 0
 
 
