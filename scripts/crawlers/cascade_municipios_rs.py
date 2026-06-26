@@ -579,11 +579,11 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
     each either a URL string or empty string.
     """
     if not candidates:
-        return {"url_concursos": "", "url_processos_seletivos": ""}
+        return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
 
     fetchable = [c for c in candidates if c.fetchable and c.page]
     if not fetchable:
-        return {"url_concursos": "", "url_processos_seletivos": ""}
+        return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
 
     items = []
     for i, c in enumerate(fetchable[:15]):
@@ -648,7 +648,7 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
                 print(f"      tier3: recovered from truncated JSON", flush=True)
             else:
                 print(f"      tier3: no valid JSON: {text[:300]}", flush=True)
-                return {"url_concursos": "", "url_processos_seletivos": ""}
+                return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
 
         url_c = result.get("url_concursos", "")
         url_p = result.get("url_processos_seletivos", "")
@@ -672,11 +672,12 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         if not url_c and not url_p:
             print(f"      → nenhuma URL valida", flush=True)
 
-        return {"url_concursos": url_c, "url_processos_seletivos": url_p}
+        return {"url_concursos": url_c, "url_processos_seletivos": url_p,
+                "razao": razao}
 
     except Exception as e:
         print(f"      tier3 parse error: {e}", flush=True)
-        return {"url_concursos": "", "url_processos_seletivos": ""}
+        return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +859,11 @@ class MunicipioResult:
     url_processos_seletivos: str = ""
     method: str = ""
     notes: str = ""
+    # Observability: which tier resolved each bucket and Tier 3's reasoning,
+    # so the expensive run is fully diagnosable without re-spending Gemini.
+    tier_concursos: str = ""
+    tier_processos: str = ""
+    razao: str = ""
 
 
 def process_municipio(session: requests.Session, municipio: str,
@@ -897,9 +903,22 @@ def process_municipio(session: requests.Session, municipio: str,
 
     # --- TIER 3 on Tier 1 candidates (if we have any) ---
     chosen = {"url_concursos": "", "url_processos_seletivos": ""}
+    bucket_tier = {"url_concursos": "", "url_processos_seletivos": ""}
+    razones: list[str] = []
+
+    def _record(picked: dict, tier_label: str) -> None:
+        """Fill empty buckets from a Tier 3 result and note which tier won."""
+        for key in ("url_concursos", "url_processos_seletivos"):
+            if not chosen[key] and picked.get(key):
+                chosen[key] = picked[key]
+                bucket_tier[key] = tier_label
+        if picked.get("razao"):
+            razones.append(f"[{tier_label}] {picked['razao']}")
+
     if fetchable_t1 and gemini_api_key():
         print(f"    Tier 3: classifying {len(fetchable_t1)} Tier 1 candidates...", flush=True)
-        chosen = tier3_classify_and_pick(session, model, municipio, fetchable_t1, timeout)
+        picked = tier3_classify_and_pick(session, model, municipio, fetchable_t1, timeout)
+        _record(picked, "t1")
         tiers_used.append("t3")
 
     # --- TIER 2: Grounded search (only for missing buckets) ---
@@ -925,11 +944,8 @@ def process_municipio(session: requests.Session, municipio: str,
             fetchable_new = [c for c in new_t2 if c.fetchable]
             if fetchable_new:
                 print(f"    Tier 3: classifying {len(fetchable_new)} grounded candidates...", flush=True)
-                chosen2 = tier3_classify_and_pick(session, model, municipio, fetchable_new, timeout)
-                if not chosen["url_concursos"] and chosen2["url_concursos"]:
-                    chosen["url_concursos"] = chosen2["url_concursos"]
-                if not chosen["url_processos_seletivos"] and chosen2["url_processos_seletivos"]:
-                    chosen["url_processos_seletivos"] = chosen2["url_processos_seletivos"]
+                picked = tier3_classify_and_pick(session, model, municipio, fetchable_new, timeout)
+                _record(picked, "t2")
         except Exception as e:
             print(f"    Tier 2 error: {e}", flush=True)
             tiers_used.append("t2_err")
@@ -953,11 +969,8 @@ def process_municipio(session: requests.Session, municipio: str,
             fetchable_t4 = [c for c in new_t4 if c.fetchable]
             if fetchable_t4 and gemini_api_key():
                 print(f"    Tier 3: classifying {len(fetchable_t4)} playwright candidates...", flush=True)
-                chosen4 = tier3_classify_and_pick(session, model, municipio, fetchable_t4, timeout)
-                if not chosen["url_concursos"] and chosen4["url_concursos"]:
-                    chosen["url_concursos"] = chosen4["url_concursos"]
-                if not chosen["url_processos_seletivos"] and chosen4["url_processos_seletivos"]:
-                    chosen["url_processos_seletivos"] = chosen4["url_processos_seletivos"]
+                picked = tier3_classify_and_pick(session, model, municipio, fetchable_t4, timeout)
+                _record(picked, "t4")
         except Exception as e:
             print(f"    Tier 4 error: {e}", flush=True)
 
@@ -965,6 +978,9 @@ def process_municipio(session: requests.Session, municipio: str,
     result.url_concursos = chosen.get("url_concursos", "")
     result.url_processos_seletivos = chosen.get("url_processos_seletivos", "")
     result.method = "+".join(tiers_used)
+    result.tier_concursos = bucket_tier["url_concursos"]
+    result.tier_processos = bucket_tier["url_processos_seletivos"]
+    result.razao = " | ".join(razones)
 
     notes_parts = []
     total = len(all_candidates)
@@ -984,7 +1000,8 @@ def process_municipio(session: requests.Session, municipio: str,
 OUTPUT_FIELDS = [
     "uf", "municipio", "site_base",
     "url_concursos", "url_processos_seletivos",
-    "method", "notes", "checked_at",
+    "tier_concursos", "tier_processos",
+    "method", "razao", "notes", "checked_at",
 ]
 
 
@@ -1001,7 +1018,10 @@ def write_results(results: list[MunicipioResult], path: Path) -> None:
                 "site_base": r.site_base,
                 "url_concursos": r.url_concursos,
                 "url_processos_seletivos": r.url_processos_seletivos,
+                "tier_concursos": r.tier_concursos,
+                "tier_processos": r.tier_processos,
                 "method": r.method,
+                "razao": r.razao,
                 "notes": r.notes,
                 "checked_at": now,
             })
