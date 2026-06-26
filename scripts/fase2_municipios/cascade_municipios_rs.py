@@ -124,25 +124,73 @@ def make_session() -> requests.Session:
     return s
 
 
+# WAF / bot-block statuses where a plain-requests fetch is worth retrying with a
+# browser TLS fingerprint (curl_cffi). Many RS municipal portals (Next.js behind
+# a WAF, Cloudflare) reject the default requests JA3 but serve a real browser.
+_BLOCK_STATUSES = {403, 406, 409, 429, 503}
+
+
+def _page_from_html(final_url: str, status: int, content_type: str,
+                    html_text: str) -> Page:
+    if "text/html" not in content_type and "text/plain" not in content_type:
+        return Page(url=final_url, status=status, error="not_html")
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    if m:
+        title = re.sub(r"\s+", " ", m.group(1)).strip()
+    links = extract_links(final_url, html_text)
+    body_text = extract_text(html_text)
+    return Page(url=final_url, status=status, title=title,
+                text=body_text, links=links)
+
+
+def _fetch_browser_impersonate(url: str, timeout: int) -> Page | None:
+    """Fallback fetch with a real browser TLS fingerprint (curl_cffi).
+
+    Returns None when curl_cffi is unavailable so the caller keeps the original
+    requests-based result. Used only after a plain fetch is blocked/errors, so it
+    never changes behaviour for sites that already work.
+    """
+    try:
+        from curl_cffi import requests as creq
+    except Exception:
+        return None
+    # curl_cffi does not read proxy env vars by default; pass them through so the
+    # documented BR-proxy option also covers this fallback path.
+    proxies = {}
+    for scheme in ("http", "https"):
+        val = os.environ.get(f"{scheme.upper()}_PROXY") or os.environ.get(f"{scheme}_proxy")
+        if val:
+            proxies[scheme] = val
+    try:
+        resp = creq.get(url, timeout=timeout, allow_redirects=True,
+                        impersonate="chrome", proxies=proxies or None)
+        return _page_from_html(
+            str(resp.url), resp.status_code,
+            resp.headers.get("content-type", ""), resp.text)
+    except Exception as e:
+        return Page(url=url, error=f"curl_cffi: {str(e)[:180]}")
+
+
 def fetch_page(session: requests.Session, url: str, timeout: int = 15) -> Page:
     url = clean_url(url)
     if not url:
         return Page(url="", error="empty_url")
     try:
         resp = session.get(url, timeout=timeout, allow_redirects=True)
-        content_type = resp.headers.get("content-type", "")
-        if "text/html" not in content_type and "text/plain" not in content_type:
-            return Page(url=resp.url, status=resp.status_code, error="not_html")
-        html_text = resp.text
-        title = ""
-        m = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
-        if m:
-            title = re.sub(r"\s+", " ", m.group(1)).strip()
-        links = extract_links(resp.url, html_text)
-        body_text = extract_text(html_text)
-        return Page(url=resp.url, status=resp.status_code, title=title,
-                    text=body_text, links=links)
+        if resp.status_code in _BLOCK_STATUSES:
+            alt = _fetch_browser_impersonate(url, timeout)
+            if alt is not None and alt.ok:
+                return alt
+        page = _page_from_html(
+            str(resp.url), resp.status_code,
+            resp.headers.get("content-type", ""), resp.text)
+        return page
     except Exception as e:
+        # Connection reset / TLS handshake rejected by a WAF — retry as a browser.
+        alt = _fetch_browser_impersonate(url, timeout)
+        if alt is not None and alt.ok:
+            return alt
         return Page(url=url, error=str(e)[:200])
 
 
