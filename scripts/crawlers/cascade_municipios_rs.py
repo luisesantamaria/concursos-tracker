@@ -216,6 +216,9 @@ class Candidate:
 # TIER 0: Find/confirm site base
 # ---------------------------------------------------------------------------
 def domain_candidates(municipio: str) -> list[str]:
+    # Only the safe, full-name slugs (no collision-prone heuristics like
+    # first-word or pm+initials). When these miss, Tier 2 grounded search
+    # discovers the real domain — see tier2_find_site_grounded.
     slugs = []
     s1 = slugify(municipio)
     s2 = re.sub(r"[^a-z0-9]+", "", norm(municipio))
@@ -232,6 +235,27 @@ def domain_candidates(municipio: str) -> list[str]:
     return [u for u in urls if u not in seen and not seen.add(u)]
 
 
+def score_site_page(page: Page, municipio: str) -> int:
+    """How strongly a page looks like the official prefeitura homepage.
+
+    Used both by the free slug discovery (Tier 0) and the grounded domain
+    discovery fallback, so the validation bar is identical regardless of how
+    the URL was found.
+    """
+    blob = norm(page.title + " " + page.text[:2000])
+    muni_norm = norm(municipio)
+    score = 0
+    if muni_norm in blob:
+        score += 10
+    if "prefeitura" in blob:
+        score += 5
+    if ".rs.gov.br" in page.url:
+        score += 3
+    if ".atende.net" in page.url:
+        score += 2
+    return score
+
+
 def tier0_find_site(session: requests.Session, municipio: str,
                     timeout: int = 15) -> Page | None:
     candidates = domain_candidates(municipio)
@@ -241,17 +265,7 @@ def tier0_find_site(session: requests.Session, municipio: str,
         page = fetch_page(session, url, timeout)
         if not page.ok:
             continue
-        score = 0
-        blob = norm(page.title + " " + page.text[:2000])
-        muni_norm = norm(municipio)
-        if muni_norm in blob:
-            score += 10
-        if "prefeitura" in blob:
-            score += 5
-        if ".rs.gov.br" in page.url:
-            score += 3
-        if ".atende.net" in page.url:
-            score += 2
+        score = score_site_page(page, municipio)
         if score > best_score:
             best_score = score
             best = page
@@ -461,6 +475,83 @@ def tier2_grounded_search(session: requests.Session, model: str,
             c.fetchable = False
 
     return candidates
+
+
+def tier2_find_site_grounded(session: requests.Session, model: str,
+                             municipio: str, timeout: int = 15) -> Page | None:
+    """Discover the official prefeitura domain via grounded search.
+
+    Fallback for when the free slug guesses (Tier 0) miss because the real
+    host is non-obvious (abbreviations like pmpf, shortened names like
+    caxias, geo-blocked sites, migrations). No fixed rules: Gemini + Google
+    find the domain, and we validate it with the same score bar as Tier 0.
+    """
+    prompt = (
+        f"Qual e o site OFICIAL da Prefeitura Municipal de {municipio} "
+        f"({UF_NOME}, {UF_SIGLA}, Brasil)?\n"
+        "Responda com a URL da PAGINA INICIAL oficial (dominio .rs.gov.br, "
+        ".atende.net ou outro dominio oficial da prefeitura). "
+        "Nao responda com redes sociais, wikipedia, noticias nem portais de terceiros."
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
+    }
+    try:
+        data = gemini_post(session, model, payload, timeout=90)
+    except Exception as e:
+        print(f"      grounded site discovery error: {e}", flush=True)
+        return None
+
+    cand = (data.get("candidates") or [{}])[0]
+    text_response = "\n".join(
+        p.get("text", "") for p in (cand.get("content", {}) or {}).get("parts", [])
+        if isinstance(p, dict)
+    )
+    chunks = (cand.get("groundingMetadata", {}) or {}).get("groundingChunks", []) or []
+
+    # Collect candidate homepage URLs: grounding chunks first (real indexed
+    # URLs), then any URL mentioned in the text answer.
+    raw_urls: list[str] = []
+    for ch in chunks:
+        uri = (ch.get("web", {}) or {}).get("uri", "") if isinstance(ch, dict) else ""
+        if uri:
+            try:
+                raw_urls.append(session.get(uri, allow_redirects=True, timeout=timeout).url)
+            except Exception:
+                raw_urls.append(uri)
+    raw_urls.extend(re.findall(r"https?://[^\s\]\)\"'<>]+", text_response or ""))
+
+    # Reduce to candidate base domains, skipping junk hosts.
+    seen: set[str] = set()
+    base_urls: list[str] = []
+    for raw in raw_urls:
+        url = clean_url((raw or "").rstrip(".,;:"))
+        host = urlparse(url).netloc.lower()
+        if not host or host in seen:
+            continue
+        if any(bad in host for bad in BAD_HOSTS):
+            continue
+        seen.add(host)
+        base_urls.append(f"{urlparse(url).scheme}://{host}/")
+
+    print(f"      grounded site discovery: {len(base_urls)} domain candidates", flush=True)
+
+    best = None
+    best_score = -1
+    for url in base_urls:
+        page = fetch_page(session, url, timeout)
+        if not page.ok:
+            continue
+        score = score_site_page(page, municipio)
+        if score > best_score:
+            best_score = score
+            best = page
+    if best and best_score >= 5:
+        migrated = _check_migration(session, best, timeout)
+        return migrated or best
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -748,16 +839,25 @@ def process_municipio(session: requests.Session, municipio: str,
     tiers_used = []
     all_candidates: list[Candidate] = []
 
-    # --- TIER 0: Find site base ---
+    # --- TIER 0: Find site base (free slug guesses) ---
     print(f"  [{municipio}] Tier 0: finding site...", flush=True)
     home = tier0_find_site(session, municipio, timeout)
+    if home:
+        tiers_used.append("t0")
+    elif gemini_api_key():
+        # Free path missed (non-obvious domain, geo-block, migration):
+        # let grounded search discover the official domain.
+        print(f"    Tier 0 free miss; grounded site discovery...", flush=True)
+        home = tier2_find_site_grounded(session, model, municipio, timeout)
+        if home:
+            tiers_used.append("t2site")
+
     if not home:
         result.notes = "site_not_found"
-        result.method = "tier0_failed"
+        result.method = "+".join(tiers_used) + ("+" if tiers_used else "") + "tier0_failed"
         return result
     result.site_base = clean_url(home.url)
     print(f"    site: {result.site_base}", flush=True)
-    tiers_used.append("t0")
 
     # --- TIER 1: Free link discovery ---
     print(f"    Tier 1: scanning links...", flush=True)
