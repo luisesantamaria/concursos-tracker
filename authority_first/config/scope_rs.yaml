@@ -1,0 +1,37 @@
+scope:
+  country: BR
+  uf: RS
+  uf_name: Rio Grande do Sul
+  pilot_only: true
+
+municipality_registry:
+  source_csv: ../../data/sites_municipios_rs.csv
+  required_columns:
+    - uf
+    - ibge_codigo
+    - municipio
+    - municipio_slug
+    - home_url
+    - concursos_url
+    - processos_seletivos_url
+    - diario_municipal_url
+
+accept_if_any:
+  - uf_equals_rs
+  - municipality_slug_in_rs_registry
+  - municipality_name_in_rs_registry
+  - official_prefeitura_url_matches_rs_registry
+  - famurs_municipality_match
+  - bank_context_contains_rs_municipality
+  - bank_context_contains_explicit_rs
+
+reject_if:
+  - explicit_other_uf
+  - municipality_matches_non_rs_context
+  - no_rs_evidence
+
+ambiguous_policy:
+  action: quarantine
+  status: out_of_scope_pending
+  reason: candidate lacks hard RS evidence
+

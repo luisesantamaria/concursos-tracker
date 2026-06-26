@@ -1,0 +1,51 @@
+events:
+  edital_abertura:
+    primary: banca
+    fallback:
+      - prefeitura
+      - diario
+  retificacao:
+    primary: banca
+    fallback:
+      - diario
+  cronograma:
+    primary: banca
+    fallback: []
+  inscricao:
+    primary: banca
+    fallback: []
+  gabarito:
+    primary: banca
+    fallback: []
+  resultado_classificados:
+    primary: banca
+    fallback:
+      - diario
+  homologacao:
+    primary: diario
+    fallback:
+      - banca
+  convocacao:
+    primary:
+      - diario
+      - prefeitura
+    fallback: []
+  nomeacao:
+    primary:
+      - diario
+      - prefeitura
+    fallback: []
+  posse:
+    primary:
+      - diario
+      - prefeitura
+    fallback: []
+
+portal_radar:
+  ache_concursos:
+    can_create_candidate: true
+    can_verify: false
+    promotion_requires:
+      - official_source
+      - rs_scope_evidence
+

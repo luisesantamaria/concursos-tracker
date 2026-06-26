@@ -1,0 +1,16 @@
+diarios:
+  famurs:
+    name: Diario Oficial dos Municipios do Rio Grande do Sul
+    base_url: https://diariomunicipal.com.br/famurs/pesquisar
+    role:
+      - homologacao
+      - convocacao
+      - nomeacao
+      - posse
+      - edital_abertura_fallback
+    rs_filter_required: true
+  dom_proprio:
+    name: Diario oficial municipal proprio
+    notes: Municipios grandes pueden no usar FAMURS y requieren adapter dedicado.
+    rs_filter_required: true
+

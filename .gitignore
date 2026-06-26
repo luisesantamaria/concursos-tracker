@@ -1,0 +1,89 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+credentials*.json
+token*.json
+secrets/
+.secrets/
+
+# Local assistant/runtime state
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pip-wheel-metadata/
+
+# Node/build artifacts
+node_modules/
+dist/
+build/
+
+# Runtime output and generated files
+logs/
+log/
+output/
+outputs/
+tmp/
+temp/
+*.log
+*.tmp
+*.bak
+*.old
+*.cache
+.cache/
+*.sqlite
+*.db
+
+# Generated data and spreadsheet exports
+/data/
+laboratorio/**/data/
+authority_first/data/*
+!authority_first/data/
+!authority_first/data/golden_set_v1.csv
+!authority_first/data/municipios_resources_rs.csv
+authority_first/data/raw/
+authority_first/data/exports/
+authority_first/data/logs/
+authority_first/data/normalized/
+authority_first/data/archive_runpod_deleted/
+authority_first/data/*test*.csv
+authority_first/data/*probe*.csv
+authority_first/data/*fallback*.csv
+authority_first/data/*fix*.csv
+authority_first/data/*grounded*.csv
+authority_first/data/*gemini*.csv
+authority_first/data/*review*.csv
+authority_first/data/*.xlsx
+*.xlsx
+*.xlsm
+*.xls
+~$*
+
+# Heavy models/checkpoints
+models/
+modelos/
+checkpoints/
+*.ckpt
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# iCloud/local operational files
+icloud-sync-test-*.txt
+priority-upload-*.txt

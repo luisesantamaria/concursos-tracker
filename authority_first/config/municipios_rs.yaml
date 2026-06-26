@@ -1,0 +1,6 @@
+municipios:
+  registry_csv: ../../data/sites_municipios_rs.csv
+  expected_count: 497
+  accepted_uf: RS
+  use_as_whitelist: true
+

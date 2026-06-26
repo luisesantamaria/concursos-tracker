@@ -1,0 +1,72 @@
+table: concursos_base_rs
+description: MVP base table for RS concursos/processos seletivos.
+scope:
+  uf: RS
+  require_scope_guard: true
+
+columns:
+  - name: semaforo
+    allowed:
+      - listo
+      - revisar
+      - no_encontrado
+    required: true
+  - name: tipo
+    allowed:
+      - concurso_publico
+      - processo_seletivo
+    required: true
+  - name: orgao
+    required: true
+    notes: Nombre completo y limpio, no siglas si se puede inferir con seguridad.
+  - name: municipio
+    required: false
+    notes: Municipio RS cuando aplique.
+  - name: uf
+    allowed:
+      - RS
+    required: true
+  - name: numero
+    required: false
+    normalized_format: "nº 01/2026"
+    notes: Numero del edital o processo seletivo. No extraer de cronograma/anexo si contradice el edital de abertura.
+  - name: banca
+    required: false
+  - name: pagina_oficial
+    required: false
+    hyperlink: true
+    notes: Pagina estable del certamen con todos los documentos.
+  - name: edital_abertura_url
+    required: false
+    hyperlink: true
+    notes: Link directo al edital de abertura.
+  - name: fonte_primaria
+    allowed:
+      - banca
+      - prefeitura
+      - diario
+    required: false
+  - name: fonte_radar
+    required: false
+  - name: radar_url
+    required: false
+    hyperlink: true
+  - name: evidencia_rs
+    required: true
+  - name: status_validacao
+    required: true
+  - name: last_checked
+    required: true
+
+validation_rules:
+  - id: rs_only
+    description: Candidate must pass authority_first/scripts/shared/scope_rs.py.
+  - id: stable_official_page
+    description: pagina_oficial must not be a generic homepage if a certame-specific page exists.
+  - id: opening_edital_only
+    description: edital_abertura_url must not be cronograma, aviso, anexo, lista, gabarito, resultado or retificacao.
+  - id: split_multiple_editais
+    description: Multiple edital numbers for the same orgao/municipio become separate rows.
+  - id: radar_cannot_verify
+    description: Ache or other radar sources can suggest candidates but cannot mark a row as listo.
+

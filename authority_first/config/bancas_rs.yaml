@@ -1,0 +1,43 @@
+bancas:
+  legalle_instituto:
+    name: Instituto Legalle
+    base_urls:
+      - https://portal.institutolegalle.org.br/edital
+    rs_filter_required: true
+  legalle_editais:
+    name: Legalle Concursos
+    base_urls:
+      - https://portal.editais.legalleconcursos.com.br/edital/index/abertos
+      - https://portal.editais.legalleconcursos.com.br/edital/index/andamento
+      - https://portal.editais.legalleconcursos.com.br/edital/index/encerrados
+    rs_filter_required: true
+  lasalle:
+    name: Fundacao La Salle
+    base_urls:
+      - https://fundacaolasalle.org.br/concursos/?filtro=inscricoes-abertas
+      - https://fundacaolasalle.org.br/concursos/?filtro=em-andamento
+      - https://fundacaolasalle.org.br/concursos/?filtro=encerradas
+    rs_filter_required: true
+  fundatec:
+    name: Fundatec
+    base_urls:
+      - https://www.fundatec.org.br/portal/concursos/
+    edital_page_pattern: https://www.fundatec.org.br/portal/concursos/pagina_editais.php?concurso={id}
+    rs_filter_required: true
+  quadrix:
+    name: Instituto Quadrix
+    base_urls:
+      - https://quadrix.org.br/todos-os-concursos/
+    edital_page_pattern: https://quadrix.org.br/informacoes/{id}/
+    rs_filter_required: true
+  objetiva:
+    name: Objetiva Concursos
+    base_urls:
+      - https://www.objetivas.com.br/
+    rs_filter_required: true
+  cebraspe:
+    name: Cebraspe
+    base_urls:
+      - https://www.cebraspe.org.br/concursos/
+    rs_filter_required: true
+
