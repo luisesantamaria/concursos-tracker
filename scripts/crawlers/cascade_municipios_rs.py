@@ -717,11 +717,16 @@ def _get_browser():
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if proxy_url:
             launch_args.append(f"--proxy-server={proxy_url}")
-        # A re-terminating egress proxy presents a per-host forged chain rooted
-        # at the bundle CA; tell Chromium to accept it.
-        ca_bundle = os.environ.get("NODE_EXTRA_CA_CERTS", "/root/.ccr/ca-bundle.crt")
-        if os.path.exists(ca_bundle):
-            launch_args += ["--ignore-certificate-errors", "--test-type"]
+            # A re-terminating egress proxy forges a per-host cert chain and
+            # cannot complete BoringSSL's TLS 1.3 ClientHello (post-quantum
+            # keyshare). Accept the forged cert and cap at TLS 1.2 so the
+            # tunnel handshake succeeds. Only applied when a proxy is present;
+            # direct-egress (production) keeps modern TLS.
+            launch_args += [
+                "--ignore-certificate-errors",
+                "--test-type",
+                "--ssl-version-max=tls1.2",
+            ]
         _BROWSER = pw.chromium.launch(
             headless=True,
             executable_path=chrome_path,
@@ -749,6 +754,7 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
+            ignore_https_errors=True,
         )
         page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
