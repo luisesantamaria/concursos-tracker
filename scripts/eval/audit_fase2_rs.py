@@ -52,9 +52,24 @@ BUCKET_LABEL = {
 }
 
 
+WALL_MARKERS = [
+    "usa cookies", "utiliza cookies", "aceitar cookies", "aceite os cookies",
+    "faca seu login", "faça seu login", "habilite o javascript",
+    "enable javascript", "ative o javascript", "ativar o javascript",
+]
+
+
 def distinct_listing_items(text: str) -> int:
     """How many distinct edital-like items the page text exposes."""
     return len({m.group(0).lower() for m in LISTING_RE.finditer(text or "")})
+
+
+def _looks_like_wall(text: str) -> bool:
+    """A short cookie/login/JS stub that hides the real page (not verifiable)."""
+    if len(text or "") > 2500 or distinct_listing_items(text) >= 2:
+        return False
+    blob = norm(text)
+    return any(norm(m) in blob for m in WALL_MARKERS)
 
 
 def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
@@ -134,7 +149,7 @@ def ai_verdict(session, model: str, municipio: str, bucket: str,
         f"Município: {municipio}. BUCKET ALVO: {BUCKET_LABEL.get(bucket, bucket)}.\n\n"
         "Conteúdo renderizado da página:\n"
         f"TÍTULO: {title[:200]}\n"
-        f"TEXTO: {text[:3000]}\n\n"
+        f"TEXTO: {text[:6000]}\n\n"
         "A página funciona como ÍNDICE/LISTAGEM do bucket alvo? Responda com UMA "
         "decisão discreta (JSON):\n"
         '{"veredicto": "valido_indice" | "tipo_equivocado" | "nao_e_indice" '
@@ -264,7 +279,17 @@ def audit_one(session, bucket: str, url: str, timeout: int,
             return "soft", ["bloqueo_antibot_no_verificable"]
         return "hard", [f"inalcanzable_status_{status or 'err'}"]
 
+    # Cookie / login wall: a short stub that hides the real page → not verifiable.
+    if _looks_like_wall(text):
+        return "soft", ["muro_cookies_login_no_verificable"]
+
     det_sev, det_flags = _deterministic(bucket, url, title, text, js_like)
+
+    # We only trust an AI "bad" verdict as HARD when we are confident we judged
+    # the REAL content: either the page rendered, or the static page was already a
+    # rich index. Otherwise (thin nav/menu of a JS portal we could not fully load)
+    # a bad verdict is downgraded to SOFT — likely an artefact, not a true FP.
+    confident = rendered or static_rich
 
     # AI adjudication (discrete decision) — the only automatable way to catch a
     # valid-looking listing of the WRONG legal type (semantic ambiguity).
@@ -277,7 +302,8 @@ def audit_one(session, bucket: str, url: str, timeout: int,
         if v == "erro":
             # AI failed — keep the structural result.
             return det_sev, det_flags + [f"ai_erro: {motivo}"]
-        return "hard", [f"ai_{v}({tag}): {motivo}"]
+        sev = "hard" if confident else "soft"
+        return sev, [f"ai_{v}({tag}{'' if confident else ',low_conf'}): {motivo}"]
 
     if rendered and det_sev != "ok":
         det_flags = [f"{f}(rendered)" for f in det_flags]
