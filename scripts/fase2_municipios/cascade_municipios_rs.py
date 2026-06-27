@@ -102,6 +102,7 @@ class Page:
     text: str = ""
     links: list[tuple[str, str]] = field(default_factory=list)
     error: str = ""
+    is_spa: bool = False  # served HTML is a JS shell (menu rendered client-side)
 
     @property
     def ok(self) -> bool:
@@ -140,8 +141,15 @@ def _page_from_html(final_url: str, status: int, content_type: str,
         title = re.sub(r"\s+", " ", m.group(1)).strip()
     links = extract_links(final_url, html_text)
     body_text = extract_text(html_text)
+    # SPA shell: framework markers present but the served HTML exposes almost no
+    # links (the menu is rendered client-side). Tier 1 must render it to see it.
+    html_low = html_text[:200000].lower()
+    spa_markers = ("__next_data__" in html_low or "/_next/" in html_low
+                   or "window.__nuxt__" in html_low or "data-reactroot" in html_low
+                   or 'id="__nuxt"' in html_low)
+    is_spa = spa_markers and len([h for h, _ in links if h.startswith("http")]) < 8
     return Page(url=final_url, status=status, title=title,
-                text=body_text, links=links)
+                text=body_text, links=links, is_spa=is_spa)
 
 
 def _fetch_browser_impersonate(url: str, timeout: int) -> Page | None:
@@ -948,6 +956,56 @@ def _get_browser():
     return _BROWSER
 
 
+def _render_page_links(url: str, timeout: int = 20) -> list[tuple[str, str]]:
+    """Load a JS-rendered page in a headless browser and return its <a> links.
+
+    Used only for SPA shells in Tier 1, where the served HTML has no usable menu.
+    Reuses the shared browser; returns [] if the browser is unavailable so the
+    caller silently keeps the (empty) static result.
+    """
+    try:
+        browser = _get_browser()
+    except Exception as e:
+        print(f"      SPA render unavailable: {e}", flush=True)
+        return []
+    context = None
+    try:
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            ignore_https_errors=True,
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        page.wait_for_timeout(2000)
+        links = page.evaluate("""() => {
+            const results = [];
+            document.querySelectorAll('a[href]').forEach(el => {
+                results.push({href: el.href, text: (el.innerText || '').trim()});
+            });
+            return results;
+        }""")
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for link in links:
+            href = link.get("href", "")
+            if href.startswith("http") and href not in seen:
+                seen.add(href)
+                out.append((href, link.get("text", "")))
+        return out
+    except Exception as e:
+        print(f"      SPA render error: {e}", flush=True)
+        return []
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
 def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
     """Navigate the site like a human: open menus, follow relevant links."""
     try:
@@ -1284,6 +1342,17 @@ def process_municipio(session: requests.Session, municipio: str,
 
     # --- TIER 1: Free link discovery ---
     print(f"    Tier 1: scanning links...", flush=True)
+    # SPA shell: the served HTML has no usable menu (rendered client-side).
+    # Render it once with the browser so Tier 1 can see the real links. Gated on
+    # use_playwright; normal sites are untouched and stay cheap.
+    if home.is_spa and use_playwright and len(home.links) < 8:
+        print(f"    Tier 1: SPA shell detected, rendering menu with browser...", flush=True)
+        rendered = _render_page_links(home.url, timeout)
+        if rendered:
+            existing = {h for h, _ in home.links}
+            home.links.extend((h, t) for h, t in rendered if h not in existing)
+            print(f"    Tier 1: rendered {len(rendered)} links from SPA menu", flush=True)
+            tiers_used.append("t1spa")
     t1_candidates = tier1_collect_candidates(session, home, municipio, timeout)
     all_candidates.extend(t1_candidates)
     fetchable_t1 = [c for c in t1_candidates if c.fetchable]
