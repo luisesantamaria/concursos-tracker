@@ -127,6 +127,32 @@ externo cuya URL "se pudra". Mitigación futura: un modo `--reverify-confirmed`
 solo-determinístico (re-baja las URLs confirmadas y marca las que ya no listan, sin
 llamar a Gemini).
 
+## Auditoría / monitoreo de falsos positivos (recurrente)
+
+El golden cubre 24; para auditar TODOS los confirmados (cientos) y cazar FPs
+escondidos de cualquier clase (URL muerta, PDF, página de detalle/noticia, tipo
+equivocado) hay un auditor determinístico (sin Gemini). Córrelo desde Brasil
+(necesita alcanzar los sitios), tras cada corrida grande y de forma periódica
+(detecta también link rot cuando los sitios cambian):
+
+```bash
+python scripts/eval/audit_fase2_rs.py \
+  --input data/fase2/municipios_rs.csv --detalle
+```
+
+Clasifica cada URL confirmada en **OK / SOFT / HARD** y escribe un CSV
+`<input>_auditoria.csv` solo con los sospechosos:
+
+- **HARD** = problema estructural casi seguro (PDF, 4xx muerta, ruta de detalle/
+  noticia, o sin keyword del bucket en página con texto sustancial). Revisar y,
+  si es FP, bajar a `revisar` en el CSV.
+- **SOFT** = no verificable sin navegador (SPA/antibot, 5xx transitorio, listado
+  corto en página JS). Ojeo opcional.
+
+Lo que el auditor NO atrapa: ambigüedad semántica (listado real, keywords
+correctas, tipo legal equivocado — ej. "Processo Seletivo Público" que es un
+concurso). Ese residuo (~0.4%) necesita una muestra humana de ~40 confirmados.
+
 ## Gate de precisión (antes de escalar)
 
 Tras una corrida, valida contra el golden set (verdad de campo, 24 municipios):
