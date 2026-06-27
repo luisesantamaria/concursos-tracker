@@ -140,14 +140,18 @@ def ai_verdict(session, model: str, municipio: str, bucket: str,
         '{"veredicto": "valido_indice" | "tipo_equivocado" | "nao_e_indice" '
         '| "licitacao_ou_cultural", "motivo": "frase curta"}\n\n'
         "Definições:\n"
-        "- valido_indice: lista MÚLTIPLOS editais/processos DO TIPO do bucket alvo.\n"
-        "- tipo_equivocado: é um índice, mas do OUTRO tipo (ex.: o bucket pede "
-        "processos seletivos e a página lista concursos públicos, ou vice-versa).\n"
-        "- nao_e_indice: edital único, notícia, PDF ou página vazia.\n"
+        "- valido_indice: lista MÚLTIPLOS editais/processos do tipo do bucket alvo. "
+        "INCLUI páginas COMBINADAS que listam AMBOS os tipos (concursos E processos "
+        "seletivos) — uma página combinada é valido_indice para QUALQUER bucket.\n"
+        "- tipo_equivocado: é um índice de UM tipo só, e é o OUTRO (ex.: o bucket pede "
+        "processos seletivos e a página lista SOMENTE concursos públicos, ou vice-versa). "
+        "NÃO use este veredicto se a página lista os dois tipos.\n"
+        "- nao_e_indice: edital único, notícia, PDF ou página vazia/sem itens.\n"
         "- licitacao_ou_cultural: licitação/pregão ou concurso cultural (soberana/rainha).\n\n"
         "IMPORTANTE: classifique pelo CONTEÚDO real, não pelo título. "
         "Um 'Processo Seletivo Público' cujos itens são do tipo Concurso Público "
-        "conta como concurso, não como PSS."
+        "conta como concurso, não como PSS. Na dúvida entre valido e tipo_equivocado "
+        "quando há itens do bucket alvo presentes, escolha valido_indice."
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -224,17 +228,32 @@ def audit_one(session, bucket: str, url: str, timeout: int,
     page = fetch_page(session, url, timeout)
     title, text = page.title, page.text
     reachable = page.ok and not getattr(page, "is_antibot", False)
-    js_like = (getattr(page, "is_spa", False) or getattr(page, "is_antibot", False)
-               or len(page.text) < 800 or not page.ok)
+
+    # Is the STATIC page already a rich index (keyword + several items)? If so we
+    # trust it and skip rendering — rendering some portals returns a degraded
+    # "baixe a versão atualizada" view that is worse than the static content.
+    kws0 = [norm(k) for k in BUCKET_KEYWORDS[bucket]]
+
+    def _is_rich(t: str, x: str) -> bool:
+        blob0 = norm((t or "") + " " + (x or "")[:4000])
+        return any(k in blob0 for k in kws0) and distinct_listing_items(x) >= 2
+
+    static_rich = reachable and _is_rich(title, text)
     rendered = False
 
-    # Render when the static fetch is weak/blocked and rendering is enabled.
-    if do_render and (js_like or not reachable):
+    # Render when the static page is weak: blocked/unreachable, or not already a
+    # rich index (covers JS portals like atende.net that serve a short shell).
+    if do_render and (not reachable or not static_rich):
         r = render_page(url, timeout)
-        if r and (r[1] or "").strip():
+        # Keep the richer of the two — never let a degraded render replace good
+        # static content.
+        if r and len(r[1] or "") > len(text):
             title, text = r
             rendered = True
-            js_like = False  # we now have the real content
+
+    js_like = (not rendered) and (
+        getattr(page, "is_spa", False) or getattr(page, "is_antibot", False)
+        or len(page.text) < 800 or not page.ok)
 
     # If still unreachable and no render, fall back to status-based verdict.
     if not reachable and not rendered:
