@@ -1506,16 +1506,15 @@ def process_municipio(session: requests.Session, municipio: str,
             result.confianza_processos = "confirmado"
 
     # Downgrade to "revisar" when site not found or all tiers exhausted
+    antibot_block = False
     if not result.url_concursos and not result.url_processos_seletivos:
         if any(c.fetchable for c in all_candidates):
             result.confianza_concursos = "revisar"
             result.confianza_processos = "revisar"
         # Honest reporting: if the official site only served an anti-bot JS
-        # challenge, this is a block, not a real miss. Label it so the reviewer
+        # challenge, this is a block, not a real miss. Flag it so the reviewer
         # does not waste time hunting for an index that exists behind the wall.
-        if home.is_antibot:
-            note = "bloqueo_antibot: site responde challenge JS (indice no accesible)"
-            result.notes = f"{result.notes}; {note}" if result.notes else note
+        antibot_block = home.is_antibot
 
     # --- Collect extra valid URLs (others Tier 3 could have picked) ---
     # Only emitted for buckets a human will actually review: when the chosen URL
@@ -1552,6 +1551,8 @@ def process_municipio(session: requests.Session, municipio: str,
         notes_parts.append(f"{total} candidates ({fetchable} fetchable)")
     if not result.url_concursos and not result.url_processos_seletivos:
         notes_parts.append("no valid index page found")
+    if antibot_block:
+        notes_parts.append("bloqueo_antibot: site responde challenge JS (indice no accesible)")
     result.notes = "; ".join(notes_parts)
 
     return result
@@ -1587,7 +1588,7 @@ def _read_existing_rows(path: Path) -> dict[str, dict]:
 
 
 def write_results(results: list[MunicipioResult], path: Path,
-                  append: bool = False) -> None:
+                  append: bool = False, csv_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1618,6 +1619,8 @@ def write_results(results: list[MunicipioResult], path: Path,
         writer.writeheader()
         for row in ordered:
             writer.writerow({k: row.get(k, "") for k in OUTPUT_FIELDS})
+    if csv_only:
+        return
     print(f"\nCSV written to {path} ({len(ordered)} rows)", flush=True)
 
     # --- Excel output with proper formatting ---
@@ -1830,6 +1833,14 @@ def main() -> int:
             print(f"  ERROR: {e}", flush=True)
             traceback.print_exc()
             results.append(MunicipioResult(municipio=muni, notes=f"error: {e}"))
+
+        # Checkpoint after every municipality (CSV only, fast) so a crash/stop
+        # loses nothing: re-running with --skip-existing resumes where it left off.
+        try:
+            write_results(results, args.output,
+                          append=args.append or args.skip_existing, csv_only=True)
+        except Exception as e:
+            print(f"  checkpoint write failed: {e}", flush=True)
 
     # --- Batch Gemini verification for uncertain results ---
     to_verify: list[dict] = []
