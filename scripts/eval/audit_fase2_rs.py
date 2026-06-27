@@ -302,6 +302,11 @@ def audit_one(session, bucket: str, url: str, timeout: int,
         if v == "erro":
             # AI failed — keep the structural result.
             return det_sev, det_flags + [f"ai_erro: {motivo}"]
+        # Anti-pruning guard: a page with >=2 distinct edital numbers (NN/AAAA) IS
+        # a listing. Hard structural evidence overrides the model misreading it as
+        # a single detail/empty page (only for nao_e_indice; type errors stand).
+        if v == "nao_e_indice" and distinct_listing_items(text) >= 2:
+            return "ok", [f"ai_nao_e_indice_anulado_por_listado({tag})"]
         sev = "hard" if confident else "soft"
         return sev, [f"ai_{v}({tag}{'' if confident else ',low_conf'}): {motivo}"]
 
