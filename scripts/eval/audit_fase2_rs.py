@@ -53,8 +53,6 @@ def audit_url(session, bucket: str, url: str, timeout: int) -> tuple[str, list[s
 
     severity: "ok" | "soft" (verify manually) | "hard" (likely a real problem).
     """
-    flags: list[str] = []
-
     if is_pdf_or_file(url):
         return "hard", ["es_pdf_o_archivo"]
 
@@ -63,39 +61,52 @@ def audit_url(session, bucket: str, url: str, timeout: int) -> tuple[str, list[s
     if getattr(page, "is_antibot", False):
         return "soft", ["bloqueo_antibot_no_verificable"]
     if not page.ok:
-        return "hard", [f"inalcanzable_status_{page.status or 'err'}"]
+        status = page.status or 0
+        # 5xx is usually a transient server hiccup, not a dead/wrong link.
+        if 500 <= status <= 599:
+            return "soft", [f"servidor_5xx_reintentar({status})"]
+        return "hard", [f"inalcanzable_status_{status or 'err'}"]
 
     blob = norm(page.title + " " + page.text[:4000])
-
-    # 1) The page must mention the bucket type at all.
     kws = [norm(k) for k in BUCKET_KEYWORDS[bucket]]
-    if not any(k in blob for k in kws):
-        flags.append("sin_keyword_del_bucket")
+    has_kw = any(k in blob for k in kws)
+    # A JS-rendered page (SPA markers or near-empty static text) carries its real
+    # content client-side, so missing keywords/items there is not evidence of a
+    # bad page — only a limitation of a no-browser check. Such findings are soft.
+    js_like = getattr(page, "is_spa", False) or len(page.text) < 800
 
-    # 2) Reject content (licitacao / cultural) when the bucket keyword is weak.
-    if any(rk in blob for rk in REJECT_KEYWORDS) and not any(k in blob for k in kws):
-        flags.append("posible_licitacao_o_cultural")
+    hard: list[str] = []
+    soft: list[str] = []
 
-    # 3) Obvious detail/news single-item URL.
+    # Detail / news single-item route — structural, always a real problem.
     low_url = url.lower()
     if any(h in low_url for h in DETAIL_PATH_HINTS):
-        flags.append("ruta_de_detalle")
+        hard.append("ruta_de_detalle")
 
-    # 4) Index check: a listing exposes several distinct edital items. Skip this
-    #    when the page renders via JS (SPA) — the items are not in the static
-    #    text, so absence is not evidence of a non-index. Flag those as soft.
+    # Missing bucket keyword: hard only when the static page is substantial and
+    # still has no mention; otherwise it is likely JS-rendered → soft.
+    if not has_kw:
+        if js_like:
+            soft.append("sin_keyword_posible_js")
+        else:
+            hard.append("sin_keyword_del_bucket")
+
+    # Reject content (licitacao / cultural) without a bucket keyword → verify.
+    if not has_kw and any(rk in blob for rk in REJECT_KEYWORDS):
+        soft.append("posible_licitacao_o_cultural")
+
+    # Index check: a real listing exposes several distinct edital items. Absent
+    # on JS pages by design, so soft there.
     n_items = distinct_listing_items(page.text)
-    if getattr(page, "is_spa", False):
-        flags.append("spa_render_js_verificar_manual")
+    if js_like:
+        soft.append("render_js_verificar_manual")
     elif n_items < 2:
-        flags.append(f"pocos_items_listado({n_items})_posible_detalle_o_vacio")
+        soft.append(f"pocos_items_listado({n_items})_posible_detalle_o_vacio")
 
+    flags = hard + soft
     if not flags:
         return "ok", []
-    # "hard" only for the structural certainties; the rest is "soft".
-    hard = {"sin_keyword_del_bucket", "ruta_de_detalle"}
-    severity = "hard" if any(f in hard for f in flags) else "soft"
-    return severity, flags
+    return ("hard" if hard else "soft"), flags
 
 
 def main() -> int:
