@@ -103,6 +103,7 @@ class Page:
     links: list[tuple[str, str]] = field(default_factory=list)
     error: str = ""
     is_spa: bool = False  # served HTML is a JS shell (menu rendered client-side)
+    is_antibot: bool = False  # served HTML is an anti-bot JS challenge (DDoS-Guard, etc.)
 
     @property
     def ok(self) -> bool:
@@ -148,8 +149,16 @@ def _page_from_html(final_url: str, status: int, content_type: str,
                    or "window.__nuxt__" in html_low or "data-reactroot" in html_low
                    or 'id="__nuxt"' in html_low)
     is_spa = spa_markers and len([h for h, _ in links if h.startswith("http")]) < 8
+    # Anti-bot JS challenge (DDoS-Guard / "checking your browser"): a thin page
+    # whose only job is to reload until a cookie is set. Not a real miss — flag
+    # it so the report says "blocked", not "index not found".
+    title_low = title.lower()
+    challenge = ("one moment, please" in title_low or "just a moment" in title_low
+                 or "ddos-guard" in html_low or "checking your browser" in html_low
+                 or "attention required" in title_low)
+    is_antibot = challenge and len(body_text) < 1500
     return Page(url=final_url, status=status, title=title,
-                text=body_text, links=links, is_spa=is_spa)
+                text=body_text, links=links, is_spa=is_spa, is_antibot=is_antibot)
 
 
 def _fetch_browser_impersonate(url: str, timeout: int) -> Page | None:
@@ -1501,6 +1510,12 @@ def process_municipio(session: requests.Session, municipio: str,
         if any(c.fetchable for c in all_candidates):
             result.confianza_concursos = "revisar"
             result.confianza_processos = "revisar"
+        # Honest reporting: if the official site only served an anti-bot JS
+        # challenge, this is a block, not a real miss. Label it so the reviewer
+        # does not waste time hunting for an index that exists behind the wall.
+        if home.is_antibot:
+            note = "bloqueo_antibot: site responde challenge JS (indice no accesible)"
+            result.notes = f"{result.notes}; {note}" if result.notes else note
 
     # --- Collect extra valid URLs (others Tier 3 could have picked) ---
     # Only emitted for buckets a human will actually review: when the chosen URL
