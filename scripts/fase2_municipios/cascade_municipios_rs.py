@@ -153,10 +153,16 @@ def _page_from_html(final_url: str, status: int, content_type: str,
     # whose only job is to reload until a cookie is set. Not a real miss — flag
     # it so the report says "blocked", not "index not found".
     title_low = title.lower()
-    challenge = ("one moment, please" in title_low or "just a moment" in title_low
-                 or "ddos-guard" in html_low or "checking your browser" in html_low
-                 or "attention required" in title_low)
-    is_antibot = challenge and len(body_text) < 1500
+    challenge_title = ("one moment, please" in title_low or "just a moment" in title_low
+                       or "checking your browser" in title_low
+                       or "attention required" in title_low)
+    # Explicit challenge markers (Cloudflare / DDoS-Guard) are unambiguous and
+    # can ship a large body, so they flag regardless of page size. A generic
+    # challenge title only flags when the page is thin (no real content).
+    hard_markers = ("challenge-platform" in html_low or "/cdn-cgi/challenge" in html_low
+                    or "_cf_chl_opt" in html_low or "cf_chl_" in html_low
+                    or "ddos-guard" in html_low)
+    is_antibot = hard_markers or (challenge_title and len(body_text) < 1500)
     return Page(url=final_url, status=status, title=title,
                 text=body_text, links=links, is_spa=is_spa, is_antibot=is_antibot)
 
