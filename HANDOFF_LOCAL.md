@@ -1,5 +1,10 @@
 # Concursos Tracker — Handoff completo de sesión (web → local Windows)
 
+> **Última actualización:** rama `claude/skill-files-accuracy-vd6uyt` en el commit
+> `81c601d` (correcciones de FP) sobre `4a4aed6` (snapshot del CSV de las 497) y
+> `c1fdea4` (este handoff). El CSV de datos YA está en GitHub (ver §3). Si al hacer
+> `git pull` ves commits más nuevos, esos mandan sobre lo aquí escrito.
+
 > **Qué es este archivo.** Es la transferencia literal de una sesión larga de
 > Claude Code (web) a una sesión local nueva en Windows. Contiene TODO: contexto,
 > meta, arquitectura, dónde vamos, el porqué de cada decisión, cómo correr, y las
@@ -59,17 +64,26 @@ municipio de RS. **Esta fase NO extrae editais/PDFs individuales** — eso es fa
 
 ### Estado numérico actual (497 municipios de RS, corrida completa hecha)
 
+Números REALES calculados del CSV commiteado `data/fase2/municipios_rs_local.csv`
+(no de memoria), en el commit `81c601d`:
+
 | Estado | # | % |
 |---|---|---|
-| ✅ Confirmado pleno (ambos buckets) | 347 | 69.8% |
-| 🟡 Parcial / revisar | 100 | 20.1% |
-| ⚪ Sin resultado | 50 | 10.1% |
+| ✅ Confirmado pleno (todo bucket presente = confirmado) | 369 | 74.2% |
+| 🟡 Parcial (algún bucket en `revisar`/`probable`) | 78 | 15.7% |
+| ⚪ Sin resultado (sin URLs) | 50 | 10.1% |
 
-- **Precisión sobre confirmados: ~99.5% (medida-hasta-ahora).** Se auditaron 768
+Por track: **concursos** confirmado 397 / probable 35 / revisar 24 / sin 41 ·
+**processos** confirmado 367 / probable 36 / revisar 46 / sin 48.
+
+- **Precisión sobre confirmados: ~99%+ (medida-hasta-ahora).** Se auditaron las
   URLs confirmadas con métodos determinísticos + scan cross-tipo + muestra manual,
-  y se hallaron y corrigieron **4 falsos positivos** (Erechim, São José do
-  Inhacorá, Três Coroas, Cerro Largo — todos del patrón "bucket apuntando al índice
-  del tipo opuesto", bajados a `revisar`).
+  y se hallaron y corrigieron varios falsos positivos del patrón "bucket apuntando
+  al índice del tipo opuesto" (Erechim, São José do Inhacorá, Três Coroas, Cerro
+  Largo, etc.), bajados a `revisar` (commit `81c601d`).
+- **Esto es PRE-barrido-semántico-completo.** El número definitivo y la limpieza
+  final salen de correr la auditoría `--render --ai-all` sobre las 497 (ver §2 →
+  tarea pendiente).
 - **Golden set gate:** automatable **WRNG=0 / F-POS=0** (cero URLs inventadas).
 - **Geo-block ausente** corriendo desde Brasil; solo ~1.6% de las 497 son bloqueos
   de red reales (Cloudflare/SSL/antibot).
@@ -96,26 +110,17 @@ Tras eso: corregir los FP reales → fase 2 **cerrada** → arrancar **fase 3**
 
 ---
 
-## 3. ⚠️ ESTADO DE LOS DATOS — leer con atención
+## 3. Estado de los datos (YA RESUELTO)
 
-El CSV acumulado de las 497 (`data/fase2/municipios_rs_local.csv`, ~497 filas, +
-su `.xlsx` y el `*_auditoria.csv`) **NO está en GitHub.** Razones: `data/` está en
-`.gitignore` (regla de seguridad: no commitear outputs generados) y los `git push`
-desde el entorno local viejo fallaban por falta de credenciales.
+El CSV acumulado de las 497 (`data/fase2/municipios_rs_local.csv`, 497 filas) **YA
+está versionado en GitHub** (commit `4a4aed6`, forzado más allá del `.gitignore`).
+Tras el `git clone` / `git pull`, **lo tendrás automáticamente** — no hay que copiar
+nada a mano. Verifica que tenga ~497 filas de datos.
 
-**Acción requerida en el setup:** localiza ese CSV en tu clon/entorno anterior
-(ruta `data/fase2/municipios_rs_local.csv`) y **cópialo** dentro de la carpeta nueva
-en `data/fase2/`. Si no lo tienes a mano, hay que **regenerarlo** corriendo el
-pipeline completo (ver §7, ~4 horas + Gemini). **No empieces la fase 3 ni la
-auditoría completa sin este CSV.**
-
-Cuando tengas acceso de push configurado, considera commitearlo como excepción
-puntual para no volver a perderlo:
-```bash
-git add -f data/fase2/municipios_rs_local.csv
-git commit -m "Snapshot fase 2: 497 municipios RS"
-git push -u origin claude/skill-files-accuracy-vd6uyt
-```
+Nota: `data/` sigue en `.gitignore` (no commitear outputs por defecto). Este CSV es
+una excepción puntual y deliberada para que el dato no se pierda entre máquinas. Si
+generas un CSV nuevo (p.ej. tras la auditoría completa), commitéalo también con
+`git add -f data/fase2/municipios_rs_local.csv` para mantener el respaldo.
 
 ---
 
@@ -283,9 +288,11 @@ Para que no "redescubras" estos problemas ni deshagas los fixes:
    un patrón repetido y general. Un caso aislado → se queda en `revisar`.
 
 Historia de commits relevante (rama actual, más reciente arriba):
-`9d03f3c` guard anti-poda · `ff867c8` HARD confiable + muros · `11c41e0` combinadas ·
-`3ed2d5a` --render/--ai · `2a5a1a5` auditor base · `bc499c4` antibot Cloudflare ·
-`0f43f22` checkpoint CSV · `c6f3a52` render SPA · `1ab1da0` fallback curl_cffi.
+`81c601d` correcciones de FP cross-tipo · `4a4aed6` snapshot CSV 497 ·
+`c1fdea4` este handoff · `9d03f3c` guard anti-poda · `ff867c8` HARD confiable +
+muros · `11c41e0` combinadas · `3ed2d5a` --render/--ai · `2a5a1a5` auditor base ·
+`bc499c4` antibot Cloudflare · `0f43f22` checkpoint CSV · `c6f3a52` render SPA ·
+`1ab1da0` fallback curl_cffi.
 
 ---
 
@@ -345,7 +352,8 @@ Copia `data/fase2/municipios_rs_local.csv` (y `.xlsx`) de tu entorno anterior a
        `claude/skill-files-accuracy-vd6uyt`.
 3. [ ] venv + requirements + `playwright install chromium` listos.
 4. [ ] `GEMINI_API_KEY` seteada; push a GitHub funcionando (PAT).
-5. [ ] Copié `data/fase2/municipios_rs_local.csv` (o decidí regenerarlo).
+5. [ ] Verifiqué que `data/fase2/municipios_rs_local.csv` (~497 filas) llegó con el
+       clon — ya está versionado en GitHub, no hay que copiarlo.
 6. [ ] `git pull` antes de correr; `git push` después de cada cambio.
 7. [ ] Próximo paso: auditoría completa `--render --ai-all` sobre las 497.
 
