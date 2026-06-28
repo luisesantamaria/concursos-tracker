@@ -315,6 +315,30 @@ def audit_one(session, bucket: str, url: str, timeout: int,
     return det_sev, det_flags
 
 
+PROGRESS_COLS = ["municipio", "bucket", "severidad", "flags"]
+
+
+def _load_progress(path: Path) -> dict[tuple[str, str], dict]:
+    """Load prior progress file into a dict keyed by (municipio, bucket)."""
+    done: dict[tuple[str, str], dict] = {}
+    if not path.exists():
+        return done
+    for r in csv.DictReader(path.open(encoding="utf-8")):
+        key = (r.get("municipio", ""), r.get("bucket", ""))
+        done[key] = r
+    return done
+
+
+def _flush_progress(path: Path, records: list[dict]) -> None:
+    """Write all progress records to disk (atomic overwrite)."""
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=PROGRESS_COLS)
+        w.writeheader()
+        w.writerows(records)
+    tmp.replace(path)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Deterministic fase 2 index auditor")
     ap.add_argument("--input", type=Path, required=True,
@@ -338,6 +362,8 @@ def main() -> int:
                          "wrong-type FPs hidden among the OK ones (more Gemini cost)")
     ap.add_argument("--model", type=str,
                     default=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+    ap.add_argument("--fresh", action="store_true",
+                    help="Ignore existing progress and start from scratch")
     args = ap.parse_args()
 
     ai_mode = "all" if args.ai_all else ("flagged" if args.ai else "off")
@@ -350,41 +376,94 @@ def main() -> int:
         rows = rows[: args.limit]
     levels = {"confirmado"} | ({"revisar"} if args.include_revisar else set())
 
+    progress_path = args.input.with_name(args.input.stem + "_audit_progress.csv")
+    if args.fresh and progress_path.exists():
+        progress_path.unlink()
+        print("--fresh: progreso anterior descartado.", flush=True)
+
+    prior = _load_progress(progress_path)
+    if prior:
+        print(f"Progreso previo: {len(prior)} URLs ya auditadas — retomando.",
+              flush=True)
+
+    progress_records: list[dict] = list(prior.values())
+
     session = make_session()
-    suspects: list[dict] = []
     n_audited = 0
+    n_skipped = 0
     sev_count = {"ok": 0, "soft": 0, "hard": 0}
+    pending_flush = 0
 
     buckets = [
         ("concursos", "url_concursos", "confianza_concursos"),
         ("processos", "url_processos_seletivos", "confianza_processos"),
     ]
 
+    for sev in sev_count:
+        sev_count[sev] = sum(1 for r in prior.values() if r.get("severidad") == sev)
+    n_audited = len(prior)
+
     for i, r in enumerate(rows, 1):
         muni = r.get("municipio", "")
+        did_work = False
         for bucket, url_key, conf_key in buckets:
             url = (r.get(url_key) or "").strip()
             conf = (r.get(conf_key) or "").strip()
             if not url or conf not in levels:
                 continue
+            if (muni, bucket) in prior:
+                n_skipped += 1
+                continue
             n_audited += 1
+            did_work = True
             severity, flags = audit_one(
                 session, bucket, url, args.timeout,
                 municipio=muni, do_render=args.render,
                 model=args.model, ai_mode=ai_mode,
             )
             sev_count[severity] += 1
-            if severity != "ok":
-                rec = {
-                    "municipio": muni, "bucket": bucket, "confianza": conf,
-                    "severidad": severity, "url": url, "flags": "; ".join(flags),
-                }
-                suspects.append(rec)
-                if args.detalle:
-                    print(f"[{severity.upper():4}] {muni} / {bucket}: "
-                          f"{'; '.join(flags)}\n        {url}", flush=True)
+            rec = {
+                "municipio": muni, "bucket": bucket,
+                "severidad": severity, "flags": "; ".join(flags),
+            }
+            progress_records.append(rec)
+            prior[(muni, bucket)] = rec
+            if severity != "ok" and args.detalle:
+                print(f"[{severity.upper():4}] {muni} / {bucket}: "
+                      f"{'; '.join(flags)}\n        {url}", flush=True)
+        if did_work:
+            pending_flush += 1
+        if pending_flush >= 10:
+            _flush_progress(progress_path, progress_records)
+            pending_flush = 0
         if i % 25 == 0:
-            print(f"  ... {i}/{len(rows)} municipios", flush=True)
+            print(f"  ... {i}/{len(rows)} municipios  "
+                  f"(auditados {n_audited}, ok {sev_count['ok']}, "
+                  f"soft {sev_count['soft']}, hard {sev_count['hard']})",
+                  flush=True)
+
+    _flush_progress(progress_path, progress_records)
+
+    suspects: list[dict] = []
+    url_lookup: dict[tuple[str, str], tuple[str, str]] = {}
+    for r in rows:
+        muni = r.get("municipio", "")
+        for bucket, url_key, conf_key in buckets:
+            url = (r.get(url_key) or "").strip()
+            conf = (r.get(conf_key) or "").strip()
+            if url and conf in levels:
+                url_lookup[(muni, bucket)] = (url, conf)
+
+    for rec in progress_records:
+        if rec.get("severidad") not in ("soft", "hard"):
+            continue
+        key = (rec["municipio"], rec["bucket"])
+        url, conf = url_lookup.get(key, ("", ""))
+        suspects.append({
+            "municipio": rec["municipio"], "bucket": rec["bucket"],
+            "confianza": conf, "severidad": rec["severidad"],
+            "url": url, "flags": rec.get("flags", ""),
+        })
 
     out = args.output or args.input.with_name(args.input.stem + "_auditoria.csv")
     with out.open("w", encoding="utf-8", newline="") as f:
@@ -403,12 +482,16 @@ def main() -> int:
     print("\n" + "=" * 60, flush=True)
     print(f"Modo: {mode_str}", flush=True)
     print(f"Auditados (URLs confirmadas): {n_audited}", flush=True)
+    if n_skipped:
+        print(f"  Skipped (ya en progreso): {n_skipped}", flush=True)
     print(f"  OK:    {sev_count['ok']}", flush=True)
     print(f"  SOFT (verificar manual): {sev_count['soft']}", flush=True)
     print(f"  HARD (probable problema): {sev_count['hard']}", flush=True)
     ok_rate = sev_count["ok"] / n_audited * 100 if n_audited else 0
     print(f"  Tasa OK: {ok_rate:.1f}%", flush=True)
-    print(f"\nSospechosos escritos en: {out} ({len(suspects)} filas)", flush=True)
+    print(f"\nProgreso guardado en: {progress_path} ({len(progress_records)} filas)",
+          flush=True)
+    print(f"Sospechosos escritos en: {out} ({len(suspects)} filas)", flush=True)
     if ai_mode != "off":
         print("Con --ai, los HARD 'ai_tipo_equivocado'/'ai_nao_e_indice' son FP "
               "semánticos confirmados por Gemini → bajar a 'revisar' en el CSV.",
