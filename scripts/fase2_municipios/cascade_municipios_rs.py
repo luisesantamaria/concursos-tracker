@@ -1237,6 +1237,35 @@ PSS_VERIFY_KW = [
 ]
 
 
+def _render_text(url: str, timeout: int = 20) -> str:
+    """Open a URL in a real browser and return the visible text.
+
+    For SPA portals (atende.net, IPM, JSF) whose listing only exists after
+    client-side rendering: the static fetch returns a shell, so verification
+    can't see the items. Returns "" if the browser is unavailable or load fails.
+    """
+    try:
+        browser = _get_browser()
+    except Exception:
+        return ""
+    ctx = None
+    try:
+        ctx = browser.new_context(ignore_https_errors=True)
+        page = ctx.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        page.wait_for_timeout(2500)
+        return page.evaluate(
+            "() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        return ""
+    finally:
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 def _deterministic_verify(url: str, bucket: str,
                           all_candidates: list[Candidate]) -> bool:
     """Check if URL content looks like a real listing page for this bucket.
@@ -1247,14 +1276,23 @@ def _deterministic_verify(url: str, bucket: str,
     if not cand or not cand.page:
         return False
     page = cand.page
-    text = norm(page.title + " " + page.text[:2000])
+    # Include the page title AND the URL, not just the body: the bucket keyword
+    # frequently lives in the title ("Concursos Públicos | ...") or the URL path
+    # (/cidadao/pagina/concursos, ?titulo=CONCURSOS) even when the rendered body
+    # does not repeat it literally.
+    text = norm(page.title + " " + url + " " + page.text[:2000])
 
     kw_list = CONCURSO_VERIFY_KW if bucket == "concursos" else PSS_VERIFY_KW
     has_keyword = any(k in text for k in kw_list)
     listing_matches = len(LISTING_RE.findall(page.text[:3000]))
     has_multiple_items = listing_matches >= 2
 
-    return has_keyword and has_multiple_items
+    # A generic "Editais" index that already exposes several edital-like items
+    # (NN/AAAA numbers, "Edital Nº", inscrições, homologação) is a valid listing
+    # for the bucket even without the literal "concurso/processo" keyword.
+    is_editais_index = ("editais" in text or "edital" in text) and listing_matches >= 3
+
+    return (has_keyword or is_editais_index) and has_multiple_items
 
 
 def batch_gemini_verify(session: requests.Session, model: str,
@@ -1269,8 +1307,18 @@ def batch_gemini_verify(session: requests.Session, model: str,
     if not to_verify or not gemini_api_key():
         return {}
 
+    # Process ALL uncertain URLs in chunks of 30. The previous code verified only
+    # to_verify[:30], so with >30 probables the rest were never checked and stayed
+    # stuck at "probable" forever (even rich, valid indexes). Chunk + aggregate.
+    if len(to_verify) > 30:
+        merged: dict[str, str] = {}
+        for start in range(0, len(to_verify), 30):
+            merged.update(batch_gemini_verify(
+                session, model, to_verify[start:start + 30], timeout))
+        return merged
+
     items_text = ""
-    for i, item in enumerate(to_verify[:30]):
+    for i, item in enumerate(to_verify):
         items_text += (
             f"[{i}] Municipio: {item['municipio']}, Bucket: {item['bucket']}\n"
             f"    Site oficial: {item.get('site_base', '')}\n"
@@ -1899,6 +1947,15 @@ def main() -> int:
                 pg = fetch_page(session, item["url"], timeout=args.timeout)
                 item["title"] = pg.title[:150] if pg else ""
                 item["preview"] = pg.text[:400] if pg else ""
+                # SPA portals serve a JS shell, so the static preview is empty and
+                # Gemini can't see the listing. Render to capture the real content.
+                if (pg and not args.no_playwright
+                        and (pg.is_spa or len((pg.text or "").strip()) < 500)):
+                    rt = _render_text(item["url"], args.timeout)
+                    if len(rt) > len(pg.text or ""):
+                        item["preview"] = rt[:400]
+                        if not item["title"]:
+                            item["title"] = item["url"]
             except Exception:
                 pass
 
