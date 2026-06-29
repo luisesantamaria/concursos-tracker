@@ -72,12 +72,48 @@ def _looks_like_wall(text: str) -> bool:
     return any(norm(m) in blob for m in WALL_MARKERS)
 
 
+# Generic "show the whole listing" script. A municipal listing's items for the
+# target bucket may sit on later pages/years; the auditor must judge ALL of them,
+# not just the first (most recent) page — otherwise a page whose recent entries
+# are all one type gets a false `tipo_equivocado`. This expands two generic,
+# portal-agnostic controls only: a "show N per page" length selector (DataTables)
+# and a "year = all" / "all categories" selector. It does NOT touch type/modalidade
+# filters (changing those would hide the very items we need to see).
+_EXPAND_LISTING_JS = """
+() => {
+  try {
+    document.querySelectorAll('select').forEach(sel => {
+      const opts = Array.from(sel.options || []);
+      if (!opts.length) return;
+      // 1) An explicit "all" option (year=TODOS, "todas categorias", length=todos).
+      let target = opts.find(o => /^\\s*(todos|todas|all)\\b/i.test(o.textContent || ''));
+      // 2) Otherwise the largest numeric page-length option (>=100), e.g. DataTables.
+      if (!target) {
+        const nums = opts.filter(o => /^\\d+$/.test((o.value || '').trim())
+                                      && parseInt(o.value, 10) >= 100);
+        if (nums.length) {
+          target = nums.reduce((a, b) =>
+            parseInt(a.value, 10) >= parseInt(b.value, 10) ? a : b);
+        }
+      }
+      if (target && sel.value !== target.value) {
+        sel.value = target.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  } catch (e) {}
+}
+"""
+
+
 def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
     """Open the URL in a real browser and return (title, visible_text).
 
     For JS-rendered municipal portals (atende.net, oxy.elotech, etc.) whose menu
-    and listing only exist after client-side rendering. Returns None if the
-    browser is unavailable or the load fails.
+    and listing only exist after client-side rendering. Before reading the text it
+    expands client-side pagination (see ``_EXPAND_LISTING_JS``) so the auditor
+    sees the whole listing, not just the first page. Returns None if the browser
+    is unavailable or the load fails.
     """
     try:
         browser = _get_browser()
@@ -96,6 +132,12 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         page.wait_for_timeout(2500)
+        # Expand pagination so later-page/older items become visible, then settle.
+        try:
+            page.evaluate(_EXPAND_LISTING_JS)
+            page.wait_for_timeout(1800)
+        except Exception:
+            pass
         title = page.title() or ""
         text = page.evaluate("() => document.body ? document.body.innerText : ''")
         return title, text or ""
@@ -149,7 +191,9 @@ def ai_verdict(session, model: str, municipio: str, bucket: str,
         f"Município: {municipio}. BUCKET ALVO: {BUCKET_LABEL.get(bucket, bucket)}.\n\n"
         "Conteúdo renderizado da página:\n"
         f"TÍTULO: {title[:200]}\n"
-        f"TEXTO: {text[:6000]}\n\n"
+        # Wider window than the original 6000: expanded pagination produces longer
+        # listings, and the target bucket's items may sit past the first rows.
+        f"TEXTO: {text[:9000]}\n\n"
         "A página funciona como ÍNDICE/LISTAGEM do bucket alvo? Responda com UMA "
         "decisão discreta (JSON):\n"
         '{"veredicto": "valido_indice" | "tipo_equivocado" | "nao_e_indice" '
