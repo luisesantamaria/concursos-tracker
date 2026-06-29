@@ -1193,8 +1193,21 @@ def _try_combined_fill(session: requests.Session, chosen: dict,
     if not page:
         return
 
-    content = norm(page.title + " " + page.text[:3000])
-    if any(s in content for s in signals):
+    text = page.text or ""
+    # SPA (atende.net, JSF): the static body is a JS shell, so the other type's
+    # listing is invisible and the combined fill never fires. Render to see it.
+    if getattr(page, "is_spa", False) or len(text.strip()) < 500:
+        rt = _render_text(filled_url)
+        if len(rt) > len(text):
+            text = rt
+
+    content = norm((page.title or "") + " " + filled_url + " " + text[:4000])
+    # Require a signal of the OTHER type AND that the page is an actual listing
+    # (>=2 edital-like items). A lone mention can be a menu/footer link, not a
+    # combined listing — demanding listing context avoids a false combined fill.
+    has_other = any(norm(s) in content for s in signals)
+    listing_matches = len(LISTING_RE.findall(text[:4000]))
+    if has_other and listing_matches >= 2:
         chosen[empty_key] = filled_url
         bucket_tier[empty_key] = bucket_tier.get(filled_key, "") + "_combined"
         razones.append(f"[combined] Page also contains {empty_key.split('_')[1]} content")
@@ -1213,7 +1226,10 @@ def _assign_confidence(tier: str) -> str:
     if tier in ("t2", "t2dir", "t4"):
         return "probable"
     if tier.endswith("_combined"):
-        return "revisar"
+        # A combined fill starts as "probable" (not "revisar") so the batch Gemini
+        # verification — which only checks "probable" URLs — actually re-examines
+        # it and can upgrade a real combined index to confirmado.
+        return "probable"
     return "probable"
 
 
