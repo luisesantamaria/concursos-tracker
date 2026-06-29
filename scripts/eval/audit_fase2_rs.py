@@ -58,6 +58,23 @@ WALL_MARKERS = [
     "enable javascript", "ative o javascript", "ativar o javascript",
 ]
 
+# Antibot challenge pages (Cloudflare "Just a moment", DDoS-Guard, etc.). They
+# resolve with HTTP 200 and render a placeholder, so the real content is hidden
+# and an AI verdict on them is meaningless. Treat as SOFT (not verifiable), never
+# HARD — a false HARD here could wrongly discard a valid URL.
+ANTIBOT_MARKERS = [
+    "um momento", "just a moment", "verificacao de seguranca",
+    "verificando seguranca", "checking your browser", "cf-browser-verification",
+    "attention required", "enable javascript and cookies to continue",
+    "ddos-guard", "needs to review the security",
+]
+
+
+def _is_antibot_challenge(title: str, text: str) -> bool:
+    """A Cloudflare/DDoS-Guard interstitial that hides the real page."""
+    blob = norm((title or "") + " " + (text or "")[:600])
+    return any(norm(m) in blob for m in ANTIBOT_MARKERS)
+
 
 def distinct_listing_items(text: str) -> int:
     """How many distinct edital-like items the page text exposes."""
@@ -132,6 +149,14 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         page.wait_for_timeout(2500)
+        # Cloudflare/DDoS-Guard interstitial ("Just a moment"): the JS challenge
+        # usually clears itself in a few seconds and navigates to the real page.
+        # Poll up to ~12s for the title to stop being a challenge before reading,
+        # so we judge the real content instead of the antibot placeholder.
+        for _ in range(6):
+            if not _is_antibot_challenge(page.title() or "", ""):
+                break
+            page.wait_for_timeout(2000)
         # Expand pagination so later-page/older items become visible, then settle.
         try:
             page.evaluate(_EXPAND_LISTING_JS)
@@ -322,6 +347,12 @@ def audit_one(session, bucket: str, url: str, timeout: int,
         if getattr(page, "is_antibot", False):
             return "soft", ["bloqueo_antibot_no_verificable"]
         return "hard", [f"inalcanzable_status_{status or 'err'}"]
+
+    # Antibot challenge that did not clear (Cloudflare/DDoS-Guard): real content
+    # is hidden → not verifiable. SOFT, never HARD (a false HARD could discard a
+    # valid URL). Comes before the deterministic/AI checks for the same reason.
+    if _is_antibot_challenge(title, text):
+        return "soft", ["desafio_antibot_no_verificable"]
 
     # Cookie / login wall: a short stub that hides the real page → not verifiable.
     if _looks_like_wall(text):
