@@ -259,6 +259,27 @@ def is_soft_404(page: Page) -> bool:
     return any(p in blob for p in SOFT_404_PATTERNS)
 
 
+# Markers of a domain that RESOLVES but is not a live official site: an
+# "under construction" stub, a parked domain, or a hosting placeholder. Such a
+# page often still echoes the municipality name (so score_site_page would rate
+# it highly) yet has no usable content. Accepting it as site_base silently
+# blocks the grounded fallback that would find the real domain (frequently a
+# .com.br the slug candidates never try). The markers are deliberately
+# unambiguous to avoid rejecting a real site.
+DEAD_SITE_PATTERNS = [
+    "em construcao", "site em construcao", "pagina em construcao",
+    "em manutencao", "site em manutencao",
+    "hospedagem de site", "dominio gratis", "registre seu dominio",
+    "compre este dominio", "domain for sale", "this domain is for sale",
+]
+
+
+def is_dead_site(page: Page) -> bool:
+    """A reachable page that is a parked / hosting / under-construction stub."""
+    blob = norm(page.title + " " + page.text[:800])
+    return any(p in blob for p in DEAD_SITE_PATTERNS)
+
+
 def is_broad_landing(url: str) -> bool:
     path = (urlparse(clean_url(url)).path or "/").strip("/").lower()
     return path in {"", "web", "home", "inicio", "index.php", "index.html",
@@ -313,6 +334,11 @@ def score_site_page(page: Page, municipio: str) -> int:
     discovery fallback, so the validation bar is identical regardless of how
     the URL was found.
     """
+    # A parked / hosting / under-construction stub is never a usable site_base,
+    # even if it echoes the municipality name. Reject it hard (negative score) so
+    # Tier 0 misses and the grounded site discovery runs to find the real domain.
+    if is_soft_404(page) or is_dead_site(page):
+        return -100
     blob = norm(page.title + " " + page.text[:2000])
     muni_norm = norm(municipio)
     score = 0
