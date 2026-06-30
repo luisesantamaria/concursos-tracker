@@ -1401,6 +1401,69 @@ def batch_gemini_verify(session: requests.Session, model: str,
         return {}
 
 
+def grounded_verify_one(session: requests.Session, model: str,
+                        municipio: str, bucket: str, url: str,
+                        timeout: int = 90) -> tuple[str, str]:
+    """Grounded (Google Search) verification fallback for a URL whose static/rendered
+    preview was empty (Cloudflare challenge, JS shell). Gemini reads Google's INDEX of
+    the page instead of fetching it directly — Google's crawler passes the antibot that
+    headless Playwright cannot.
+
+    Guardrail against hallucination: only CONFIRM when the verdict is backed by REAL
+    grounding evidence (>=1 grounding chunk AND a non-trivial 'evidencia'). A
+    'confirmado' with zero chunks is pure URL-shape inference (observed on Arroio dos
+    Ratos: it confirmed a /category/ URL with no search results) and is downgraded to
+    'revisar'. This keeps precision-over-coverage.
+
+    Returns (veredicto, motivo) where veredicto is 'confirmado' or 'revisar'.
+    """
+    bucket_label = "concursos publicos" if bucket == "concursos" else "processos seletivos"
+    prompt = (
+        f"Verifique se esta URL e a pagina INDICE/LISTAGEM de {bucket_label} da "
+        f"Prefeitura de {municipio} ({UF_NOME}, {UF_SIGLA}, Brasil).\n"
+        f"URL: {url}\n\n"
+        "Use a busca do Google para ver o conteudo real indexado desta pagina "
+        "(ela pode ter protecao anti-bot que impede leitura direta pelo crawler).\n"
+        "A pagina LISTA MULTIPLOS editais/concursos/processos (nao apenas um)?\n"
+        "Responda APENAS em JSON: {\"veredicto\": \"confirmado\" ou \"revisar\", "
+        "\"motivo\": \"frase curta\", "
+        "\"evidencia\": \"itens concretos que a busca mostrou\"}"
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
+    }
+    try:
+        data = gemini_post(session, model, payload, timeout=timeout)
+    except Exception as e:
+        return ("revisar", f"grounded error: {e}")
+
+    cand = (data.get("candidates") or [{}])[0]
+    text = "\n".join(
+        p.get("text", "") for p in (cand.get("content", {}) or {}).get("parts", [])
+        if isinstance(p, dict)
+    )
+    chunks = (cand.get("groundingMetadata", {}) or {}).get("groundingChunks", []) or []
+
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return ("revisar", "grounded: sin json")
+    try:
+        obj = json.loads(m.group(0))
+    except Exception:
+        return ("revisar", "grounded: json invalido")
+    veredicto = str(obj.get("veredicto", "revisar")).lower().strip()
+    motivo = str(obj.get("motivo", ""))[:100]
+    evidencia = str(obj.get("evidencia", "")).strip()
+
+    # GUARDRAIL: confirm only with real grounding evidence (>=1 chunk + evidencia).
+    if veredicto.startswith("confirm") and len(chunks) >= 1 and len(evidencia) >= 15:
+        return ("confirmado", f"grounded({len(chunks)}ch): {motivo}")
+    return ("revisar",
+            f"grounded({len(chunks)}ch, sin evidencia suficiente): {motivo}")
+
+
 @dataclass
 class MunicipioResult:
     municipio: str
@@ -1870,6 +1933,12 @@ def main() -> int:
                              "re-scraped or re-sent to Gemini. Municipalities that "
                              "were 'sin resultado' or 'revisar' ARE re-processed, "
                              "so a code fix gets another shot. Combine with --append.")
+    parser.add_argument("--grounded-verify", action="store_true",
+                        help="Second verification pass for 'probable' URLs whose "
+                             "static/rendered preview was empty (Cloudflare challenge, "
+                             "JS shell): ask Gemini with Google Search grounding, which "
+                             "reads Google's index of the page. Only ascends with real "
+                             "grounding evidence (guardrail against URL-shape inference).")
     args = parser.parse_args()
 
     session = make_session()
@@ -1993,6 +2062,42 @@ def main() -> int:
         confirmed = sum(1 for _, (v, _) in verdicts.items() if v == "confirmado")
         print(f"  Verified: {confirmed}/{len(verdicts)} upgraded to confirmado",
               flush=True)
+
+    # --- Grounded verification fallback (--grounded-verify) ---
+    # The passive batch verify judges only the static/rendered preview. When that
+    # preview is empty (Cloudflare challenge, JS shell), valid indexes get stuck at
+    # 'revisar' because Gemini sees nothing. Fall back to Gemini grounded, which reads
+    # GOOGLE'S INDEX of the page (Google's crawler passes the antibot). Only the items
+    # whose preview was empty AND are still not confirmed are retried, and the guardrail
+    # in grounded_verify_one ascends only with real evidence.
+    if args.grounded_verify and gemini_api_key() and to_verify:
+        retry = []
+        for it in to_verify:
+            r = verify_index.get(f"{it['municipio']}|{it['bucket']}")
+            if not r:
+                continue
+            conf = (r.confianza_concursos if it['bucket'] == "concursos"
+                    else r.confianza_processos)
+            if conf != "confirmado" and len((it.get("preview") or "").strip()) < 200:
+                retry.append((it, r))
+        if retry:
+            print(f"\n{'='*60}", flush=True)
+            print(f"Grounded fallback: {len(retry)} URLs with empty preview",
+                  flush=True)
+            asc = 0
+            for it, r in retry:
+                veredicto, motivo = grounded_verify_one(
+                    session, args.model, it['municipio'], it['bucket'], it['url'])
+                print(f"    grounded {it['municipio']}/{it['bucket']}: "
+                      f"{veredicto} — {motivo}", flush=True)
+                if veredicto == "confirmado":
+                    asc += 1
+                    if it['bucket'] == "concursos":
+                        r.confianza_concursos = "confirmado"
+                    else:
+                        r.confianza_processos = "confirmado"
+                    r.notes += f"; {motivo}"
+            print(f"  Grounded: {asc}/{len(retry)} upgraded to confirmado", flush=True)
 
     # --skip-existing implies append: the skipped rows must be preserved.
     write_results(results, args.output, append=args.append or args.skip_existing)
