@@ -412,6 +412,94 @@ def _check_migration(session: requests.Session, page: Page,
 # ---------------------------------------------------------------------------
 # TIER 1: Free link discovery
 # ---------------------------------------------------------------------------
+# Recurring "where the index lives" CMS paths, confirmed by hand across many RS
+# municipalities (see project_patrones_indices_codeables). Probing them, derived
+# only from the site HOST (no hardcoded municipality name/IP/portal), widens the
+# candidate set toward the canonical index when the menu surfaced a worse or
+# year-filtered URL — e.g. a govbr CMS exposes the combined index at
+# `/site/concursos` even when the menu only links a single `?tipo=N` filter.
+# These are CANDIDATES only: Tier 3's discrete verifier is still the only thing
+# that confirms a bucket, so probing cannot create false positives beyond Tier 3.
+# Only HIGH-PRECISION, low-collision CMS signatures: paths that render a
+# distinctive combined index ("Concursos e Seleções Públicas" with a Tipo field,
+# "Editais de Concursos" with a Categoria dropdown, the `/portal/editais/N`
+# template). Generic paths like bare `/concursos` or `/portal-da-transparencia/
+# concursos-publicos` were intentionally DROPPED: they collide on big-city sites
+# (caused golden F-POS/WRNG on Aceguá, Porto Alegre, São Leopoldo) and are
+# already found by the menu/link discovery anyway, so probing them only adds risk.
+PROBE_PATHS_DEFAULT = [
+    "/site/concursos",
+    "/concurso",
+    "/portal/editais/3",
+]
+PROBE_PATHS_ATENDE = [
+    "/cidadao/pagina/concursos",
+    "/cidadao/pagina/processos-seletivos",
+    "/cidadao/pagina/concurso-e-processos-seletivos",
+]
+
+
+# A probed path frequently resolves to a soft-404 or a generic CMS fallback
+# (e.g. atende serving "Páginas" / "Valores de Diárias", or a "Não Encontrado"
+# stub returned with HTTP 200). Those must NOT reach Tier 3, which occasionally
+# over-confirms them. So a probe page is only accepted if it (a) isn't a stub and
+# (b) actually talks about concursos / processos seletivos. This is a content
+# gate, not a scorer — it just keeps the probe from inventing candidates.
+PROBE_REJECT_TITLE = [
+    "nao encontrado", "nao encontrada", "acesso negado", "forbidden",
+    "pagina inexistente", "erro 404", "error 404", "indisponivel",
+]
+PROBE_RELEVANT_KEYWORDS = [
+    "concurso", "processo seletivo", "processos seletivos",
+    "selecao publica", "selecoes publicas", "seletivo simplificado",
+]
+
+
+def _probe_page_is_index_like(page: Page) -> bool:
+    """A probed page is a usable candidate only if it is a real, on-topic page
+    (not a stub/fallback) that mentions concursos or processos seletivos."""
+    if not page.ok or is_soft_404(page) or is_dead_site(page):
+        return False
+    if is_broad_landing(page.url):
+        return False
+    title_n = norm(page.title)
+    if any(p in title_n for p in PROBE_REJECT_TITLE):
+        return False
+    blob = norm(page.text[:3000])
+    return any(k in blob for k in PROBE_RELEVANT_KEYWORDS)
+
+
+def _probe_known_index_paths(session: requests.Session, home: Page,
+                             seen_urls: set[str], timeout: int = 15) -> list[Candidate]:
+    """Probe well-known CMS index paths derived from the site host.
+
+    Returns fetched Candidates (source='probe') for paths that resolve to a real,
+    on-topic page (see _probe_page_is_index_like) not already discovered.
+    Platform-selected by host so the cost stays small (~3-6 cheap GETs). Pure
+    requests, no AI, no scoring — Tier 3 still decides which (if any) to confirm.
+    """
+    parsed = urlparse(home.url)
+    host = parsed.netloc.lower()
+    if not host:
+        return []
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    paths = PROBE_PATHS_ATENDE if host.endswith("atende.net") else PROBE_PATHS_DEFAULT
+    probes: list[Candidate] = []
+    for path in paths:
+        url = base + path
+        if url in seen_urls or clean_url(url) in seen_urls:
+            continue
+        page = fetch_page(session, url, min(timeout, 10))
+        if not _probe_page_is_index_like(page):
+            continue
+        seen_urls.add(url)
+        probes.append(Candidate(
+            url=url, source="probe", menu_text="(probe: known index path)",
+            page=page, content_preview=page.text[:1200], fetchable=True,
+        ))
+    return probes
+
+
 def tier1_collect_candidates(session: requests.Session, home: Page,
                              municipio: str, timeout: int = 15) -> list[Candidate]:
     """Scan home page links and one level of container pages for relevant URLs."""
@@ -1584,6 +1672,23 @@ def process_municipio(session: requests.Session, municipio: str,
     # If Tier 3 filled one bucket but not the other, check if the chosen
     # page's content mentions both types. If so, it's a combined page.
     _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
+
+    # --- TIER 1.5: probe known CMS index paths (FALLBACK only) ---
+    # Fires only for buckets Tier 1 + Tier 3 left empty, so it never competes
+    # with an index already discovered via the menu (which the golden treats as
+    # canonical — e.g. an external delegated portal). The content guard inside
+    # the probe keeps soft-404s / generic CMS fallbacks out of Tier 3.
+    if (not chosen["url_concursos"] or not chosen["url_processos_seletivos"]) \
+            and gemini_api_key():
+        existing_urls = {c.url for c in all_candidates}
+        probe_cands = _probe_known_index_paths(session, home, existing_urls, timeout)
+        if probe_cands:
+            all_candidates.extend(probe_cands)
+            tiers_used.append("probe")
+            print(f"    Probe: {len(probe_cands)} known-path candidate(s)...", flush=True)
+            picked = tier3_classify_and_pick(session, model, municipio, probe_cands, timeout)
+            _record(picked, "probe")
+            _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- TIER 2: Grounded search (only for missing buckets) ---
     missing_buckets = []
