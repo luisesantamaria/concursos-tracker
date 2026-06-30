@@ -308,6 +308,26 @@ def is_pdf_or_file(url: str) -> bool:
     return any(path.endswith(ext) for ext in [".pdf", ".doc", ".docx", ".xls", ".xlsx"])
 
 
+# A URL that points at ONE item (an individual edital, a single legislação, a
+# single content/news page, a PDF) is never a stable index — the phase rules
+# reject it. Even when Tier 3 picked it, it must not earn `confirmado`: the
+# cascade keeps it `probable` and leaves promotion to the rendered AI verdict in
+# the closing pass. None of the 24 golden index URLs match these patterns.
+DETAIL_URL_PATTERNS = [
+    r"/id/\d+",                # /concurso/id/200/
+    r"/detalhe/",              # /detalhe/452/...
+    r"/legislacao/detalhe",    # /legislacao/detalhe/3619/...
+    r"/conteudos?/\d+",        # /site/conteudos/5848-... (single content item)
+    r"[?&]slug=",              # ?slug=processo-seletivo (a single named item)
+    r"\.pdf(\?|$)",
+]
+
+
+def is_detail_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(re.search(p, u) for p in DETAIL_URL_PATTERNS)
+
+
 # ---------------------------------------------------------------------------
 # Candidate: a URL with metadata
 # ---------------------------------------------------------------------------
@@ -1802,6 +1822,18 @@ def process_municipio(session: requests.Session, municipio: str,
         if _deterministic_verify(result.url_processos_seletivos, "processos", all_candidates):
             result.confianza_processos = "confirmado"
 
+    # Confidence honesty: never let a single-item/detail URL stand as `confirmado`.
+    # The cascade proposes it as `probable`; the closing pass (rendered AI verdict)
+    # is the only thing allowed to promote it. This is what keeps `confirmado`
+    # trustworthy enough that a human never has to re-check it.
+    if result.confianza_concursos == "confirmado" and is_detail_url(result.url_concursos):
+        result.confianza_concursos = "probable"
+        razones.append("[honesty] url de detalle, baja a probable hasta verificar")
+    if result.confianza_processos == "confirmado" and is_detail_url(result.url_processos_seletivos):
+        result.confianza_processos = "probable"
+        razones.append("[honesty] url de detalle, baja a probable hasta verificar")
+    result.razao = " | ".join(razones)
+
     # Downgrade to "revisar" when site not found or all tiers exhausted
     antibot_block = False
     if not result.url_concursos and not result.url_processos_seletivos:
@@ -2188,6 +2220,13 @@ def main() -> int:
             if not r:
                 continue
             muni, bucket = key.split("|", 1)
+            # Batch verify works off static/lightly-rendered content; it is not
+            # authorized to promote a single-item/detail URL to `confirmado`. That
+            # promotion is reserved for the rendered closing pass. Cap at probable.
+            bucket_url = r.url_concursos if bucket == "concursos" else r.url_processos_seletivos
+            if veredicto == "confirmado" and is_detail_url(bucket_url):
+                veredicto = "probable"
+                motivo = (motivo + "; " if motivo else "") + "url de detalle: queda probable hasta verificacion renderizada"
             if bucket == "concursos":
                 r.confianza_concursos = veredicto
                 if motivo:
