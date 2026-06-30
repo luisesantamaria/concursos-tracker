@@ -12,14 +12,12 @@
 
 | Métrica | Valor |
 |---|---|
-| 🟢 **Pleno** (ambos buckets confirmados) | **407 (81.9%)** |
-| 🟡 Parcial | 77 (15.5%) |
-| 🔴 Sin sitio | 13 (2.6%) |
-| Concursos confirmado | 452 |
-| Processos confirmado | 433 |
+| 🟢 **Pleno** (ambos buckets confirmados) | **413 (83.1%)** |
+| 🟡 Parcial | ~70 |
+| 🔴 Sin sitio | ~14 |
 
 **Git:** rama `claude/skill-files-accuracy-vd6uyt`, working tree limpio, último commit
-`ac4757a` ("+2 plenos verificados en Chrome (Itati, Caibate)").
+`bd53562` ("Mano-negra Chrome: +5 plenos verificados (pleno 408->413, 83.1%)").
 
 **Cómo correr (recordatorio):**
 ```bash
@@ -106,26 +104,39 @@ correcta** — dar click a menús + **buscar en Google** + ir más profundo hast
 | São José do Sul | C | 🔒 SSL roto | "Error de privacidad" |
 | Torres | C | ❌ FP | `/categorias/concurso` = atos de nomeação |
 
-### Quedó A MEDIAS (verificar de nuevo):
-- **Vacaria (C)** `https://www.vacaria.rs.gov.br/concurso` → ALCANCÉ A VER que **SÍ es el
-  índice oficial combinado** ("Consulte os concursos públicos e processos seletivos";
-  "Processo Seletivo: Não há nada cadastrado / Concurso: Não há nada cadastrado") —
-  **vacío ahora, pero estructura de índice oficial correcta = candidato a CONFIRMAR**
-  (igual criterio que Itati). Fue lo último antes del corte.
+### RESUELTO (sesión 30-jun, lote de 11) — pleno 407→413:
 
-### PENDIENTES de verificar con mano-negra total (10):
-| Municipio | Bucket | URL guardada | Pista |
+**Vacaria (C/P)** ✅ CONFIRMADO — `/concurso` índice oficial combinado (vacío, criterio Itati).
+
+**+5 confirmados a mano (probable→confirmado, monótono):**
+| Municipio | Bucket | URL final | Evidencia |
 |---|---|---|---|
-| Canoas | P | `/noticias_tag/processo-seletivo` | tag de noticias, revisar si lista |
-| Caraá | C | `msgestaopublica...:8079/transparencia/#` | portal transparência genérico |
-| Dom Pedrito | P | `/portal-transparencia/publicacoes-e-edit...` | era licitação (dudoso) |
-| General Câmara | P | `/concurso/id/1006/` | edital individual (dudoso) |
-| Gentil | C | `pmgentil.com.br/concurso.php` | sitio propio, verificar |
-| Jaquirana | P | `msgestaopublica...:8079/transparencia/#` | portal transparência genérico |
-| Parobé | C | `atende.../concurso-publico-2022` | página de UN concurso (dudoso) |
-| São José do Norte | P | `/portal-transparencia/processos-de-s...` | transparência, verificar |
-| São Nicolau | C | `/site/editais?pagina=1&tipo=1085` | editais filtrado, verificar |
-| Cruz Alta | C | `atende.../concurso-publico-2024` | página de UN concurso (dudoso) |
+| São José do Norte | P | `/portal-da-transparencia/processos-de-selecao` | "Processos de Seleção", 819 editais PSS |
+| São Nicolau | C | `/site/concursos` (URL corregida) | "Concursos e Seleções Públicas", múltiplos |
+| Caraá | C | `…:8079/transparencia/HomeConcursos.aspx` (corregida) | índice oficial vacío (criterio Itati) |
+| General Câmara | P | `/concurso` (corregida) | índice combinado "Editais de Concursos" |
+| Gentil | C | `/concurso.php` | índice combinado, múltiplos PSS |
+
+**5 RECHAZADOS (quedan probable → revisión humana, sin índice oficial real):**
+| Municipio | Bucket | Razón |
+|---|---|---|
+| Jaquirana | P | SCPI roto (error BD); sitio solo tiene "Concursos Públicos"; PSS solo en bancas externas (Objetivas/Legalle) |
+| Canoas | P | solo tag de **noticias** (artículos, no editais); categorías oficiales sin PSS |
+| Dom Pedrito | P | "Publicações e Editais" genérico, dominado por dispensa de licitação |
+| Parobé | C | `/editais` lista editais por secretaría; concursos solo páginas por año, sin índice |
+| Cruz Alta | C/P | concurso único externo (Fundatec) + archivo "Editais/Decretos/Avisos" mixto; sin índice PSS |
+
+**Aprendizaje portales (reutilizable):**
+- **SCPI/msgestaopublica** (`:8079/transparencia/`): el índice de concursos vive en el iframe
+  `/transparencia/HomeConcursos.aspx` (menú Pessoal → "Concursos/Teste Seletivo"). Combinado
+  (concursos+teste seletivo). Navegar directo al .aspx. Algunos dan error de BD = inútil.
+- **CMS "portal-da-transparencia"** (S.J.Norte, Jaquirana, Dom Pedrito): secciones como rutas
+  `/portal-da-transparencia/<slug>`. Buscar `/processos-de-selecao` o `/concursos-publicos`.
+  Si solo hay "Publicações e Editais" genérico = NO es índice PSS (mezcla licitação).
+- **CMS "/site/"** (Caibaté, S.Nicolau): ruta dedicada `/site/concursos` = índice combinado
+  limpio; mejor que `/site/editais?tipo=NNNN` (filtro de un solo concurso).
+- **atende.net** (`/cidadao/pagina/<slug>`): concursos suelen ser páginas POR AÑO
+  (`concurso-publico-2024`), sin índice combinado → suelen quedar a revisión humana.
 
 **Truco técnico útil (Chrome):** `get_page_text` solo agarra menús en estos sitios. Usar
 `javascript_tool` para extraer el contenido principal (liviano y preciso):
@@ -148,12 +159,13 @@ nota `rev_humana(Chrome): indice <tipo> verificado`.
 
 ## 5. PRÓXIMOS PASOS (en orden)
 
-1. **Reconectar Chrome** (`tabs_context_mcp createIfEmpty`) y retomar la mano-negra total:
-   - Confirmar **Vacaria** (ya casi verificado).
-   - Verificar los **10 pendientes** (buscar la correcta si la guardada no sirve).
-   - Aplicar válidos al CSV (monótono) + commit. Techo realista ~412-415 (~83%).
-2. **Cerrar fase 2** cuando se agoten los parciales con índice real. 82-83% con cero FP es
-   el resultado defendible (el proyecto acepta ~20% revisión humana).
+1. **Lote de 11 RESUELTO** (sección 4): Vacaria + 5 confirmados (413, 83.1%), 5 a revisión
+   humana. El techo realista (~412-415) está prácticamente alcanzado.
+2. **Cerrar fase 2.** 83.1% con cero FP es el resultado defendible (el proyecto acepta ~20%
+   revisión humana). Los ~70 parciales restantes son residuo sin índice oficial real
+   (bancas externas, news tags, repos genéricos de licitação, atende por-año). Si se quiere
+   exprimir más: barrer parciales restantes uno a uno en Chrome, pero rinde poco (mismo perfil
+   que los 5 rechazados). Los 5 rechazados de este lote quedan documentados para no re-verificar.
 3. **Mejoras futuras anotadas** (NO urgentes, post-RS):
    - Parametrizar `--uf` (UF_SIGLA/UF_NOME están hardcodeados líneas 43-44) para reusar en RJ.
    - Propagar el grounded verify al **auditor** (`audit_fase2_rs.py`) para que no marque
