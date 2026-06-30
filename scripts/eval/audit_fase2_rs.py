@@ -32,7 +32,7 @@ _FASE2 = Path(__file__).resolve().parents[1] / "fase2_municipios"
 sys.path.insert(0, str(_FASE2))
 import json  # noqa: E402
 
-from cascade_municipios_rs import (  # noqa: E402
+from cascade_municipios import (  # noqa: E402
     make_session, fetch_page, is_pdf_or_file, norm,
     LISTING_RE, BUCKET_KEYWORDS,
     _get_browser, gemini_post, gemini_api_key,

@@ -161,7 +161,7 @@ scripts/
     ai_repair_bancas_rs.py      # post-proceso con IA (corrige campos)
     quick_audit_bancas_rs.py    # auditor determinístico de bancas
   fase2_municipios/      # FASE 2 (actual)
-    cascade_municipios_rs.py    # EL pipeline de 5 tiers (el corazón)
+    cascade_municipios.py       # EL pipeline de 5 tiers / 8 pasos (el corazón)
   eval/
     medir_golden_set.py         # evaluador vs golden (HIT/HOST/WRNG/MISS/F-POS)
     audit_fase2_rs.py           # AUDITOR de confirmados (det + --render + --ai)
@@ -226,12 +226,12 @@ python scripts/eval/validate_golden_audit.py compare   # 0 ERRORES = auditor con
 ### Pipeline fase 2 (cascade)
 ```bash
 # Una corrida por letras, acumulando, sin re-gastar Gemini en confirmados:
-python scripts/fase2_municipios/cascade_municipios_rs.py \
+python scripts/fase2_municipios/cascade_municipios.py \
   --all --letras ab --append --skip-existing \
   --output data/fase2/municipios_rs_local.csv
 
 # Un solo municipio (debug):
-python scripts/fase2_municipios/cascade_municipios_rs.py --municipio "Caxias do Sul" \
+python scripts/fase2_municipios/cascade_municipios.py --municipio "Caxias do Sul" \
   --output /tmp/uno.csv
 ```
 
@@ -246,7 +246,7 @@ Flags clave:
 
 ### Gate de regresión (tras CUALQUIER cambio de lógica de verify/select/tier)
 ```bash
-python scripts/fase2_municipios/cascade_municipios_rs.py --golden --output /tmp/golden_check.csv
+python scripts/fase2_municipios/cascade_municipios.py --golden --output /tmp/golden_check.csv
 python scripts/eval/medir_golden_set.py \
   --golden authority_first/data/golden_set_v1.csv --pipeline /tmp/golden_check.csv --detalle
 # Espera: automatable WRNG=0 / F-POS=0. Si aparece un nuevo WRNG/F-POS automatable, es regresión.

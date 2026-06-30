@@ -52,12 +52,12 @@ El CSV de salida es **acumulativo**. Se procesan municipios por letra inicial y 
 
 ```bash
 # Primera tanda: A y B
-python scripts/fase2_municipios/cascade_municipios_rs.py \
+python scripts/fase2_municipios/cascade_municipios.py \
   --all --letras ab --append \
   --output data/fase2/municipios_rs.csv
 
 # Siguientes tandas: agrega C y D SIN re-correr A y B ya confirmados
-python scripts/fase2_municipios/cascade_municipios_rs.py \
+python scripts/fase2_municipios/cascade_municipios.py \
   --all --letras cd --append --skip-existing \
   --output data/fase2/municipios_rs.csv
 ```

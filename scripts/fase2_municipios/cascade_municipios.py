@@ -1,18 +1,35 @@
 #!/usr/bin/env python3
-"""5-tier cascade pipeline for RS municipality resource discovery.
+"""Cascade pipeline for municipality resource discovery (state-agnostic).
 
 Finds the stable index/listing page for concursos and processos seletivos
-in each RS municipality. Does NOT extract individual editals.
+in each municipality. Does NOT extract individual editals.
 
-Architecture (spend expensive tools only when cheap ones fail):
+The TIERS are numbered by COST/TYPE, not by run order: Tier 2 (grounding) is
+costlier than Tier 3 (verifier), so it actually runs AFTER Tier 3. What each does:
     Tier 0 — Site oficial: find/confirm the prefeitura's base domain.
     Tier 1 — Free link discovery: HTML menus, anchors, sitemap, transparência.
-    Tier 2 — Grounded search: Gemini + Google Search (only if Tier 1 incomplete).
+    Tier 2 — Grounded search: Gemini + Google Search (only if still missing).
     Tier 3 — Gemini verifier/selector: classifies candidates with discrete
              decisions (indice_oficial, detalle_rechazado, licitacao_rechazada,
              etc.) and picks best among valid ones (ai_pick_best).
     Tier 4 — Playwright navigation agent: directed menu navigation as last resort.
 
+ACTUAL RUN ORDER per municipality (each step runs ONLY if buckets remain empty —
+spend expensive tools only when cheap ones fail):
+    1. Tier 0           · Site oficial (free slug; grounded discovery if it misses)
+    2. Tier 1           · Free links (renders the menu first if the site is a SPA)
+    3. Tier 3           · AI classifies Tier 1 candidates, picks the best index
+    4. Combined fill    · if one bucket filled, lend its URL to the other when the
+                          page lists BOTH types (signal + >=2 listing items)
+    5. Tier 2           · Grounded Google search for the missing bucket -> Tier 3
+    6. Directed grounding · "site:host {tipo}" per missing bucket -> Tier 3
+    7. Tier 4           · Playwright navigates the menus as a human -> Tier 3
+    8. (after ALL municipios) Batch verify the 'probable' URLs; then Grounded
+       verify those whose preview was empty (Cloudflare/SPA), reading Google's
+       index with a guardrail (>=1 chunk + evidence) against false positives.
+
+The 'method' field records which tiers fired (e.g. 't0+t1+t3'). UF/scope is set
+by UF_SIGLA / UF_NOME below; the discovery logic itself is state-agnostic.
 No numeric scorers. No magic constants. Discrete decisions + AI judgment.
 """
 from __future__ import annotations

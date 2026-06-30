@@ -35,7 +35,7 @@ Smoke checks:
 ```bash
 python scripts/fase1_bancas/crawl_bancas_base_rs.py --help
 python scripts/fase1_bancas/ai_repair_bancas_rs.py --help
-python scripts/fase2_municipios/cascade_municipios_rs.py --help
+python scripts/fase2_municipios/cascade_municipios.py --help
 ```
 
 Golden-set evaluation:
@@ -64,10 +64,10 @@ code edits and commits happen in the main (web) conversation. Full guide:
 
 ```bash
 # first batch
-python scripts/fase2_municipios/cascade_municipios_rs.py --all --letras ab --append \
+python scripts/fase2_municipios/cascade_municipios.py --all --letras ab --append \
   --output data/fase2/municipios_rs.csv
 # later batches (skip already-confirmed, keep appending)
-python scripts/fase2_municipios/cascade_municipios_rs.py --all --letras cd --append \
+python scripts/fase2_municipios/cascade_municipios.py --all --letras cd --append \
   --skip-existing --output data/fase2/municipios_rs.csv
 ```
 
