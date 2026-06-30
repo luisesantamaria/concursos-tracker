@@ -58,6 +58,24 @@ def _is_server_error(title: str, text: str) -> bool:
     return any(m in blob for m in SERVER_ERROR_MARKERS)
 
 
+# Soft-404: pagina servida con HTTP 200 cuyo titulo/cuerpo dice "nao encontrada".
+# Categoria WordPress muerta (Estacao C/P: /publicacoes_legais?categ=concursos ->
+# "Pagina nao encontrada") que ademas traia una fecha/timestamp que el regex de
+# nº-edital confundia con un item -> pasaba como indice. Nunca es indice -> revisar.
+# Solo marcadores INEQUIVOCOS de 404 (en titulo o inicio del cuerpo). Se omiten
+# "nenhum resultado/nada encontrado" a proposito: aparecen en buscadores de indices
+# reales con filtro vacio y degradarian buenos.
+NOT_FOUND_MARKERS = [
+    "pagina nao encontrada", "page not found", "404 not found", "erro 404",
+    "conteudo nao encontrado", "404 - ", "erro 404",
+]
+
+
+def _is_not_found(title: str, text: str) -> bool:
+    blob = C.norm((title or "") + " " + (text or "")[:400])
+    return any(m in blob for m in NOT_FOUND_MARKERS)
+
+
 # NARROW, low-collateral deterministic guards for the FP categories that ARE
 # cleanly detectable. The fuzzy ones (single-concurso, type-mixed) are left to the
 # AI verdict + the human/Chrome final audit — trying to catch them with stricter
@@ -152,6 +170,8 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
         return ("revisar", "inaccesible/render-vacio")
     if _is_server_error(title, text):
         return ("revisar", "pagina de error de servidor (no es indice)")
+    if _is_not_found(title, text):
+        return ("revisar", "soft-404 / pagina no encontrada (no es indice)")
     # Guard determinista de bajo colateral: solo paginas de DEFINICION (probadas
     # sin colateral en golden). El guard de "editais genericos" se descarto: degradaba
     # indices reales que mencionan chamamento/licitacao (Almirante, Anta Gorda). Lo
