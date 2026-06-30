@@ -1432,7 +1432,9 @@ def grounded_verify_one(session: requests.Session, model: str,
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 1024},
+        # Grounding spends output tokens on a prose preamble before the JSON, so 1024
+        # truncated the JSON tail on many cases ('sin json'). 2048 leaves room.
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048},
     }
     try:
         data = gemini_post(session, model, payload, timeout=timeout)
@@ -1446,16 +1448,30 @@ def grounded_verify_one(session: requests.Session, model: str,
     )
     chunks = (cand.get("groundingMetadata", {}) or {}).get("groundingChunks", []) or []
 
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return ("revisar", "grounded: sin json")
-    try:
-        obj = json.loads(m.group(0))
-    except Exception:
-        return ("revisar", "grounded: json invalido")
-    veredicto = str(obj.get("veredicto", "revisar")).lower().strip()
-    motivo = str(obj.get("motivo", ""))[:100]
-    evidencia = str(obj.get("evidencia", "")).strip()
+    # Robust parse. Grounded answers often wrap the JSON in prose or markdown fences,
+    # and the tail can be truncated (grounding spends tokens on a preamble before the
+    # JSON), so a naive {.*} + json.loads failed a lot ('sin json'). Try full JSON
+    # first, then fall back to pulling each field by regex from the raw text.
+    raw = re.sub(r"```(?:json)?", "", text).strip()
+    veredicto = motivo = evidencia = ""
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            veredicto = str(obj.get("veredicto", "")).lower().strip()
+            motivo = str(obj.get("motivo", ""))[:100]
+            evidencia = str(obj.get("evidencia", "")).strip()
+        except Exception:
+            pass
+    if not veredicto:  # truncated / loose JSON: pull fields individually
+        vm = re.search(r'veredicto"?\s*:\s*"?(confirmado|revisar)', raw, re.I)
+        veredicto = vm.group(1).lower() if vm else ""
+        em = re.search(r'evidencia"?\s*:\s*"([^"]{0,400})', raw, re.I)
+        evidencia = em.group(1).strip() if em else ""
+        mm = re.search(r'motivo"?\s*:\s*"([^"]{0,150})', raw, re.I)
+        motivo = mm.group(1).strip() if mm else ""
+    if not veredicto:
+        return ("revisar", f"grounded: no parseable ({len(text)}c)")
 
     # GUARDRAIL: confirm only with real grounding evidence (>=1 chunk + evidencia).
     if veredicto.startswith("confirm") and len(chunks) >= 1 and len(evidencia) >= 15:
