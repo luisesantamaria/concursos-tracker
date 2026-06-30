@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -253,6 +254,16 @@ def ai_verdict(session, model: str, municipio: str, bucket: str,
         )
         obj = _parse_json_object(out)
         if obj is None:
+            # gemini-2.5-flash spends tokens "thinking" and can truncate the JSON
+            # mid-string (the long `motivo`), leaving valid output unparseable. The
+            # verdict word itself appears early — recover it by regex so a real
+            # `valido_indice` is not lost to a parse error (was demoting valid
+            # indexes to revisar: Almirante Tamandaré).
+            m = re.search(
+                r'veredicto"?\s*:\s*"?(valido_indice|tipo_equivocado|nao_e_indice|licitacao_ou_cultural)',
+                out, re.I)
+            if m:
+                return m.group(1).lower(), "veredicto recuperado de json truncado"
             return "erro", f"json invalido: {out[:80]}"
         v = str(obj.get("veredicto", "erro")).strip().lower()
         if v not in {"valido_indice", "tipo_equivocado", "nao_e_indice",
