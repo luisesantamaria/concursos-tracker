@@ -63,20 +63,6 @@ def _is_server_error(title: str, text: str) -> bool:
 # AI verdict + the human/Chrome final audit — trying to catch them with stricter
 # rules demoted real indexes (Água Santa, Pareci Novo), so we do NOT.
 
-def _is_generic_editais(text: str) -> bool:
-    """Page whose items are licitação / chamamento / pregão / exumação (generic
-    administrative editais), with almost no concurso/PSS content. Catches a
-    concursos page that is really the generic 'Editais' repository (Sapiranga)."""
-    t = C.norm(text or "")
-    generic = sum(t.count(k) for k in
-                  ("chamamento", "licitacao", "licitação", "pregao", "dispensa",
-                   "exumacao", "tomada de preco", "inexigibilidade"))
-    relevant = sum(t.count(k) for k in
-                   ("concurso publico", "concurso público", "processo seletivo",
-                    "selecao publica", "seleção pública"))
-    return generic >= 3 and relevant <= 1
-
-
 _DEFINITION_PHRASES = [
     "e um processo seletivo", "é um processo seletivo", "e o procedimento",
     "é o procedimento", "tem por objetivo selecionar", "destina-se a selecionar",
@@ -120,11 +106,11 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
         return ("revisar", "inaccesible/render-vacio")
     if _is_server_error(title, text):
         return ("revisar", "pagina de error de servidor (no es indice)")
-    # Guards deterministas NARROW (bajo colateral). Lo difuso (concurso unico,
-    # tipo-mixto) se deja a la IA + auditoria humana: endurecer la IA demotaba
-    # indices reales (Agua Santa/Pareci Novo).
-    if _is_generic_editais(text):
-        return ("revisar", "editais genericos/licitacao dominante (no es indice de concurso/PSS)")
+    # Guard determinista de bajo colateral: solo paginas de DEFINICION (probadas
+    # sin colateral en golden). El guard de "editais genericos" se descarto: degradaba
+    # indices reales que mencionan chamamento/licitacao (Almirante, Anta Gorda). Lo
+    # difuso (generico, single-concurso, tipo-mixto) se deja a la IA + auditoria Chrome:
+    # NO es separable deterministamente de los indices reales sin romper buenos.
     if _is_definition_page(text):
         return ("revisar", "pagina de definicion sin listado (no es indice)")
     if not C.gemini_api_key():
