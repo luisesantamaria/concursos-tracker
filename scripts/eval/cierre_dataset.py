@@ -38,6 +38,24 @@ BUCKETS = [
     ("processos", "url_processos_seletivos", "confianza_processos"),
 ]
 
+# Server-side error pages served with HTTP 200 (ASP.NET "Runtime Error", PHP/SQL
+# stack traces, 500/503 bodies). Their rendered text has no listing, but the AI
+# verdict can occasionally still mis-read it. A page matching these is never a
+# valid index -> revisar. Caught the sinsoft .aspx portals (Gramado dos Loureiros)
+# that intermittently 500 yet were being confirmed.
+SERVER_ERROR_MARKERS = [
+    "server error in", "runtime error", "application error",
+    "erro de execucao", "internal server error", "http error 500",
+    "service unavailable", "error 503", "nao foi possivel conectar-se ao banco",
+    "could not connect", "error establishing a database",
+    "whoops, something went wrong", "exception details",
+]
+
+
+def _is_server_error(title: str, text: str) -> bool:
+    blob = C.norm((title or "") + " " + (text or "")[:600])
+    return any(m in blob for m in SERVER_ERROR_MARKERS)
+
 
 def rendered_verdict(session, model, municipio, bucket, url, timeout):
     """Render the page (browser if needed) and ask the discrete AI verdict.
@@ -60,6 +78,8 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
             title, text = r
     if not (text or "").strip():
         return ("revisar", "inaccesible/render-vacio")
+    if _is_server_error(title, text):
+        return ("revisar", "pagina de error de servidor (no es indice)")
     if not C.gemini_api_key():
         return ("revisar", "sin api key")
     try:
