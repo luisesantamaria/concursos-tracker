@@ -23,6 +23,7 @@ Uso:
 from __future__ import annotations
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 
@@ -57,6 +58,45 @@ def _is_server_error(title: str, text: str) -> bool:
     return any(m in blob for m in SERVER_ERROR_MARKERS)
 
 
+# NARROW, low-collateral deterministic guards for the FP categories that ARE
+# cleanly detectable. The fuzzy ones (single-concurso, type-mixed) are left to the
+# AI verdict + the human/Chrome final audit — trying to catch them with stricter
+# rules demoted real indexes (Água Santa, Pareci Novo), so we do NOT.
+
+def _is_generic_editais(text: str) -> bool:
+    """Page whose items are licitação / chamamento / pregão / exumação (generic
+    administrative editais), with almost no concurso/PSS content. Catches a
+    concursos page that is really the generic 'Editais' repository (Sapiranga)."""
+    t = C.norm(text or "")
+    generic = sum(t.count(k) for k in
+                  ("chamamento", "licitacao", "licitação", "pregao", "dispensa",
+                   "exumacao", "tomada de preco", "inexigibilidade"))
+    relevant = sum(t.count(k) for k in
+                   ("concurso publico", "concurso público", "processo seletivo",
+                    "selecao publica", "seleção pública"))
+    return generic >= 3 and relevant <= 1
+
+
+_DEFINITION_PHRASES = [
+    "e um processo seletivo", "é um processo seletivo", "e o procedimento",
+    "é o procedimento", "tem por objetivo selecionar", "destina-se a selecionar",
+    "e uma forma de", "é uma forma de",
+]
+
+
+def _is_definition_page(text: str) -> bool:
+    """Short explanatory page ('Concurso Público é um processo...') with no real
+    listing. Narrow: only fires on short pages with definition phrasing and no
+    edital number (Pinhal Grande)."""
+    t = text or ""
+    if len(t) > 2600:
+        return False
+    blob = C.norm(t)
+    has_def = any(p in blob for p in _DEFINITION_PHRASES)
+    has_edital_num = bool(re.search(r"\b\d{1,4}\s*[/.\-]\s*20[12]\d\b", t))
+    return has_def and not has_edital_num
+
+
 def rendered_verdict(session, model, municipio, bucket, url, timeout):
     """Render the page (browser if needed) and ask the discrete AI verdict.
     Returns ('confirmado'|'revisar', motivo). Never returns confirmado without a
@@ -80,6 +120,13 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
         return ("revisar", "inaccesible/render-vacio")
     if _is_server_error(title, text):
         return ("revisar", "pagina de error de servidor (no es indice)")
+    # Guards deterministas NARROW (bajo colateral). Lo difuso (concurso unico,
+    # tipo-mixto) se deja a la IA + auditoria humana: endurecer la IA demotaba
+    # indices reales (Agua Santa/Pareci Novo).
+    if _is_generic_editais(text):
+        return ("revisar", "editais genericos/licitacao dominante (no es indice de concurso/PSS)")
+    if _is_definition_page(text):
+        return ("revisar", "pagina de definicion sin listado (no es indice)")
     if not C.gemini_api_key():
         return ("revisar", "sin api key")
     try:
