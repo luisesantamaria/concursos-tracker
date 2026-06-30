@@ -71,16 +71,57 @@ _DEFINITION_PHRASES = [
 
 
 def _is_definition_page(text: str) -> bool:
-    """Short explanatory page ('Concurso Público é um processo...') with no real
-    listing. Narrow: only fires on short pages with definition phrasing and no
-    edital number (Pinhal Grande)."""
+    """Explanatory page ('Concurso Público é um processo...') with no real listing.
+    LENGTH-INDEPENDENT: the deterministic render (networkidle) can grow such a page
+    past any size threshold, so we judge by SIGNAL, not length — definition phrasing
+    AND zero real listing items. A genuine index never has the definition sentence
+    *and* zero items (Pinhal Grande C escaped the old len<2600 gate after render)."""
     t = text or ""
-    if len(t) > 2600:
-        return False
     blob = C.norm(t)
     has_def = any(p in blob for p in _DEFINITION_PHRASES)
-    has_edital_num = bool(re.search(r"\b\d{1,4}\s*[/.\-]\s*20[12]\d\b", t))
-    return has_def and not has_edital_num
+    return has_def and not _has_real_listing_item(t)
+
+
+# A page that names the bucket ("Concurso Público", "Processo Seletivo") only in its
+# heading, intro text, or NAV MENU — with no actual edital — is NOT an index. Two
+# real false positives had exactly this shape: a definition page (Pinhal Grande C)
+# and an empty category page whose only PSS mention was the side menu (Pinhal Grande
+# P). The rule is robust against indexes that list by bare year (which broke the old
+# >=2 item count): an item counts if there is an edital number, a cascade listing
+# hit, OR the bucket keyword next to a 4-digit year (atende "Concurso Público 2021").
+# Numero de edital tipo NN/AAAA o NN-AAAA (01/2024, 071-2026). Lookbehind (?<![\d.])
+# para NO morder la cola de un numero de LEI ("Lei 13.019/2014" -> "019/2014"): ese
+# falso item hacia que el menu pasara como indice. Sin "." de separador (los editais
+# usan / o -, no punto), asi "13.019" no dispara.
+_EDITAL_NUM_RE = re.compile(r"(?<![\d.])\d{1,3}\s*[/\-]\s*20[12]\d\b")
+# Bucket keyword next to a 4-digit year. BROAD on purpose (bare "Concurso 2012",
+# not only "Concurso Público"): Gramado lists "Concurso 2012" with no "Público".
+# Over-matching is safe here — the guard only GATES (no item -> revisar), so a broad
+# match just defers to the AI; under-matching is what wrongly demotes real indexes.
+_KEYWORD_YEAR_RE = re.compile(
+    r"(concurso|processo\s+seletivo|sele[çc]\w+\s+p\w+)[^\n]{0,15}?\b20[12]\d\b",
+    re.I)
+
+
+# Frases fuertes de un item de listado (las alternativas TEXTUALES del LISTING_RE del
+# cascade, SIN la de numero pelado "\d{1,3}/20\d\d" que muerde "Lei 13.019/2014").
+_LISTING_PHRASE_RE = re.compile(
+    r"edital\s+n|inscri[cç][oõ]es\s+(aberta|encerrada)|"
+    r"resultado\s+(final|parcial|preliminar)|homologa[cç][aã]o|retifica[cç][aã]o",
+    re.I)
+
+
+def _has_real_listing_item(text: str) -> bool:
+    """True if the page exposes >=1 concrete listing item (not just the keyword in a
+    heading/menu). Deliberately permissive so year-listed indexes still pass."""
+    t = text or ""
+    if _EDITAL_NUM_RE.search(t):
+        return True
+    if _LISTING_PHRASE_RE.search(t):
+        return True
+    if _KEYWORD_YEAR_RE.search(t):
+        return True
+    return False
 
 
 def rendered_verdict(session, model, municipio, bucket, url, timeout):
@@ -96,11 +137,16 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     pg = C.fetch_page(session, url, timeout)
     title = pg.title if (pg and pg.ok) else ""
     text = pg.text if (pg and pg.ok) else ""
+    # Render (browser + scroll) cuando el fetch plano viene fino, es SPA, o NO trae
+    # items de listado: muchos CMS sirven el menu server-side pero cargan el listado
+    # por JS/scroll, asi que un fetch "largo" puede ser solo el menu (Pinhal Grande
+    # fetch=3934 era el menu; el render con scroll trae la verdad). Preferimos el
+    # render si surface items O si el fetch no los tenia (aunque sea mas corto).
     need_render = (not (pg and pg.ok)) or getattr(pg, "is_spa", False) \
-        or len((text or "").strip()) < 500
+        or len((text or "").strip()) < 500 or not _has_real_listing_item(text)
     if need_render:
         r = A.render_page(url, timeout)
-        if r and len((r[1] or "")) > len(text or ""):
+        if r and (_has_real_listing_item(r[1]) or len((r[1] or "").strip()) >= 500):
             title, text = r
     if not (text or "").strip():
         return ("revisar", "inaccesible/render-vacio")
@@ -113,6 +159,13 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     # NO es separable deterministamente de los indices reales sin romper buenos.
     if _is_definition_page(text):
         return ("revisar", "pagina de definicion sin listado (no es indice)")
+    # Regla de oro: sin >=1 item de listado real (solo la palabra clave en titulo/menu),
+    # NO es indice -> revisar. Con el render+scroll de arriba, un indice de verdad ya
+    # mostro sus items (Pareci Novo: 50 PSS con fecha); si aun asi no hay item, es una
+    # definicion o categoria vacia (Pinhal Grande C/P). Permisivo (anio/numero/LISTING)
+    # para no tocar los que listan por anio.
+    if not _has_real_listing_item(text):
+        return ("revisar", "sin items de listado real (definicion/menu/vacia)")
     if not C.gemini_api_key():
         return ("revisar", "sin api key")
     try:
@@ -120,6 +173,14 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     except Exception as e:
         return ("revisar", f"verdict-error: {str(e)[:60]}")
     if v == "valido_indice":
+        # Re-fetch anti-intermitente: portales .aspx (sinsoft) dan "Runtime Error" a
+        # ratos; si estaban arriba durante el render confirmaban en falso. Una 2a lectura
+        # barata antes de sellar; si AHORA es error de servidor -> revisar. Un indice
+        # estable pasa 2 veces; solo degradamos si el 2do fetch trae marcadores de error
+        # (un fallo de red deja pg2 sin marcadores -> no degrada un indice bueno).
+        pg2 = C.fetch_page(session, url, timeout)
+        if pg2 and pg2.ok and _is_server_error(pg2.title, pg2.text):
+            return ("revisar", "error de servidor intermitente (2do fetch)")
         return ("confirmado", f"valido_indice: {motivo[:80]}")
     return ("revisar", f"{v}: {motivo[:80]}")
 

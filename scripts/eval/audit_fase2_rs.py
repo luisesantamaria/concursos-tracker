@@ -169,6 +169,19 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
             page.wait_for_timeout(1500)
         except Exception:
             pass
+        # Lazy-load por scroll: muchos CMS municipais (govbr/IPM "/site/...",
+        # "/editais-licitacoes/...") cargan el LISTADO de editais recién al hacer
+        # scroll; sin esto el render captura solo el menú y la IA juzga el menú, no
+        # los items (Pareci Novo rendía el menú -> intermitente; con scroll aparecen
+        # los 50 PSS con fecha). Es la causa nº1 de que el listado falte. Scroll
+        # progresivo dispara la carga; luego volvemos arriba para leer todo.
+        try:
+            for _ in range(4):
+                page.mouse.wheel(0, 4000)
+                page.wait_for_timeout(800)
+            page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception:
+            pass
         # Poll hasta que el texto visible SE ESTABILICE (mismo largo en 2 lecturas
         # consecutivas) o aparezcan ítems de listado — así capturamos la página ya
         # cargada, no un estado intermedio. Determinismo de la entrada.
