@@ -149,24 +149,40 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
         )
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        page.wait_for_timeout(2500)
+        # Esperar a que las llamadas XHR/fetch del portal (atende, Next.js, etc.)
+        # terminen: ese es el motivo nº1 de que el texto varíe entre corridas (a
+        # veces la lista alcanzó a pintar, a veces no). networkidle estabiliza la
+        # ENTRADA -> el veredicto deja de parpadear por input cambiante.
+        try:
+            page.wait_for_load_state("networkidle", timeout=9000)
+        except Exception:
+            page.wait_for_timeout(2500)
         # Cloudflare/DDoS-Guard interstitial ("Just a moment"): the JS challenge
         # usually clears itself in a few seconds and navigates to the real page.
-        # Poll up to ~12s for the title to stop being a challenge before reading,
-        # so we judge the real content instead of the antibot placeholder.
         for _ in range(6):
             if not _is_antibot_challenge(page.title() or "", ""):
                 break
             page.wait_for_timeout(2000)
-        # Expand pagination so later-page/older items become visible, then settle.
+        # Expand pagination so later-page/older items become visible.
         try:
             page.evaluate(_EXPAND_LISTING_JS)
-            page.wait_for_timeout(1800)
+            page.wait_for_timeout(1500)
         except Exception:
             pass
+        # Poll hasta que el texto visible SE ESTABILICE (mismo largo en 2 lecturas
+        # consecutivas) o aparezcan ítems de listado — así capturamos la página ya
+        # cargada, no un estado intermedio. Determinismo de la entrada.
         title = page.title() or ""
-        text = page.evaluate("() => document.body ? document.body.innerText : ''")
-        return title, text or ""
+        text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        prev = -1
+        for _ in range(5):
+            if len(text) > 700 and (len(text) == prev or distinct_listing_items(text) >= 2):
+                break
+            prev = len(text)
+            page.wait_for_timeout(1200)
+            text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            title = page.title() or title
+        return title, text
     except Exception as e:
         print(f"      render error: {str(e)[:120]}", flush=True)
         return None
