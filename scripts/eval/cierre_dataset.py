@@ -26,6 +26,7 @@ import csv
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "fase2_municipios"))
@@ -205,6 +206,57 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     return ("revisar", f"{v}: {motivo[:80]}")
 
 
+# Rutas canonicas por bucket (patrones recurrentes: govbr /site/concursos, IPM /concurso,
+# pg.php, portal-da-transparencia, /portal/editais/3). Se prueban cuando la URL del dataset
+# cae a revisar: muchas veces el INDICE REAL existe en la ruta canonica y el pipeline eligio
+# una URL debil (vista filtrada '/site/editais?tipo=N', menu de transparencia, o el sibling
+# del tipo equivocado -> Esperanca do Sul, Mato Leitao P). Reparar = probar estas con la MISMA
+# vara estricta (rendered_verdict) y quedarse con la que verifique, corrigiendo la URL. Cero
+# FP: solo promueve lo que el gate confirma.
+_CANON_COMBINED = ["/site/concursos", "/concurso", "/portal/editais/3"]
+CANONICAL_PATHS = {
+    "concursos": _CANON_COMBINED + [
+        "/concursos-publicos/", "/concursos/", "/pg.php?area=CONCURSOPUBLICO",
+        "/portal-da-transparencia/concursos-publicos"],
+    "processos": _CANON_COMBINED + [
+        "/processos-seletivos/", "/processo-seletivo", "/site/selecoes",
+        "/pg.php?area=PROCESSOSELETIVO", "/portal-da-transparencia/processos-seletivos",
+        "/portal-da-transparencia/contratacoes-emergenciais"],
+}
+
+
+def _host_base(url: str) -> str:
+    try:
+        p = urlparse(url or "")
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        pass
+    return ""
+
+
+def _repair_via_canonical(session, model, muni, bucket, current_url, site_base, timeout):
+    """Prueba rutas canonicas del host; devuelve (url, motivo) de la primera que verifica
+    como indice valido del tipo, o (None, '') si ninguna. Corrige el error de DESCUBRIMIENTO
+    (URL debil) sin arriesgar FP (todo pasa por rendered_verdict)."""
+    base = _host_base(current_url) or _host_base(site_base)
+    if not base:
+        return None, ""
+    seen = {(current_url or "").rstrip("/")}
+    for path in CANONICAL_PATHS.get(bucket, []):
+        cand = base + path
+        if cand.rstrip("/") in seen:
+            continue
+        seen.add(cand.rstrip("/"))
+        try:
+            ver, mot = rendered_verdict(session, model, muni, bucket, cand, timeout)
+        except Exception:
+            continue
+        if ver == "confirmado":
+            return cand, mot
+    return None, ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
@@ -214,6 +266,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-investigate", action="store_true",
                     help="No re-descubrir buckets vacios; solo verificar URLs existentes")
+    ap.add_argument("--no-repair", action="store_true",
+                    help="No probar rutas canonicas cuando la URL cae a revisar")
     args = ap.parse_args()
 
     rows = list(csv.DictReader(args.input.open(encoding="utf-8-sig")))
@@ -223,7 +277,7 @@ def main() -> int:
     session = C.make_session()
 
     summ = {"confirmado": 0, "revisar": 0, "sin_sitio": 0}
-    changed = {"promovido": 0, "degradado": 0, "investig_hallado": 0}
+    changed = {"promovido": 0, "degradado": 0, "investig_hallado": 0, "reparado": 0}
 
     for i, r in enumerate(rows, 1):
         muni = r["municipio"]
@@ -251,6 +305,16 @@ def main() -> int:
                 ver, motivo = rendered_verdict(session, args.model, muni, bk, url, args.timeout)
                 if ver == "confirmado":
                     final_conf = "confirmado"
+
+            # Step 1.5 — REPAIR: si la URL no confirmo, probar rutas canonicas del host.
+            # Barato (unos fetches) y antes del investigate (cascade completo, caro). Corrige
+            # el error de URL-debil (el indice real existe en la canonica) sin arriesgar FP.
+            if final_conf != "confirmado" and not args.no_repair:
+                rurl, rmot = _repair_via_canonical(
+                    session, args.model, muni, bk, url, r.get("site_base", ""), args.timeout)
+                if rurl:
+                    final_url, final_conf, motivo = rurl, "confirmado", f"reparado: {rmot}"
+                    changed["reparado"] += 1
 
             # Step 2 — if not confirmed, INVESTIGATE: re-discover and verify a fresh
             # candidate (this is the "auto mano-negra" over empty AND revisar buckets).
@@ -303,7 +367,8 @@ def main() -> int:
     print(f"  🟠 revisar (humano triajea):           {summ['revisar']} ({100*summ['revisar']/n:.0f}%)")
     print(f"  🔴 sin_sitio:                          {summ['sin_sitio']} ({100*summ['sin_sitio']/n:.0f}%)")
     print(f"  movimientos: promovidos {changed['promovido']} | degradados {changed['degradado']} | "
-          f"hallados por investigacion {changed['investig_hallado']}")
+          f"hallados por investigacion {changed['investig_hallado']} | "
+          f"reparados (URL canonica) {changed['reparado']}")
     print(f"  salida: {args.output}")
     return 0
 
