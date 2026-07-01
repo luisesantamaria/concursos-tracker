@@ -45,10 +45,16 @@ def qn(s: str) -> str:
 
 # Número de edital NN/AAAA o NN-AAAA (con lookbehind para no morder "Lei 13.019/2014").
 _NUM = re.compile(r"(?<![\d.])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b")
-# Documentos de ciclo de vida de UN certame (no suman certame nuevo).
+# BINDING: el item nombra al certame PADRE ("Edital 29/2019 - Concurso Público nº
+# 01/2019"). Cuando está, la clave del certame es el padre, aunque el doc tenga su
+# propio número -> colapsa homologações/convocações con número propio (São Marcos).
+_BINDING = re.compile(
+    r"(concurso\s+p[uú]blic\w*|processo\s+seletivo\w*|sele[çc][aã]o\s+p[uú]blic\w*|"
+    r"\bpss\b)[^\n]{0,18}?n?[º°o]?\s*(\d{1,4})\s*[/\-]\s*(20[12]\d)\b", re.I)
+# Documentos de ciclo de vida de UN certame (no suman certame nuevo). SOLO estos —
+# NO "abertura"/"inscrições"/"anexo": una ABERTURA sí crea certame (regla de Fable).
 _CYCLE = re.compile(
-    r"homologa|convoca|retifica|resultad|classifica[çc]|inscri[çt]|gabarito|"
-    r"prova|inscritos|prorroga|errata|adiamento|anexo", re.I)
+    r"homologa|convoca|retifica|classifica[çc]|resultad|prorroga|adiamento|errata", re.I)
 # Entidades AJENAS conocidas (supra/extra-municipales). El default-deny no las
 # necesita para ejecutar, pero acelerarlas y explicarlas ayuda a la telemetría.
 _FOREIGN = re.compile(
@@ -61,12 +67,16 @@ _INTRA = re.compile(
     r"instituto de previd|regime pr[oó]prio|conselho municipal|conselho tutelar", re.I)
 
 # Keywords del tipo por bucket (para clasificar por CONTENIDO, no por título/URL).
+# Concursos: "concurso público", o "concurso" seguido de número/año (Concurso 2020,
+# Concurso 01/2024) — pero NO "concurso de soberanas/rainha" (cultural, otro tipo).
 _KW = {
-    "concursos": re.compile(r"concurso\s+p[uú]blic", re.I),
+    "concursos": re.compile(
+        r"concurso\s+p[uú]blic|concurso\s+n?[º°o]?\s*\d|concurso\s+20[12]\d", re.I),
     "processos": re.compile(r"processo\s+seletivo|sele[çc][aã]o\s+p[uú]blic|"
                             r"sele[çc][aã]o\s+simplificad|\bpss\b|"
                             r"contrata[çc][aã]o\s+tempor", re.I),
 }
+_CULTURAL = re.compile(r"soberan|rainha|garota|majestade|realeza|rei\s+e\s+rainha", re.I)
 
 _SCHEMA = {
     "type": "object",
@@ -162,13 +172,10 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     """Decide 'confirmar'|'revisar' sobre la evidencia extraída. Devuelve
     (decision, evidencia) con la evidencia estructurada para telemetría/muestreo."""
     low = qn(text)
-    kw = _KW.get(bucket if bucket in _KW else
-                 ("concursos" if bucket == "C" else "processos"))
+    bnorm = bucket if bucket in _KW else ("concursos" if bucket == "C" else "processos")
+    kw = _KW[bnorm]
     certames: set = set()
-    n_ajeno = 0
-    n_verif = 0
-    n_cycle = 0
-    n_offtype = 0
+    n_ajeno = n_verif = n_cycle = n_offtype = 0
     for it in items or []:
         cita = it.get("cita", "")
         if not cita:
@@ -179,23 +186,36 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         n_verif += 1
         i = low.find(qc)
         win = low[max(0, i - 160): i + len(qc) + 160]
-        if not kw.search(win):             # tipo del bucket por ventana
-            n_offtype += 1
-            continue
         if _emissor_ajeno(it.get("emissor"), municipio):
             n_ajeno += 1
             continue
-        m = _NUM.search(cita) or _NUM.search(win)
-        is_cycle = bool(_CYCLE.search(win))
-        if is_cycle:
+        if _CULTURAL.search(win):          # concurso cultural (soberanas) != concurso público
+            n_offtype += 1
+            continue
+        # Regla 1 — BINDING gana: el item nombra al certame padre (tipo + N/AAAA),
+        # aunque el doc tenga su propio número. Colapsa docs de ciclo numerados.
+        b = _BINDING.search(cita) or _BINDING.search(win)
+        if b:
+            btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
+            if btipo == bnorm:
+                certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
+            continue
+        if not kw.search(win):             # tipo del bucket por ventana
+            n_offtype += 1
+            continue
+        # Regla 2 — keyword de ciclo sin binding -> doc huérfano, no crea certame.
+        if _CYCLE.search(win):
             n_cycle += 1
-            continue                       # doc de ciclo -> no suma certame nuevo
+            continue
+        # Regla 3 — abertura / edital con número -> crea certame.
+        m = _NUM.search(cita) or _NUM.search(win)
         if m:
             certames.add((m.group(1).lstrip("0") or "0", m.group(2)))
         else:
+            # Regla 4 — keyword + año sin número -> crea certame por año.
             y = re.search(r"\b(20[12]\d)\b", win)
             if y:
-                certames.add(("Y", y.group(1)))   # listado por año pelado
+                certames.add(("Y", y.group(1)))
     ev = {
         "n_certames": len(certames),
         "certames": sorted(certames)[:8],
