@@ -166,7 +166,7 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     if need_render:
         r = A.render_page(url, timeout)
         if r and (_has_real_listing_item(r[1]) or len((r[1] or "").strip()) >= 500):
-            title, text = r
+            title, text = r[0], r[1]  # r[2] = anchors (para el futuro adjudicador)
     if not (text or "").strip():
         return ("revisar", "inaccesible/render-vacio")
     if _is_server_error(title, text):

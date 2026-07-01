@@ -124,14 +124,39 @@ _EXPAND_LISTING_JS = """
 """
 
 
-def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
-    """Open the URL in a real browser and return (title, visible_text).
+# Recolecta los anchors (href + texto) de la página ya renderizada. Sirve para la
+# TOPOLOGÍA DE LINKS del adjudicador: un índice real enlaza a páginas de certames
+# DISTINTOS (/concurso/id/200, /id/187...) o a PDFs en carpetas distintas; el detalle
+# de UN solo certame enlaza a documentos del mismo certame (mismo dir/mismo id base).
+# Contar targets-de-certame distintos discrimina São Marcos (arquetipo B') de forma
+# determinista, sin depender de que el texto lo diga. Cap a 300 para no explotar.
+_COLLECT_ANCHORS_JS = """
+() => {
+  const out = [];
+  const seen = new Set();
+  for (const a of document.querySelectorAll('a[href]')) {
+    const href = a.href || '';
+    if (!href || href.startsWith('javascript') || href.startsWith('mailto')) continue;
+    const key = href + '|' + (a.innerText || '').trim().slice(0, 60);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({href: href, text: (a.innerText || '').trim().slice(0, 120)});
+    if (out.length >= 300) break;
+  }
+  return out;
+}
+"""
+
+
+def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
+    """Open the URL in a real browser and return (title, visible_text, anchors).
 
     For JS-rendered municipal portals (atende.net, oxy.elotech, etc.) whose menu
     and listing only exist after client-side rendering. Before reading the text it
     expands client-side pagination (see ``_EXPAND_LISTING_JS``) so the auditor
-    sees the whole listing, not just the first page. Returns None if the browser
-    is unavailable or the load fails.
+    sees the whole listing, not just the first page. ``anchors`` is a list of
+    ``{"href", "text"}`` para la topología de links del adjudicador. Returns None
+    if the browser is unavailable or the load fails.
     """
     try:
         browser = _get_browser()
@@ -195,7 +220,11 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str] | None:
             page.wait_for_timeout(1200)
             text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
             title = page.title() or title
-        return title, text
+        try:
+            anchors = page.evaluate(_COLLECT_ANCHORS_JS) or []
+        except Exception:
+            anchors = []
+        return title, text, anchors
     except Exception as e:
         print(f"      render error: {str(e)[:120]}", flush=True)
         return None
@@ -372,7 +401,7 @@ def audit_one(session, bucket: str, url: str, timeout: int,
         # Keep the richer of the two — never let a degraded render replace good
         # static content.
         if r and len(r[1] or "") > len(text):
-            title, text = r
+            title, text = r[0], r[1]  # r[2] = anchors
             rendered = True
 
     js_like = (not rendered) and (
