@@ -313,19 +313,35 @@ def is_pdf_or_file(url: str) -> bool:
 # reject it. Even when Tier 3 picked it, it must not earn `confirmado`: the
 # cascade keeps it `probable` and leaves promotion to the rendered AI verdict in
 # the closing pass. None of the 24 golden index URLs match these patterns.
-DETAIL_URL_PATTERNS = [
+# Detalle INEQUIVOCO: nunca es un indice -> hard-block en el cierre.
+HARD_DETAIL_PATTERNS = [
     r"/id/\d+",                # /concurso/id/200/
     r"/detalhe/",              # /detalhe/452/...
     r"/legislacao/detalhe",    # /legislacao/detalhe/3619/...
-    r"/conteudos?/\d+",        # /site/conteudos/5848-... (single content item)
     r"[?&]slug=",              # ?slug=processo-seletivo (a single named item)
     r"\.pdf(\?|$)",
 ]
+# AMBIGUO: /conteudo/N puede ser un DETALLE (una noticia/concurso unico) O el INDICE de
+# la seccion — hay CMS que usan /conteudo/ID para sus paginas de LISTADO (p.ej. Imbe:
+# "Concursos Publicos" vive en /conteudo/13400/... y "Processos Seletivos" en /conteudo/
+# 13086/...). Por eso NO se hard-blockea: se juzga por contenido (render + item + IA).
+AMBIGUOUS_DETAIL_PATTERNS = [
+    r"/conteudos?/\d+",        # /site/conteudos/5848-... o /conteudo/13400 (indice o detalle)
+]
+DETAIL_URL_PATTERNS = HARD_DETAIL_PATTERNS + AMBIGUOUS_DETAIL_PATTERNS
 
 
 def is_detail_url(url: str) -> bool:
+    """Union (duro + ambiguo). Usado por el cascade para bajar la confianza a probable."""
     u = (url or "").lower()
     return any(re.search(p, u) for p in DETAIL_URL_PATTERNS)
+
+
+def is_hard_detail_url(url: str) -> bool:
+    """Solo detalle INEQUIVOCO (/id/N, /detalhe/, .pdf, ?slug=). El cierre hard-blockea
+    estas; deja pasar /conteudo/N (ambiguo) a verificacion por contenido."""
+    u = (url or "").lower()
+    return any(re.search(p, u) for p in HARD_DETAIL_PATTERNS)
 
 
 # ---------------------------------------------------------------------------

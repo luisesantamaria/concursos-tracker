@@ -151,8 +151,8 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     # rules, no matter how index-like its rendered content looks (a single concurso
     # page lists many sub-editais and can fool the verdict). Send it to revisar so
     # investigation/human finds the real index. Keeps `confirmado` airtight.
-    if C.is_detail_url(url):
-        return ("revisar", "url de detalle: no es indice (regla de fase)")
+    if C.is_hard_detail_url(url):
+        return ("revisar", "url de detalle inequivoca: no es indice (regla de fase)")
     pg = C.fetch_page(session, url, timeout)
     title = pg.title if (pg and pg.ok) else ""
     text = pg.text if (pg and pg.ok) else ""
