@@ -100,6 +100,19 @@ def _looks_like_wall(text: str) -> bool:
 _EXPAND_LISTING_JS = """
 () => {
   try {
+    // 0) Clear/show-all controls by TEXT (generic, portal-agnostic — not a CMS
+    // hardcode). São Marcos had a "LIMPAR FILTROS" anchor: the default view was a
+    // filtered subset (only the most recent certame), and clearing it revealed the
+    // full listing (4 concursos instead of 1). Match by visible text only.
+    const clearRe = /limpar\\s+filtros?|ver\\s+todos|mostrar\\s+todos|exibir\\s+todos|todos\\s+os\\s+anos|ver\\s+mais|carregar\\s+mais|show\\s+all|clear\\s+filters/i;
+    document.querySelectorAll('a,button').forEach(el => {
+      const t = (el.innerText || el.textContent || '').trim();
+      if (t && t.length < 40 && clearRe.test(t)) {
+        try { el.click(); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+  try {
     document.querySelectorAll('select').forEach(sel => {
       const opts = Array.from(sel.options || []);
       if (!opts.length) return;
@@ -118,6 +131,18 @@ _EXPAND_LISTING_JS = """
         sel.value = target.value;
         sel.dispatchEvent(new Event('change', { bubbles: true }));
       }
+    });
+  } catch (e) {}
+  try {
+    // 3) Acordeones colapsados y <details> cerrados esconden documentos internos de
+    // innerText aunque el título de la fila (lo que el conteo de certames necesita)
+    // suele quedar visible sin expandir — pero expandir no puede perder informacion,
+    // solo agregarla. Generico: aria-expanded="false" y details:not([open]).
+    document.querySelectorAll('[aria-expanded="false"]').forEach(el => {
+      try { el.click(); } catch (e) {}
+    });
+    document.querySelectorAll('details:not([open])').forEach(el => {
+      try { el.open = true; } catch (e) {}
     });
   } catch (e) {}
 }

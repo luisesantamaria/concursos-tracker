@@ -168,12 +168,23 @@ def _emissor_ajeno(emissor: str, municipio: str) -> bool:
 
 
 def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
-               anchors: list | None = None) -> tuple[str, dict]:
+               anchors: list | None = None, title: str = "") -> tuple[str, dict]:
     """Decide 'confirmar'|'revisar' sobre la evidencia extraída. Devuelve
     (decision, evidencia) con la evidencia estructurada para telemetría/muestreo."""
     low = qn(text)
     bnorm = bucket if bucket in _KW else ("concursos" if bucket == "C" else "processos")
+    other = "processos" if bnorm == "concursos" else "concursos"
     kw = _KW[bnorm]
+    # Título/H1 de la página como señal de tipo por defecto: un item de listado que
+    # no repite la keyword del tipo (ej. "Edital de abertura das inscrições 02/2024",
+    # São Marcos) hereda el tipo declarado por el título SOLO si el título declara
+    # exactamente un tipo (XOR) -- una página combinada ("Concursos e Processos
+    # Seletivos") no dispara el fallback, para no reabrir la puerta a items neutros
+    # en páginas mixtas donde SÍ importa clasificar por contenido.
+    title_q = qn(title or "")
+    title_here = bool(_KW[bnorm].search(title_q))
+    title_other = bool(_KW[other].search(title_q))
+    title_declares = title_here and not title_other
     certames: set = set()
     n_ajeno = n_verif = n_cycle = n_offtype = 0
     # PISO DETERMINISTA de alto recall: los certames con binding explícito
@@ -218,8 +229,11 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                 certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
             continue
         if not kw.search(win):             # tipo del bucket por ventana
-            n_offtype += 1
-            continue
+            # fallback: título declara el tipo sin ambigüedad y el item no tiene
+            # marca del OTRO tipo ni cultural en su ventana local.
+            if not (title_declares and not _KW[other].search(win) and not _CULTURAL.search(win)):
+                n_offtype += 1
+                continue
         # Regla 2 — keyword de ciclo sin binding -> doc huérfano, no crea certame.
         if _CYCLE.search(win):
             n_cycle += 1
