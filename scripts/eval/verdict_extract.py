@@ -39,6 +39,11 @@ import urllib.request
 # normalizar, el substring-check falla en páginas reales (bug observado).
 # ---------------------------------------------------------------------------
 def qn(s: str) -> str:
+    if s and ("Ã" in s or "Â" in s):
+        try:
+            s = s.encode("latin1").decode("utf-8")
+        except Exception:
+            pass
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
     return re.sub(r"\s+", " ", s).strip()
 
@@ -47,6 +52,11 @@ def qn(s: str) -> str:
 # amplias (+/-160 chars) se contaminan en listados densos; incluir filas vecinas
 # tambien rompe tablas IPM, donde el binding de otra fila puede secuestrar el item.
 _DATE_LINE = re.compile(r"^\s*\d{1,2}\s*(?:/|-)\s*\d{1,2}\s*(?:/|-)\s*20[12]\d\s*$")
+_META_LINE = re.compile(
+    r"^\s*(?:publicado\s+em\b|"
+    r"(?:tipo|categoria|modalidade|situa[cç][aã]o|status)\s*:)",
+    re.I,
+)
 
 
 def _item_scope(text: str, cita: str) -> str:
@@ -62,12 +72,37 @@ def _item_scope(text: str, cita: str) -> str:
             # es una fecha aislada, nunca una fila de otro certame.
             if i > 0 and _DATE_LINE.match(lines[i - 1] or ""):
                 block = lines[i - 1] + "\n" + block
+            for nxt in lines[i + 1:i + 4]:
+                if _META_LINE.match(qn(nxt)):
+                    block += "\n" + nxt
             return qn(block)
     return qc
 
 
 # Número de edital NN/AAAA o NN-AAAA (con lookbehind para no morder "Lei 13.019/2014").
 _NUM = re.compile(r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b")
+_NUM_SHORT_YEAR = re.compile(
+    r"(?:edital|concursos?|processos?\s+seletiv\w*|sele[cç][aã]o|"
+    r"\bpss\b|n[\u00ba\u00b0o]?)\D{0,24}?"
+    r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(\d{2})\b",
+    re.I,
+)
+
+
+def _year2(yy: str) -> str:
+    y = int(yy)
+    return str(2000 + y if y <= 39 else 1900 + y)
+
+
+def _num_key(*texts: str) -> tuple[str, str] | None:
+    for t in texts:
+        m = _NUM.search(t or "")
+        if m:
+            return (m.group(1).lstrip("0") or "0", m.group(2))
+        m2 = _NUM_SHORT_YEAR.search(t or "")
+        if m2:
+            return (m2.group(1).lstrip("0") or "0", _year2(m2.group(2)))
+    return None
 # BINDING: el item nombra al certame PADRE ("Edital 29/2019 - Concurso Público nº
 # 01/2019"). Cuando está, la clave del certame es el padre, aunque el doc tenga su
 # propio número -> colapsa homologações/convocações con número propio (São Marcos).
@@ -76,6 +111,14 @@ _BINDING = re.compile(
     r"\bpss\b)[^\n]{0,18}?n?[º°o]?\s*(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b", re.I)
 # Documentos de ciclo de vida de UN certame (no suman certame nuevo). SOLO estos —
 # NO "abertura"/"inscrições"/"anexo": una ABERTURA sí crea certame (regla de Fable).
+_BINDING = re.compile(
+    r"(concursos?\s+p[u\u00fa]blic\w*|processos?\s+seletiv\w*|"
+    r"sele[\u00e7c][a\u00e3]o\s+p[u\u00fa]blic\w*|concursos?|"
+    r"processos?\s+seletiv\w*|\bpss\b)[^\n]{0,80}?"
+    r"(?:edital\s*)?n?[\u00ba\u00b0o]?\s*(?<![\d./])"
+    r"(\d{1,4})\s*[/\-]\s*(20[12]\d)\b",
+    re.I,
+)
 _CYCLE = re.compile(
     r"homologa|convoca|retifica|classifica[çc]|resultad|prorroga|adiamento|errata", re.I)
 # Entidades AJENAS conocidas (supra/extra-municipales). El default-deny no las
@@ -308,9 +351,9 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
             n_cycle += 1
             continue
         # Regla 3 — abertura / edital con número -> crea certame.
-        m = _NUM.search(cita) or _NUM.search(scope)
-        if m:
-            certames.add((m.group(1).lstrip("0") or "0", m.group(2)))
+        key = _num_key(cita, scope)
+        if key:
+            certames.add(key)
         else:
             # Regla 4 — keyword + año sin número -> crea certame por año.
             y = re.search(r"\b(20[12]\d)\b", scope)
