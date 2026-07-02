@@ -25,6 +25,7 @@ import argparse
 import csv
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
@@ -447,6 +448,33 @@ def _repair_via_canonical(session, model, muni, bucket, current_url, site_base,
     return None, ""
 
 
+def _is_revisar_op_reason(motivo: str) -> bool:
+    m = (motivo or "").strip()
+    return (
+        m.startswith("revisar_op:")
+        or m.startswith("extract: revisar_op:")
+        or "shadow:revisar:extract: revisar_op:" in m
+    )
+
+
+def _append_cierre_note(row: dict, bucket: str, state: str, motivo: str,
+                        prefix: str = "cierre") -> None:
+    row["notes"] = (
+        row.get("notes", "") + f" | {prefix}[{bucket}]: {state} ({motivo[:360]})"
+    )[:3200]
+
+
+def _summarize_rows(rows: list[dict]) -> dict[str, int]:
+    summ = {"confirmado": 0, "revisar": 0, "sin_sitio": 0}
+    for r in rows:
+        for _, _, ccol, _ in BUCKETS:
+            st = (r.get(ccol) or "").strip()
+            key = "confirmado" if st == "confirmado" else (
+                "revisar" if st == "revisar" else "sin_sitio")
+            summ[key] += 1
+    return summ
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", type=Path, required=True)
@@ -467,6 +495,10 @@ def main() -> int:
     ap.add_argument("--extract-authority", action="store_true",
                     help="Usar verdict_extract como autoridad del cierre (usar solo "
                          "despues de validar la corrida sombra)")
+    ap.add_argument("--retry-operational", action="store_true",
+                    help="Al final, reintentar solo buckets revisar_op:*")
+    ap.add_argument("--op-retry-wait", type=float, default=5.0,
+                    help="Minutos de espera antes del retry operacional (default: 5)")
     args = ap.parse_args()
     extract_mode = "authority" if args.extract_authority else (
         "shadow" if args.extract_shadow else "off")
@@ -480,6 +512,7 @@ def main() -> int:
     summ = {"confirmado": 0, "revisar": 0, "sin_sitio": 0}
     changed = {"promovido": 0, "degradado": 0, "investig_hallado": 0, "reparado": 0,
                "menu_risk": 0}
+    op_retry: list[dict] = []
 
     for i, r in enumerate(rows, 1):
         muni = r["municipio"]
@@ -577,11 +610,59 @@ def main() -> int:
                     r[ccol] = "revisar"
                 else:
                     r[ccol] = ""   # sin sitio oficial
-            r["notes"] = (r.get("notes", "") + f" | cierre[{bk}]: {r[ccol]} ({motivo[:360]})")[:3200]
+            _append_cierre_note(r, bk, r[ccol], motivo)
+            if (args.retry_operational and r[ccol] == "revisar"
+                    and (r.get(ucol) or "").startswith("http")
+                    and _is_revisar_op_reason(motivo)):
+                op_retry.append({
+                    "row": r, "bucket": bk, "ucol": ucol, "ccol": ccol,
+                    "tcol": tcol, "prev": prev, "tier": final_tier,
+                    "motivo": motivo,
+                })
             print(f"    {bk}: {prev or '-'} -> {r[ccol]}", flush=True)
 
             st = r[ccol]
             summ["confirmado" if st == "confirmado" else "revisar" if st == "revisar" else "sin_sitio"] += 1
+
+    if args.retry_operational and op_retry:
+        wait_s = max(0.0, args.op_retry_wait) * 60.0
+        print(f"\nReintentando {len(op_retry)} revisar_op tras {wait_s:.0f}s...", flush=True)
+        if wait_s:
+            time.sleep(wait_s)
+        for item in op_retry:
+            r = item["row"]
+            bk = item["bucket"]
+            ucol = item["ucol"]
+            ccol = item["ccol"]
+            url = (r.get(ucol) or "").strip()
+            if not url.startswith("http") or r.get(ccol) != "revisar":
+                continue
+            ver, mot = rendered_verdict(
+                session, args.model, r["municipio"], bk, url, args.timeout, extract_mode)
+            final_state = "confirmado" if ver == "confirmado" else "revisar"
+            if ver == "confirmado":
+                ok_menu, menu_reason = apply_menu_reachability_guard(
+                    session, r, bk, url, item["tier"], args.timeout)
+                if ok_menu:
+                    mot = f"{mot[:110]} | {menu_reason}" if mot else menu_reason
+                elif args.require_menu_reachability:
+                    final_state = "revisar"
+                    mot = menu_reason
+                else:
+                    risk = f"menu_risk:{menu_reason}"
+                    mot = f"{mot[:95]} | {risk}" if mot else risk
+                    changed["menu_risk"] += 1
+            r[ccol] = final_state
+            if final_state == "confirmado":
+                if item["prev"] == "confirmado" and changed["degradado"] > 0:
+                    changed["degradado"] -= 1
+                elif item["prev"] != "confirmado":
+                    changed["promovido"] += 1
+            _append_cierre_note(r, bk, final_state, mot, prefix="op_retry")
+            print(f"    retry {r['municipio']} {bk}: revisar_op -> {final_state}",
+                  flush=True)
+
+    summ = _summarize_rows(rows)
 
     with args.output.open("w", encoding="utf-8", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
