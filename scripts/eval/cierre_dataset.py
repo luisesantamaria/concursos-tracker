@@ -26,7 +26,7 @@ import csv
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "fase2_municipios"))
@@ -36,8 +36,8 @@ import cascade_municipios as C   # noqa: E402
 import audit_fase2_rs as A       # noqa: E402
 
 BUCKETS = [
-    ("concursos", "url_concursos", "confianza_concursos"),
-    ("processos", "url_processos_seletivos", "confianza_processos"),
+    ("concursos", "url_concursos", "confianza_concursos", "tier_concursos"),
+    ("processos", "url_processos_seletivos", "confianza_processos", "tier_processos"),
 ]
 
 # Server-side error pages served with HTTP 200 (ASP.NET "Runtime Error", PHP/SQL
@@ -141,6 +141,133 @@ def _has_real_listing_item(text: str) -> bool:
     if _KEYWORD_YEAR_RE.search(t):
         return True
     return False
+
+
+def _url_key(url: str, *, drop_default_query: bool = False) -> tuple[str, str, tuple]:
+    """Canonical key for reachability comparison.
+
+    Ignores scheme and leading www, keeps path and query. ``ano=0``/empty query
+    variants are treated as same page only when explicitly requested.
+    """
+    try:
+        p = urlparse(C.clean_url(url))
+    except Exception:
+        return ("", "", ())
+    host = p.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (p.path or "/").rstrip("/") or "/"
+    query = tuple(sorted(parse_qsl(p.query, keep_blank_values=True)))
+    if drop_default_query:
+        query = tuple(
+            (k, v) for k, v in query
+            if not (k.lower() in {"ano", "year"} and v in {"", "0", "todos", "todas"})
+        )
+    return host, path, query
+
+
+def _same_reachable_url(a: str, b: str) -> bool:
+    """True when a menu/link URL proves reachability for the target URL."""
+    if _url_key(a) == _url_key(b):
+        return True
+    return _url_key(a, drop_default_query=True) == _url_key(b, drop_default_query=True)
+
+
+def _tier_proves_menu(tier: str) -> bool:
+    """Discovery tiers that already prove current-menu reachability."""
+    t = (tier or "").strip().lower()
+    return t.startswith("t1") or t.startswith("t4")
+
+
+def _link_matches_target(links: list[tuple[str, str]], target_url: str) -> tuple[bool, str]:
+    for href, text in links:
+        if _same_reachable_url(href, target_url):
+            label = (text or "").strip()
+            return True, f"menu_link:{label[:50] or href[:50]}"
+    return False, ""
+
+
+def _collect_page_links(session, page_url: str, timeout: int) -> tuple[list[tuple[str, str]], str]:
+    home = C.fetch_page(session, page_url, timeout)
+    if not home.ok:
+        return [], f"page_inaccesible:{home.status or home.error or 'err'}"
+    links = list(home.links or [])
+    if getattr(home, "is_spa", False) or len(links) < 8:
+        rendered = C._render_page_links(home.url, timeout)  # same helper used by Tier 1
+        existing = {h for h, _ in links}
+        links.extend((h, t) for h, t in rendered if h not in existing)
+    return links, "page_ok"
+
+
+def _menu_roots(site_base: str, target_url: str) -> list[str]:
+    roots = [site_base]
+    try:
+        site = urlparse(C.clean_url(site_base))
+        target = urlparse(C.clean_url(target_url))
+    except Exception:
+        return roots
+    if site.netloc.lower() != target.netloc.lower() or not target.scheme:
+        return roots
+    first_segment = (target.path or "").strip("/").split("/", 1)[0]
+    if first_segment in {"cidadao", "transparencia"}:
+        subroot = f"{target.scheme}://{target.netloc}/{first_segment}"
+        if subroot not in roots:
+            roots.append(subroot)
+    return roots
+
+
+def menu_reachable(session, site_base: str, target_url: str, timeout: int) -> tuple[bool, str]:
+    """Best-effort proof that target is reachable from the current official menu.
+
+    This is a precision guard for non-menu discoveries (grounding, probes, repair):
+    direct home/menu link or one obvious container page is enough. The caller
+    decides whether missing proof is a hard downgrade or a ``menu_risk`` tag.
+    """
+    if not site_base or not site_base.startswith("http"):
+        return False, "sin_site_base_para_menu"
+    statuses: list[str] = []
+    root_links: list[tuple[str, str]] = []
+    for root in _menu_roots(site_base, target_url):
+        links, status = _collect_page_links(session, root, timeout)
+        statuses.append(f"{root}:{status}:{len(links)}links")
+        root_links.extend(links)
+        ok, why = _link_matches_target(links, target_url)
+        if ok:
+            return True, why
+
+    containers: list[tuple[str, str]] = []
+    all_container_terms = C.CONTAINER_KEYWORDS + [
+        "concurso", "concursos", "processo seletivo", "processos seletivos",
+        "selecao publica", "selecoes publicas", "pss",
+    ]
+    seen = set()
+    for href, text in root_links:
+        if href in seen or C.is_pdf_or_file(href) or C.is_broad_landing(href):
+            continue
+        seen.add(href)
+        blob = C.norm(f"{text} {urlparse(href).path}")
+        if any(term in blob for term in all_container_terms):
+            containers.append((href, text))
+    for href, text in containers[:8]:
+        page = C.fetch_page(session, href, min(timeout, 12))
+        if not page.ok or C.is_soft_404(page):
+            continue
+        ok, why = _link_matches_target(page.links or [], target_url)
+        if ok:
+            return True, f"container:{(text or href)[:40]}>{why}"
+    return False, "no_link_desde_menu_actual; " + "; ".join(statuses[:3])
+
+
+def apply_menu_reachability_guard(session, row: dict, bucket: str, url: str,
+                                  tier: str, timeout: int) -> tuple[bool, str]:
+    """Return (allowed, reason) for sealing `confirmado`."""
+    if _tier_proves_menu(tier):
+        return True, f"tier_menu:{tier}"
+    site_base = (row.get("site_base") or "").strip()
+    ok, why = menu_reachable(session, site_base, url, timeout)
+    if ok:
+        return True, f"menu_reachable:{why}"
+    return False, f"sin_menu_reachability({tier or 'sin_tier'}): {why}"
 
 
 def rendered_verdict(session, model, municipio, bucket, url, timeout):
@@ -268,6 +395,9 @@ def main() -> int:
                     help="No re-descubrir buckets vacios; solo verificar URLs existentes")
     ap.add_argument("--no-repair", action="store_true",
                     help="No probar rutas canonicas cuando la URL cae a revisar")
+    ap.add_argument("--require-menu-reachability", action="store_true",
+                    help="Degradar confirmados no-menu sin prueba de reachability "
+                         "desde el menu actual (default: solo etiqueta menu_risk)")
     args = ap.parse_args()
 
     rows = list(csv.DictReader(args.input.open(encoding="utf-8-sig")))
@@ -277,7 +407,8 @@ def main() -> int:
     session = C.make_session()
 
     summ = {"confirmado": 0, "revisar": 0, "sin_sitio": 0}
-    changed = {"promovido": 0, "degradado": 0, "investig_hallado": 0, "reparado": 0}
+    changed = {"promovido": 0, "degradado": 0, "investig_hallado": 0, "reparado": 0,
+               "menu_risk": 0}
 
     for i, r in enumerate(rows, 1):
         muni = r["municipio"]
@@ -295,10 +426,11 @@ def main() -> int:
                     print(f"    investig error: {str(e)[:70]}", flush=True)
             return discovered if discovered else None
 
-        for bk, ucol, ccol in BUCKETS:
+        for bk, ucol, ccol, tcol in BUCKETS:
             url = (r.get(ucol) or "").strip()
             prev = (r.get(ccol) or "").strip()
             final_url, final_conf, motivo = url, None, ""
+            final_tier = (r.get(tcol) or "").strip()
 
             # Step 1 — verify the existing URL (if any).
             if url.startswith("http"):
@@ -314,6 +446,7 @@ def main() -> int:
                     session, args.model, muni, bk, url, r.get("site_base", ""), args.timeout)
                 if rurl:
                     final_url, final_conf, motivo = rurl, "confirmado", f"reparado: {rmot}"
+                    final_tier = "repair"
                     changed["reparado"] += 1
 
             # Step 2 — if not confirmed, INVESTIGATE: re-discover and verify a fresh
@@ -328,8 +461,28 @@ def main() -> int:
                     ver2, motivo2 = rendered_verdict(session, args.model, muni, bk, cand, args.timeout)
                     if ver2 == "confirmado":
                         final_url, final_conf, motivo = cand, "confirmado", motivo2
+                        final_tier = (d.tier_concursos if bk == "concursos"
+                                      else d.tier_processos) or "investigate"
                         if not url.startswith("http"):
                             changed["investig_hallado"] += 1
+
+            # Step 2.8 — menu-reachability guard: non-menu discoveries (grounding,
+            # probes, repairs) can point at a fossil index whose content is perfect
+            # but no longer linked from the current official site. Default: tag the
+            # risk for batch review; --require-menu-reachability makes it hard.
+            if final_conf == "confirmado":
+                ok_menu, menu_reason = apply_menu_reachability_guard(
+                    session, r, bk, final_url, final_tier, args.timeout)
+                if ok_menu:
+                    motivo = f"{motivo[:110]} | {menu_reason}" if motivo else menu_reason
+                else:
+                    if args.require_menu_reachability:
+                        final_conf = None
+                        motivo = menu_reason
+                    else:
+                        risk = f"menu_risk:{menu_reason}"
+                        motivo = f"{motivo[:95]} | {risk}" if motivo else risk
+                        changed["menu_risk"] += 1
 
             # Step 3 — finalize the bucket state.
             site = (r.get("site_base") or "").strip()
@@ -368,7 +521,8 @@ def main() -> int:
     print(f"  🔴 sin_sitio:                          {summ['sin_sitio']} ({100*summ['sin_sitio']/n:.0f}%)")
     print(f"  movimientos: promovidos {changed['promovido']} | degradados {changed['degradado']} | "
           f"hallados por investigacion {changed['investig_hallado']} | "
-          f"reparados (URL canonica) {changed['reparado']}")
+          f"reparados (URL canonica) {changed['reparado']} | "
+          f"menu_risk {changed['menu_risk']}")
     print(f"  salida: {args.output}")
     return 0
 
