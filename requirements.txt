@@ -25,6 +25,7 @@ pydantic>=2.5
 # Utilities
 tqdm>=4.66
 python-dotenv>=1.0
+pytest>=8.0
 
 # Optional: OCR (instalar só se necessário)
 # pytesseract>=0.3

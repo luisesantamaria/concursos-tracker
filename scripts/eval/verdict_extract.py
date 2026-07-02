@@ -375,6 +375,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         if _CULTURAL.search(scope):         # concurso cultural (soberanas) != concurso público
             n_offtype += 1
             continue
+        used_title_fallback = False
         # Regla 1 — BINDING gana: el item nombra al certame padre (tipo + N/AAAA),
         # aunque el doc tenga su propio número. Colapsa docs de ciclo numerados.
         b = _BINDING.search(cita) or _BINDING.search(scope)
@@ -389,12 +390,16 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
             if not (title_declares and not _KW[other].search(scope) and not _CULTURAL.search(scope)):
                 n_offtype += 1
                 continue
+            used_title_fallback = True
         # Regla 2 — edital con número propio -> crea certame. Si era documento de
         # ciclo de un certame padre, la Regla 1 ya lo colapso por binding.
         key = _num_key(cita, scope)
         if key:
             certames.add(key)
         else:
+            if used_title_fallback:
+                n_offtype += 1
+                continue
             # Regla 3 — keyword de ciclo sin número/binding -> doc huérfano.
             if _CYCLE.search(scope):
                 n_cycle += 1
