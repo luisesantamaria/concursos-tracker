@@ -216,12 +216,9 @@ _EXTRACT_PROMPT = (
 )
 
 
-def extract_items(text: str, session, gemini_post, model: str,
-                  timeout: int = 40, raise_errors: bool = False) -> list[dict]:
-    """Pide al LLM la lista de items (cita verbatim + emisor). Usa responseSchema +
-    temperatura 0. `gemini_post` es la del cascade: (session, model, payload, timeout)
-    -> dict. Maneja truncación: si el JSON viene cortado, recupera los items completos."""
-    prompt = _EXTRACT_PROMPT.format(text=(text or "")[:14000])
+def _extract_one_window(window_text: str, session, gemini_post, model: str,
+                        timeout: int, raise_errors: bool) -> list[dict]:
+    prompt = _EXTRACT_PROMPT.format(text=(window_text or "")[:14000])
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -247,6 +244,33 @@ def extract_items(text: str, session, gemini_post, model: str,
         return json.loads(raw).get("items", []) or []
     except Exception:
         return _salvage_items(raw)
+
+
+def extract_items(text: str, session, gemini_post, model: str,
+                  timeout: int = 40, raise_errors: bool = False) -> list[dict]:
+    """Pide al LLM items sobre ventanas solapadas del texto renderizado.
+
+    El quote-check se preserva en adjudicate(): cada cita se verifica contra el
+    texto completo, no contra la ventana que la produjo.
+    """
+    full_text = text or ""
+    if len(full_text) <= 14000:
+        windows = [full_text]
+    else:
+        windows = [
+            full_text[i:i + 14000]
+            for i in range(0, min(len(full_text), 42000), 12000)
+        ]
+    seen: set[str] = set()
+    items: list[dict] = []
+    for window in windows:
+        for it in _extract_one_window(
+                window, session, gemini_post, model, timeout, raise_errors):
+            k = qn(it.get("cita", ""))
+            if k and k not in seen:
+                seen.add(k)
+                items.append(it)
+    return items
 
 
 def _salvage_items(raw: str) -> list[dict]:
