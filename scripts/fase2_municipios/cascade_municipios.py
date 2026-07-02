@@ -1932,6 +1932,34 @@ def _read_existing_rows(path: Path) -> dict[str, dict]:
     return rows
 
 
+def _preserve_confirmed_buckets(result: MunicipioResult,
+                                existing_row: dict | None) -> list[str]:
+    """Keep already-confirmed bucket fields when --skip-existing retries a row."""
+    if not existing_row:
+        return []
+    preserved: list[str] = []
+    bucket_fields = [
+        ("concursos", "url_concursos", "confianza_concursos",
+         "tier_concursos", "urls_extras_concursos"),
+        ("processos", "url_processos_seletivos", "confianza_processos",
+         "tier_processos", "urls_extras_processos"),
+    ]
+    for bucket, url_field, conf_field, tier_field, extras_field in bucket_fields:
+        if existing_row.get(conf_field) != "confirmado":
+            continue
+        setattr(result, url_field, existing_row.get(url_field, ""))
+        setattr(result, conf_field, "confirmado")
+        setattr(result, tier_field, existing_row.get(tier_field, ""))
+        setattr(result, extras_field, existing_row.get(extras_field, ""))
+        preserved.append(bucket)
+    if preserved:
+        if existing_row.get("site_base") and not result.site_base:
+            result.site_base = existing_row.get("site_base", "")
+        note = f"skip_existing_preserved:{','.join(preserved)}"
+        result.notes = f"{result.notes}; {note}" if result.notes else note
+    return preserved
+
+
 def write_results(results: list[MunicipioResult], path: Path,
                   append: bool = False, csv_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2114,11 +2142,10 @@ def main() -> int:
                              "overwriting it (rows for the same municipality are "
                              "replaced; new ones are appended)")
     parser.add_argument("--skip-existing", action="store_true",
-                        help="Skip municipalities already settled in the output "
-                             "CSV (at least one confirmed bucket) so they are not "
-                             "re-scraped or re-sent to Gemini. Municipalities that "
-                             "were 'sin resultado' or 'revisar' ARE re-processed, "
-                             "so a code fix gets another shot. Combine with --append.")
+                        help="Skip municipalities whose concursos and processos "
+                             "buckets are both already confirmed in the output CSV. "
+                             "If only one bucket is confirmed, retry the municipality "
+                             "and preserve that confirmed bucket. Combine with --append.")
     parser.add_argument("--grounded-verify", action="store_true",
                         help="Second verification pass for 'probable' URLs whose "
                              "static/rendered preview was empty (Cloudflare challenge, "
@@ -2140,18 +2167,19 @@ def main() -> int:
         wanted = {c for c in norm(args.letras) if c.isalnum()}
         municipios = [m for m in municipios if norm(m)[:1] in wanted]
 
+    existing_rows: dict[str, dict] = {}
     if args.skip_existing:
-        existing = _read_existing_rows(args.output)
+        existing_rows = _read_existing_rows(args.output)
         settled = {
-            key for key, row in existing.items()
+            key for key, row in existing_rows.items()
             if row.get("confianza_concursos") == "confirmado"
-            or row.get("confianza_processos") == "confirmado"
+            and row.get("confianza_processos") == "confirmado"
         }
         before = len(municipios)
         municipios = [m for m in municipios if norm(m) not in settled]
         skipped = before - len(municipios)
         if skipped:
-            print(f"Skipping {skipped} already-confirmed municipalities "
+            print(f"Skipping {skipped} fully-confirmed municipalities "
                   f"(--skip-existing); re-processing {len(municipios)}", flush=True)
 
     if args.limit > 0:
@@ -2171,7 +2199,14 @@ def main() -> int:
                 timeout=args.timeout,
                 use_playwright=not args.no_playwright,
             )
+            preserved = []
+            if args.skip_existing:
+                preserved = _preserve_confirmed_buckets(
+                    r, existing_rows.get(norm(muni)))
             results.append(r)
+            if preserved:
+                print(f"  preserved confirmed bucket(s): {', '.join(preserved)}",
+                      flush=True)
             status = []
             if r.url_concursos:
                 status.append(f"C: {r.url_concursos}")
@@ -2183,7 +2218,15 @@ def main() -> int:
         except Exception as e:
             print(f"  ERROR: {e}", flush=True)
             traceback.print_exc()
-            results.append(MunicipioResult(municipio=muni, notes=f"error: {e}"))
+            r = MunicipioResult(municipio=muni, notes=f"error: {e}")
+            preserved = []
+            if args.skip_existing:
+                preserved = _preserve_confirmed_buckets(
+                    r, existing_rows.get(norm(muni)))
+            results.append(r)
+            if preserved:
+                print(f"  preserved confirmed bucket(s): {', '.join(preserved)}",
+                      flush=True)
 
         # Checkpoint after every municipality (CSV only, fast) so a crash/stop
         # loses nothing: re-running with --skip-existing resumes where it left off.
