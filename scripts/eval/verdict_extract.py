@@ -83,7 +83,7 @@ def _item_scope(text: str, cita: str) -> str:
 _NUM = re.compile(r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b")
 _NUM_SHORT_YEAR = re.compile(
     r"(?:edital|concursos?|processos?\s+seletiv\w*|sele[cç][aã]o|"
-    r"\bpss\b|n[\u00ba\u00b0o]?)\D{0,24}?"
+    r"\bpss\b|\bn(?:[\u00ba\u00b0]|o)?\b)\D{0,24}?"
     r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(\d{2})\b",
     re.I,
 )
@@ -124,6 +124,7 @@ _BINDING = re.compile(
 )
 _CYCLE = re.compile(
     r"homologa|convoca|retifica|classifica[çc]|resultad|prorroga|adiamento|errata", re.I)
+_CHILD_DOC = re.compile(r"nomea[çc]|aprovad|portaria", re.I)
 # Entidades AJENAS conocidas (supra/extra-municipales). El default-deny no las
 # necesita para ejecutar, pero acelerarlas y explicarlas ayuda a la telemetría.
 _FOREIGN = re.compile(
@@ -337,6 +338,29 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                     and _KW[other].search(w)):
                 continue                       # "Concurso" generico dentro de bloque PSS
             certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
+    n_binding_piso = len(certames)
+    n_meta_floor = 0
+    if not block_piso:
+        lines = (text or "").splitlines()
+        for i, line in enumerate(lines):
+            key = _num_key(qn(line))
+            if not key:
+                continue
+            block = line
+            for nxt in lines[i + 1:i + 4]:
+                if _META_LINE.match(qn(nxt)):
+                    block += "\n" + nxt
+            w = qn(block)
+            if not kw.search(w) or _KW[other].search(w):
+                continue
+            if _CYCLE.search(w) or _CHILD_DOC.search(w):
+                continue
+            if _CULTURAL.search(w) or _FOREIGN.search(block):
+                continue
+            before = len(certames)
+            certames.add(key)
+            if len(certames) > before:
+                n_meta_floor += 1
     n_piso = len(certames)
     for it in items or []:
         cita = it.get("cita", "")
@@ -388,6 +412,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         "certames": sorted(certames)[:8],
         "verif": n_verif, "off_type": n_offtype,
         "ciclo": n_cycle, "ajenos": n_ajeno, "piso": n_piso,
+        "binding_piso": n_binding_piso, "meta_floor": n_meta_floor,
         "piso_blocked": block_piso, "item_here": item_here,
         "item_other": item_other,
         "title_declares": title_declares,
