@@ -38,6 +38,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -686,19 +687,21 @@ def gemini_post(session: requests.Session, model: str, payload: dict,
     if not key:
         raise RuntimeError("missing GEMINI_API_KEY")
     url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             resp = session.post(url, json=payload, timeout=timeout)
-            if resp.status_code == 429:
-                time.sleep(4 * (attempt + 1))
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if attempt == 2:
+                    resp.raise_for_status()
+                time.sleep((2 ** attempt) * 2 + random.uniform(0, 1))
                 continue
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.RequestException as e:
             print(f"      gemini attempt {attempt+1} failed: {e}", flush=True)
-            if attempt == 1:
+            if attempt == 2:
                 raise
-            time.sleep(4)
+            time.sleep((2 ** attempt) * 2 + random.uniform(0, 1))
     return {}
 
 

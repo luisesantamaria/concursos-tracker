@@ -274,6 +274,7 @@ def apply_menu_reachability_guard(session, row: dict, bucket: str, url: str,
 def _fmt_extract_evidence(decision: str, ev: dict) -> str:
     certs = ",".join(f"{a}/{b}" for a, b in ev.get("certames", [])[:5])
     estado = ev.get("estado") or decision
+    code = ev.get("motivo_code", "")
     return (f"extract_{decision}: cert={ev.get('n_certames', 0)}"
             f"[{certs}] verif={ev.get('verif', 0)} piso={ev.get('piso', 0)}"
             f" off={ev.get('off_type', 0)} ciclo={ev.get('ciclo', 0)}"
@@ -281,23 +282,34 @@ def _fmt_extract_evidence(decision: str, ev: dict) -> str:
             f" bp={ev.get('binding_piso', 0)} mf={ev.get('meta_floor', 0)}"
             f" item={ev.get('item_here', 0)}/{ev.get('item_other', 0)}"
             f" pblock={int(bool(ev.get('piso_blocked')))}"
-            f" estado={estado}")
+            f" estado={estado}"
+            f"{' code=' + code if code else ''}")
+
+
+def _extract_op_code(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "timeout" in msg or "timed out" in msg:
+        return "revisar_op:timeout"
+    if any(k in msg for k in ("connection", "connect", "429", "500", "502", "503", "504", "http")):
+        return "revisar_op:red"
+    return "revisar_op:extract_error"
 
 
 def extract_verdict(session, model, municipio, bucket, title, text, anchors, timeout):
     """New falsifiable extractor gate: LLM transcribes, code adjudicates."""
     if not C.gemini_api_key():
-        return ("revisar", "extract: sin api key")
+        return ("revisar", "extract: revisar_op:sin_api_key")
     if (text or "").count("\n") < 3:
-        return ("revisar", "extract: texto sin estructura de lineas (render fallido)")
+        return ("revisar", "extract: revisar_op:render_aplanado")
     try:
-        items = V.extract_items(text, session, C.gemini_post, model, timeout)
+        items = V.extract_items(text, session, C.gemini_post, model, timeout,
+                                raise_errors=True)
         decision, ev = V.adjudicate(
             text, bucket, municipio, items, anchors=anchors, title=title)
         conf = "confirmado" if decision == "confirmar" else "revisar"
         return conf, _fmt_extract_evidence(decision, ev)
     except Exception as e:
-        return ("revisar", f"extract-error: {str(e)[:80]}")
+        return ("revisar", f"extract: {_extract_op_code(e)}: {str(e)[:80]}")
 
 
 def rendered_verdict(session, model, municipio, bucket, url, timeout,
@@ -335,7 +347,7 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
         if r and (_has_real_listing_item(r[1]) or len((r[1] or "").strip()) >= 500):
             title, text, anchors = r[0], r[1], r[2]
     if not (text or "").strip():
-        return ("revisar", "inaccesible/render-vacio")
+        return ("revisar", "revisar_op:render_vacio")
     if _is_server_error(title, text):
         return ("revisar", "pagina de error de servidor (no es indice)")
     if _is_not_found(title, text):

@@ -217,7 +217,7 @@ _EXTRACT_PROMPT = (
 
 
 def extract_items(text: str, session, gemini_post, model: str,
-                  timeout: int = 40) -> list[dict]:
+                  timeout: int = 40, raise_errors: bool = False) -> list[dict]:
     """Pide al LLM la lista de items (cita verbatim + emisor). Usa responseSchema +
     temperatura 0. `gemini_post` es la del cascade: (session, model, payload, timeout)
     -> dict. Maneja truncación: si el JSON viene cortado, recupera los items completos."""
@@ -233,7 +233,9 @@ def extract_items(text: str, session, gemini_post, model: str,
     }
     try:
         resp = gemini_post(session, model, payload, timeout)
-    except Exception:
+    except Exception as e:
+        if raise_errors:
+            raise RuntimeError(f"extract_items_failed: {e}") from e
         return []
     try:
         raw = resp["candidates"][0]["content"]["parts"][0]["text"]
@@ -425,15 +427,19 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     if len(certames) == 1 and ev["listing_shell"]:
         ev["estado"] = "revisar_certame_unico"
         ev["motivo"] = "indice con estructura de listado pero un solo certame"
+        ev["motivo_code"] = "revisar_sem:certame_unico"
         return "revisar", ev
     if len(certames) == 1:
         ev["estado"] = "revisar"
         ev["motivo"] = "un solo certame (posible detalle)"
+        ev["motivo_code"] = "revisar_sem:certame_unico"
         return "revisar", ev
     if n_ajeno and not certames:
         ev["estado"] = "revisar"
         ev["motivo"] = "solo editais de emisor ajeno"
+        ev["motivo_code"] = "revisar_sem:emisor_ajeno"
         return "revisar", ev
     ev["estado"] = "revisar"
     ev["motivo"] = "0 certames del tipo alvo"
+    ev["motivo_code"] = "revisar_sem:0_certames"
     return "revisar", ev
