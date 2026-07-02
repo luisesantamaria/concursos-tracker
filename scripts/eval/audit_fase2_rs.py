@@ -273,6 +273,25 @@ def _apply_year_fallback(page, timeout: int) -> str:
     return ""
 
 
+def _best_frame_text(page) -> str:
+    """Return the non-main frame text with the most listing items, if any."""
+    best = ""
+    best_items = 0
+    main = page.main_frame
+    for frame in page.frames:
+        if frame == main:
+            continue
+        try:
+            text = frame.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            continue
+        n_items = distinct_listing_items(text)
+        if n_items > best_items:
+            best = text
+            best_items = n_items
+    return best if best_items >= 1 else ""
+
+
 def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
     """Open the URL in a real browser and return (title, visible_text, anchors).
 
@@ -341,6 +360,12 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
             year_used = _apply_year_fallback(page, timeout)
             if year_used:
                 title, text = _settle_and_read(page)
+        frame_used = False
+        if distinct_listing_items(text) == 0:
+            frame_text = _best_frame_text(page)
+            if frame_text:
+                text = (text or "") + "\n" + frame_text
+                frame_used = True
         try:
             anchors = page.evaluate(_COLLECT_ANCHORS_JS) or []
         except Exception:
@@ -349,6 +374,11 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
             anchors.append({
                 "href": "render-meta:year_fallback",
                 "text": f"year_fallback={year_used}",
+            })
+        if frame_used:
+            anchors.append({
+                "href": "render-meta:frame_fallback",
+                "text": "frame_fallback=1",
             })
         return title, text, anchors
     except Exception as e:
