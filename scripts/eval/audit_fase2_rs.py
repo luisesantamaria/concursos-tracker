@@ -172,6 +172,106 @@ _COLLECT_ANCHORS_JS = """
 }
 """
 
+_YEAR_CONTROLS_JS = """
+() => {
+  const yearRe = /^(19|20)\\d{2}$/;
+  const hasAll = (txt) => /\\b(todos|todas|all)\\b/i.test(txt || '');
+  const selects = Array.from(document.querySelectorAll('select'));
+  for (let i = 0; i < selects.length; i++) {
+    const sel = selects[i];
+    const opts = Array.from(sel.options || []);
+    if (opts.some(o => hasAll(o.textContent || o.value || ''))) continue;
+    const years = opts
+      .map(o => ({
+        year: (o.textContent || '').trim(),
+        value: o.value,
+      }))
+      .filter(o => yearRe.test(o.year));
+    const distinct = Array.from(new Set(years.map(o => o.year)));
+    if (distinct.length >= 2) {
+      const bestYear = distinct.sort((a, b) => parseInt(b) - parseInt(a))[0];
+      const best = years.find(o => o.year === bestYear);
+      return {select: {index: i, year: bestYear, value: best.value}};
+    }
+  }
+  const anchors = Array.from(document.querySelectorAll('a[href]'))
+    .map(a => ({text: (a.innerText || a.textContent || '').trim(), href: a.href || ''}))
+    .filter(a => yearRe.test(a.text));
+  const byYear = new Map();
+  for (const a of anchors) {
+    if (!byYear.has(a.text)) byYear.set(a.text, a.href);
+  }
+  if (byYear.size >= 2) {
+    const years = Array.from(byYear.keys()).sort((a, b) => parseInt(b) - parseInt(a));
+    return {anchor: {year: years[0], href: byYear.get(years[0])}};
+  }
+  return {};
+}
+"""
+
+_APPLY_YEAR_SELECT_JS = """
+(info) => {
+  const selects = Array.from(document.querySelectorAll('select'));
+  const sel = selects[info.index];
+  if (!sel) return false;
+  sel.value = info.value;
+  sel.dispatchEvent(new Event('input', {bubbles: true}));
+  sel.dispatchEvent(new Event('change', {bubbles: true}));
+  const form = sel.form;
+  if (form && (form.method || '').toLowerCase() === 'get') {
+    if (form.requestSubmit) form.requestSubmit();
+    else form.submit();
+  }
+  return true;
+}
+"""
+
+
+def _settle_and_read(page) -> tuple[str, str]:
+    """Read visible text after pending client-side rendering settles."""
+    title = page.title() or ""
+    text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    prev = -1
+    for _ in range(5):
+        if len(text) > 700 and (len(text) == prev or distinct_listing_items(text) >= 2):
+            break
+        prev = len(text)
+        page.wait_for_timeout(1200)
+        text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        title = page.title() or title
+    return title, text
+
+
+def _apply_year_fallback(page, timeout: int) -> str:
+    """If the default view is empty, try the most recent explicit year filter."""
+    try:
+        controls = page.evaluate(_YEAR_CONTROLS_JS) or {}
+    except Exception:
+        return ""
+    select = controls.get("select") if isinstance(controls, dict) else None
+    if select:
+        try:
+            if page.evaluate(_APPLY_YEAR_SELECT_JS, select):
+                try:
+                    page.wait_for_load_state("networkidle", timeout=min(timeout * 1000, 8000))
+                except Exception:
+                    page.wait_for_timeout(2500)
+                return str(select.get("year") or "")
+        except Exception:
+            return ""
+    anchor = controls.get("anchor") if isinstance(controls, dict) else None
+    if anchor and anchor.get("href"):
+        try:
+            page.goto(anchor["href"], wait_until="domcontentloaded", timeout=timeout * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                page.wait_for_timeout(2500)
+            return str(anchor.get("year") or "")
+        except Exception:
+            return ""
+    return ""
+
 
 def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
     """Open the URL in a real browser and return (title, visible_text, anchors).
@@ -235,20 +335,21 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
         # Poll hasta que el texto visible SE ESTABILICE (mismo largo en 2 lecturas
         # consecutivas) o aparezcan ítems de listado — así capturamos la página ya
         # cargada, no un estado intermedio. Determinismo de la entrada.
-        title = page.title() or ""
-        text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-        prev = -1
-        for _ in range(5):
-            if len(text) > 700 and (len(text) == prev or distinct_listing_items(text) >= 2):
-                break
-            prev = len(text)
-            page.wait_for_timeout(1200)
-            text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
-            title = page.title() or title
+        title, text = _settle_and_read(page)
+        year_used = ""
+        if distinct_listing_items(text) == 0:
+            year_used = _apply_year_fallback(page, timeout)
+            if year_used:
+                title, text = _settle_and_read(page)
         try:
             anchors = page.evaluate(_COLLECT_ANCHORS_JS) or []
         except Exception:
             anchors = []
+        if year_used:
+            anchors.append({
+                "href": "render-meta:year_fallback",
+                "text": f"year_fallback={year_used}",
+            })
         return title, text, anchors
     except Exception as e:
         print(f"      render error: {str(e)[:120]}", flush=True)
