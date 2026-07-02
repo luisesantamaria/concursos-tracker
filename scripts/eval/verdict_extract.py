@@ -345,6 +345,8 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                 if _META_LINE.match(qn(nxt)):
                     block += "\n" + nxt
             w = qn(block)
+            if _BINDING.search(block) or _BINDING.search(w):
+                continue
             if not kw.search(w) or _KW[other].search(w):
                 continue
             if _CYCLE.search(w) or _CHILD_DOC.search(w):
