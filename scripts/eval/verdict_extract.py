@@ -176,6 +176,23 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     kw = _KW[bnorm]
     certames: set = set()
     n_ajeno = n_verif = n_cycle = n_offtype = 0
+    # PISO DETERMINISTA de alto recall: los certames con binding explícito
+    # ("Concurso Público nº N/AAAA", "Processo Seletivo nº N/AAAA") se cuentan
+    # directo del texto renderizado — son substrings por definición (ya quote-
+    # verified) y NO dependen de la recall del LLM, que sub-extrae en páginas con
+    # muchos items (Boa Vista tenía 5 concursos, el LLM extrajo 1). Un edital ajeno
+    # reposteado NO se escribe "Processo Seletivo nº N/AAAA del município" (es
+    # "Processo Seletivo do CIEE..."), así que este piso no captura los ajenos.
+    for b in _BINDING.finditer(text or ""):
+        btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
+        if btipo != bnorm:
+            continue
+        raw_w = (text or "")[max(0, b.start() - 120): b.end() + 120]
+        w = qn(raw_w)
+        if _CULTURAL.search(w) or _FOREIGN.search(raw_w):
+            continue                       # cultural u emisor ajeno nombrado cerca
+        certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
+    n_piso = len(certames)
     for it in items or []:
         cita = it.get("cita", "")
         if not cita:
@@ -220,7 +237,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         "n_certames": len(certames),
         "certames": sorted(certames)[:8],
         "verif": n_verif, "off_type": n_offtype,
-        "ciclo": n_cycle, "ajenos": n_ajeno,
+        "ciclo": n_cycle, "ajenos": n_ajeno, "piso": n_piso,
     }
     if len(certames) >= 2:
         return "confirmar", ev
