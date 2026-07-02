@@ -275,7 +275,10 @@ def _fmt_extract_evidence(decision: str, ev: dict) -> str:
     certs = ",".join(f"{a}/{b}" for a, b in ev.get("certames", [])[:5])
     estado = ev.get("estado") or decision
     return (f"extract_{decision}: cert={ev.get('n_certames', 0)}"
-            f"[{certs}] verif={ev.get('verif', 0)} estado={estado}")
+            f"[{certs}] verif={ev.get('verif', 0)} piso={ev.get('piso', 0)}"
+            f" off={ev.get('off_type', 0)} ciclo={ev.get('ciclo', 0)}"
+            f" ajeno={ev.get('ajenos', 0)} shell={int(bool(ev.get('listing_shell')))}"
+            f" estado={estado}")
 
 
 def extract_verdict(session, model, municipio, bucket, title, text, anchors, timeout):
@@ -355,7 +358,7 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
             session, model, municipio, bucket, title, text, anchors, timeout)
         if extract_mode == "authority":
             return ex_conf, ex_motivo
-        shadow_note = f"shadow:{ex_conf}:{ex_motivo[:120]} | "
+        shadow_note = f"shadow:{ex_conf}:{ex_motivo[:220]} | "
 
     try:
         v, motivo = A.ai_verdict(session, model, municipio, bucket, title, text, timeout)
@@ -432,7 +435,7 @@ def main() -> int:
     ap.add_argument("--input", type=Path, required=True)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--model", default="gemini-2.5-flash")
-    ap.add_argument("--timeout", type=int, default=20)
+    ap.add_argument("--timeout", type=int, default=45)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-investigate", action="store_true",
                     help="No re-descubrir buckets vacios; solo verificar URLs existentes")
@@ -557,7 +560,7 @@ def main() -> int:
                     r[ccol] = "revisar"
                 else:
                     r[ccol] = ""   # sin sitio oficial
-            r["notes"] = (r.get("notes", "") + f" | cierre[{bk}]: {r[ccol]} ({motivo[:70]})")[:1900]
+            r["notes"] = (r.get("notes", "") + f" | cierre[{bk}]: {r[ccol]} ({motivo[:360]})")[:3200]
             print(f"    {bk}: {prev or '-'} -> {r[ccol]}", flush=True)
 
             st = r[ccol]
