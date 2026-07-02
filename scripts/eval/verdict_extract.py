@@ -114,8 +114,11 @@ _BINDING = re.compile(
 _BINDING = re.compile(
     r"(concursos?\s+p[u\u00fa]blic\w*|processos?\s+seletiv\w*|"
     r"sele[\u00e7c][a\u00e3]o\s+p[u\u00fa]blic\w*|concursos?|"
-    r"processos?\s+seletiv\w*|\bpss\b)[^\n]{0,80}?"
-    r"(?:edital\s*)?n?[\u00ba\u00b0o]?\s*(?<![\d./])"
+    r"processos?\s+seletiv\w*|\bpss\b)(?:"
+    r"(?:\s+(?:simplificad\w*|p[u\u00fa]blic\w*|public\w*|municipal|"
+    r"de\s+estagi[a\u00e1]ri\w*)){0,4}\s*n?[\u00ba\u00b0o]?\s*|"
+    r"[^\n]{0,80}?edital\s*n?[\u00ba\u00b0o]?\s*)"
+    r"(?<![\d./])"
     r"(\d{1,4})\s*[/\-]\s*(20[12]\d)\b",
     re.I,
 )
@@ -298,6 +301,22 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     title_declares = title_here and not title_other
     certames: set = set()
     n_ajeno = n_verif = n_cycle = n_offtype = 0
+    item_here = item_other = 0
+    for it in items or []:
+        cita = it.get("cita", "")
+        if not cita:
+            continue
+        qc = qn(cita)
+        if not qc or qc not in low:
+            continue
+        scope = _item_scope(text, cita)
+        if _emissor_ajeno(it.get("emissor"), municipio) or _CULTURAL.search(scope):
+            continue
+        if _KW[bnorm].search(scope):
+            item_here += 1
+        if _KW[other].search(scope):
+            item_other += 1
+    block_piso = item_other >= 2 and item_here == 0 and not title_declares
     # PISO DETERMINISTA de alto recall: los certames con binding explícito
     # ("Concurso Público nº N/AAAA", "Processo Seletivo nº N/AAAA") se cuentan
     # directo del texto renderizado — son substrings por definición (ya quote-
@@ -305,15 +324,19 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     # muchos items (Boa Vista tenía 5 concursos, el LLM extrajo 1). Un edital ajeno
     # reposteado NO se escribe "Processo Seletivo nº N/AAAA del município" (es
     # "Processo Seletivo do CIEE..."), así que este piso no captura los ajenos.
-    for b in _BINDING.finditer(text or ""):
-        btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
-        if btipo != bnorm:
-            continue
-        raw_w = (text or "")[max(0, b.start() - 120): b.end() + 120]
-        w = qn(raw_w)
-        if _CULTURAL.search(w) or _FOREIGN.search(raw_w):
-            continue                       # cultural u emisor ajeno nombrado cerca
-        certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
+    if not block_piso:
+        for b in _BINDING.finditer(text or ""):
+            btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
+            if btipo != bnorm:
+                continue
+            raw_w = (text or "")[max(0, b.start() - 120): b.end() + 120]
+            w = qn(raw_w)
+            if _CULTURAL.search(w) or _FOREIGN.search(raw_w):
+                continue                       # cultural u emisor ajeno nombrado cerca
+            if (bnorm == "concursos" and "public" not in qn(b.group(1))
+                    and _KW[other].search(w)):
+                continue                       # "Concurso" generico dentro de bloque PSS
+            certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
     n_piso = len(certames)
     for it in items or []:
         cita = it.get("cita", "")
@@ -346,15 +369,16 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
             if not (title_declares and not _KW[other].search(scope) and not _CULTURAL.search(scope)):
                 n_offtype += 1
                 continue
-        # Regla 2 — keyword de ciclo sin binding -> doc huérfano, no crea certame.
-        if _CYCLE.search(scope):
-            n_cycle += 1
-            continue
-        # Regla 3 — abertura / edital con número -> crea certame.
+        # Regla 2 — edital con número propio -> crea certame. Si era documento de
+        # ciclo de un certame padre, la Regla 1 ya lo colapso por binding.
         key = _num_key(cita, scope)
         if key:
             certames.add(key)
         else:
+            # Regla 3 — keyword de ciclo sin número/binding -> doc huérfano.
+            if _CYCLE.search(scope):
+                n_cycle += 1
+                continue
             # Regla 4 — keyword + año sin número -> crea certame por año.
             y = re.search(r"\b(20[12]\d)\b", scope)
             if y:
@@ -364,6 +388,8 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         "certames": sorted(certames)[:8],
         "verif": n_verif, "off_type": n_offtype,
         "ciclo": n_cycle, "ajenos": n_ajeno, "piso": n_piso,
+        "piso_blocked": block_piso, "item_here": item_here,
+        "item_other": item_other,
         "title_declares": title_declares,
         "listing_shell": _has_listing_shell(text, anchors),
     }

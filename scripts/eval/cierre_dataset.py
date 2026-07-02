@@ -278,6 +278,8 @@ def _fmt_extract_evidence(decision: str, ev: dict) -> str:
             f"[{certs}] verif={ev.get('verif', 0)} piso={ev.get('piso', 0)}"
             f" off={ev.get('off_type', 0)} ciclo={ev.get('ciclo', 0)}"
             f" ajeno={ev.get('ajenos', 0)} shell={int(bool(ev.get('listing_shell')))}"
+            f" item={ev.get('item_here', 0)}/{ev.get('item_other', 0)}"
+            f" pblock={int(bool(ev.get('piso_blocked')))}"
             f" estado={estado}")
 
 
