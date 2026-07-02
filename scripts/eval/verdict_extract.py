@@ -103,12 +103,6 @@ def _num_key(*texts: str) -> tuple[str, str] | None:
         if m2:
             return (m2.group(1).lstrip("0") or "0", _year2(m2.group(2)))
     return None
-# BINDING: el item nombra al certame PADRE ("Edital 29/2019 - Concurso Público nº
-# 01/2019"). Cuando está, la clave del certame es el padre, aunque el doc tenga su
-# propio número -> colapsa homologações/convocações con número propio (São Marcos).
-_BINDING = re.compile(
-    r"(concursos?\s+p[uú]blic\w*|processos?\s+seletiv\w*|sele[çc][aã]o\s+p[uú]blic\w*|"
-    r"\bpss\b)[^\n]{0,18}?n?[º°o]?\s*(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b", re.I)
 # Documentos de ciclo de vida de UN certame (no suman certame nuevo). SOLO estos —
 # NO "abertura"/"inscrições"/"anexo": una ABERTURA sí crea certame (regla de Fable).
 _BINDING = re.compile(

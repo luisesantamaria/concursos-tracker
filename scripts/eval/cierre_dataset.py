@@ -288,6 +288,8 @@ def extract_verdict(session, model, municipio, bucket, title, text, anchors, tim
     """New falsifiable extractor gate: LLM transcribes, code adjudicates."""
     if not C.gemini_api_key():
         return ("revisar", "extract: sin api key")
+    if (text or "").count("\n") < 3:
+        return ("revisar", "extract: texto sin estructura de lineas (render fallido)")
     try:
         items = V.extract_items(text, session, C.gemini_post, model, timeout)
         decision, ev = V.adjudicate(
