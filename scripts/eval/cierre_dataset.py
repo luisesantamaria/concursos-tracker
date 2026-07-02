@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "eval"))
 
 import cascade_municipios as C   # noqa: E402
 import audit_fase2_rs as A       # noqa: E402
+import verdict_extract as V      # noqa: E402
 
 BUCKETS = [
     ("concursos", "url_concursos", "confianza_concursos", "tier_concursos"),
@@ -270,10 +271,38 @@ def apply_menu_reachability_guard(session, row: dict, bucket: str, url: str,
     return False, f"sin_menu_reachability({tier or 'sin_tier'}): {why}"
 
 
-def rendered_verdict(session, model, municipio, bucket, url, timeout):
+def _fmt_extract_evidence(decision: str, ev: dict) -> str:
+    certs = ",".join(f"{a}/{b}" for a, b in ev.get("certames", [])[:5])
+    estado = ev.get("estado") or decision
+    return (f"extract_{decision}: cert={ev.get('n_certames', 0)}"
+            f"[{certs}] verif={ev.get('verif', 0)} estado={estado}")
+
+
+def extract_verdict(session, model, municipio, bucket, title, text, anchors, timeout):
+    """New falsifiable extractor gate: LLM transcribes, code adjudicates."""
+    if not C.gemini_api_key():
+        return ("revisar", "extract: sin api key")
+    try:
+        items = V.extract_items(text, session, C.gemini_post, model, timeout)
+        decision, ev = V.adjudicate(
+            text, bucket, municipio, items, anchors=anchors, title=title)
+        conf = "confirmado" if decision == "confirmar" else "revisar"
+        return conf, _fmt_extract_evidence(decision, ev)
+    except Exception as e:
+        return ("revisar", f"extract-error: {str(e)[:80]}")
+
+
+def rendered_verdict(session, model, municipio, bucket, url, timeout,
+                     extract_mode: str = "off"):
     """Render the page (browser if needed) and ask the discrete AI verdict.
     Returns ('confirmado'|'revisar', motivo). Never returns confirmado without a
-    rendered, on-topic, valido_indice verdict."""
+    rendered, on-topic, valido_indice verdict.
+
+    extract_mode:
+      - off: old ai_verdict is the authority.
+      - shadow: run verdict_extract in parallel, append telemetry only.
+      - authority: use verdict_extract as the authority after deterministic guards.
+    """
     # Hard block: a single-item/detail URL is never a valid index by the phase
     # rules, no matter how index-like its rendered content looks (a single concurso
     # page lists many sub-editais and can fool the verdict). Send it to revisar so
@@ -283,17 +312,20 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
     pg = C.fetch_page(session, url, timeout)
     title = pg.title if (pg and pg.ok) else ""
     text = pg.text if (pg and pg.ok) else ""
+    anchors = [{"href": h, "text": t} for h, t in (pg.links if (pg and pg.ok) else [])]
     # Render (browser + scroll) cuando el fetch plano viene fino, es SPA, o NO trae
     # items de listado: muchos CMS sirven el menu server-side pero cargan el listado
     # por JS/scroll, asi que un fetch "largo" puede ser solo el menu (Pinhal Grande
     # fetch=3934 era el menu; el render con scroll trae la verdad). Preferimos el
     # render si surface items O si el fetch no los tenia (aunque sea mas corto).
-    need_render = (not (pg and pg.ok)) or getattr(pg, "is_spa", False) \
-        or len((text or "").strip()) < 500 or not _has_real_listing_item(text)
+    force_render_for_extract = extract_mode in {"shadow", "authority"}
+    need_render = force_render_for_extract or (not (pg and pg.ok)) \
+        or getattr(pg, "is_spa", False) or len((text or "").strip()) < 500 \
+        or not _has_real_listing_item(text)
     if need_render:
         r = A.render_page(url, timeout)
         if r and (_has_real_listing_item(r[1]) or len((r[1] or "").strip()) >= 500):
-            title, text = r[0], r[1]  # r[2] = anchors (para el futuro adjudicador)
+            title, text, anchors = r[0], r[1], r[2]
     if not (text or "").strip():
         return ("revisar", "inaccesible/render-vacio")
     if _is_server_error(title, text):
@@ -316,10 +348,19 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
         return ("revisar", "sin items de listado real (definicion/menu/vacia)")
     if not C.gemini_api_key():
         return ("revisar", "sin api key")
+
+    shadow_note = ""
+    if extract_mode in {"shadow", "authority"}:
+        ex_conf, ex_motivo = extract_verdict(
+            session, model, municipio, bucket, title, text, anchors, timeout)
+        if extract_mode == "authority":
+            return ex_conf, ex_motivo
+        shadow_note = f"shadow:{ex_conf}:{ex_motivo[:120]} | "
+
     try:
         v, motivo = A.ai_verdict(session, model, municipio, bucket, title, text, timeout)
     except Exception as e:
-        return ("revisar", f"verdict-error: {str(e)[:60]}")
+        return ("revisar", f"{shadow_note}verdict-error: {str(e)[:60]}")
     if v == "valido_indice":
         # Re-fetch anti-intermitente: portales .aspx (sinsoft) dan "Runtime Error" a
         # ratos; si estaban arriba durante el render confirmaban en falso. Una 2a lectura
@@ -328,9 +369,9 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout):
         # (un fallo de red deja pg2 sin marcadores -> no degrada un indice bueno).
         pg2 = C.fetch_page(session, url, timeout)
         if pg2 and pg2.ok and _is_server_error(pg2.title, pg2.text):
-            return ("revisar", "error de servidor intermitente (2do fetch)")
-        return ("confirmado", f"valido_indice: {motivo[:80]}")
-    return ("revisar", f"{v}: {motivo[:80]}")
+            return ("revisar", f"{shadow_note}error de servidor intermitente (2do fetch)")
+        return ("confirmado", f"{shadow_note}valido_indice: {motivo[:80]}")
+    return ("revisar", f"{shadow_note}{v}: {motivo[:80]}")
 
 
 # Rutas canonicas por bucket (patrones recurrentes: govbr /site/concursos, IPM /concurso,
@@ -362,7 +403,8 @@ def _host_base(url: str) -> str:
     return ""
 
 
-def _repair_via_canonical(session, model, muni, bucket, current_url, site_base, timeout):
+def _repair_via_canonical(session, model, muni, bucket, current_url, site_base,
+                          timeout, extract_mode: str = "off"):
     """Prueba rutas canonicas del host; devuelve (url, motivo) de la primera que verifica
     como indice valido del tipo, o (None, '') si ninguna. Corrige el error de DESCUBRIMIENTO
     (URL debil) sin arriesgar FP (todo pasa por rendered_verdict)."""
@@ -376,7 +418,8 @@ def _repair_via_canonical(session, model, muni, bucket, current_url, site_base, 
             continue
         seen.add(cand.rstrip("/"))
         try:
-            ver, mot = rendered_verdict(session, model, muni, bucket, cand, timeout)
+            ver, mot = rendered_verdict(
+                session, model, muni, bucket, cand, timeout, extract_mode)
         except Exception:
             continue
         if ver == "confirmado":
@@ -398,7 +441,15 @@ def main() -> int:
     ap.add_argument("--require-menu-reachability", action="store_true",
                     help="Degradar confirmados no-menu sin prueba de reachability "
                          "desde el menu actual (default: solo etiqueta menu_risk)")
+    ap.add_argument("--extract-shadow", action="store_true",
+                    help="Ejecutar verdict_extract en sombra; ai_verdict viejo sigue "
+                         "siendo la autoridad")
+    ap.add_argument("--extract-authority", action="store_true",
+                    help="Usar verdict_extract como autoridad del cierre (usar solo "
+                         "despues de validar la corrida sombra)")
     args = ap.parse_args()
+    extract_mode = "authority" if args.extract_authority else (
+        "shadow" if args.extract_shadow else "off")
 
     rows = list(csv.DictReader(args.input.open(encoding="utf-8-sig")))
     if args.limit:
@@ -434,7 +485,8 @@ def main() -> int:
 
             # Step 1 — verify the existing URL (if any).
             if url.startswith("http"):
-                ver, motivo = rendered_verdict(session, args.model, muni, bk, url, args.timeout)
+                ver, motivo = rendered_verdict(
+                    session, args.model, muni, bk, url, args.timeout, extract_mode)
                 if ver == "confirmado":
                     final_conf = "confirmado"
 
@@ -443,7 +495,8 @@ def main() -> int:
             # el error de URL-debil (el indice real existe en la canonica) sin arriesgar FP.
             if final_conf != "confirmado" and not args.no_repair:
                 rurl, rmot = _repair_via_canonical(
-                    session, args.model, muni, bk, url, r.get("site_base", ""), args.timeout)
+                    session, args.model, muni, bk, url, r.get("site_base", ""),
+                    args.timeout, extract_mode)
                 if rurl:
                     final_url, final_conf, motivo = rurl, "confirmado", f"reparado: {rmot}"
                     final_tier = "repair"
@@ -458,7 +511,8 @@ def main() -> int:
                     cand = (d.url_concursos if bk == "concursos"
                             else d.url_processos_seletivos) or ""
                 if cand.startswith("http") and cand != url:
-                    ver2, motivo2 = rendered_verdict(session, args.model, muni, bk, cand, args.timeout)
+                    ver2, motivo2 = rendered_verdict(
+                        session, args.model, muni, bk, cand, args.timeout, extract_mode)
                     if ver2 == "confirmado":
                         final_url, final_conf, motivo = cand, "confirmado", motivo2
                         final_tier = (d.tier_concursos if bk == "concursos"
@@ -509,9 +563,10 @@ def main() -> int:
             st = r[ccol]
             summ["confirmado" if st == "confirmado" else "revisar" if st == "revisar" else "sin_sitio"] += 1
 
-    w = csv.DictWriter(args.output.open("w", encoding="utf-8", newline=""), fieldnames=cols)
-    w.writeheader()
-    w.writerows(rows)
+    with args.output.open("w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
 
     n = len(rows) * 2
     print(f"\n{'='*56}")
@@ -523,6 +578,8 @@ def main() -> int:
           f"hallados por investigacion {changed['investig_hallado']} | "
           f"reparados (URL canonica) {changed['reparado']} | "
           f"menu_risk {changed['menu_risk']}")
+    if extract_mode != "off":
+        print(f"  verdict_extract: {extract_mode}")
     print(f"  salida: {args.output}")
     return 0
 
