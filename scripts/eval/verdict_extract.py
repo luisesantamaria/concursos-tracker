@@ -43,14 +43,37 @@ def qn(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# Contexto LOCAL de un item: la linea/fila donde aparece la cita. Las ventanas
+# amplias (+/-160 chars) se contaminan en listados densos; incluir filas vecinas
+# tambien rompe tablas IPM, donde el binding de otra fila puede secuestrar el item.
+_DATE_LINE = re.compile(r"^\s*\d{1,2}\s*(?:/|-)\s*\d{1,2}\s*(?:/|-)\s*20[12]\d\s*$")
+
+
+def _item_scope(text: str, cita: str) -> str:
+    qc = qn(cita)
+    if not qc:
+        return ""
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
+        if qc in qn(line):
+            block = line
+            # Cards de noticia/listado suelen renderizar FECHA en la linea anterior
+            # y titulo en la siguiente (Canoas P). Solo anexamos si la linea previa
+            # es una fecha aislada, nunca una fila de otro certame.
+            if i > 0 and _DATE_LINE.match(lines[i - 1] or ""):
+                block = lines[i - 1] + "\n" + block
+            return qn(block)
+    return qc
+
+
 # Número de edital NN/AAAA o NN-AAAA (con lookbehind para no morder "Lei 13.019/2014").
-_NUM = re.compile(r"(?<![\d.])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b")
+_NUM = re.compile(r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b")
 # BINDING: el item nombra al certame PADRE ("Edital 29/2019 - Concurso Público nº
 # 01/2019"). Cuando está, la clave del certame es el padre, aunque el doc tenga su
 # propio número -> colapsa homologações/convocações con número propio (São Marcos).
 _BINDING = re.compile(
-    r"(concurso\s+p[uú]blic\w*|processo\s+seletivo\w*|sele[çc][aã]o\s+p[uú]blic\w*|"
-    r"\bpss\b)[^\n]{0,18}?n?[º°o]?\s*(\d{1,4})\s*[/\-]\s*(20[12]\d)\b", re.I)
+    r"(concursos?\s+p[uú]blic\w*|processos?\s+seletiv\w*|sele[çc][aã]o\s+p[uú]blic\w*|"
+    r"\bpss\b)[^\n]{0,18}?n?[º°o]?\s*(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b", re.I)
 # Documentos de ciclo de vida de UN certame (no suman certame nuevo). SOLO estos —
 # NO "abertura"/"inscrições"/"anexo": una ABERTURA sí crea certame (regla de Fable).
 _CYCLE = re.compile(
@@ -71,12 +94,57 @@ _INTRA = re.compile(
 # Concurso 01/2024) — pero NO "concurso de soberanas/rainha" (cultural, otro tipo).
 _KW = {
     "concursos": re.compile(
-        r"concurso\s+p[uú]blic|concurso\s+n?[º°o]?\s*\d|concurso\s+20[12]\d", re.I),
-    "processos": re.compile(r"processo\s+seletivo|sele[çc][aã]o\s+p[uú]blic|"
+        r"concursos?\s+p[uú]blic|concursos?\s+n?[º°o]?\s*\d|concursos?\s+20[12]\d", re.I),
+    "processos": re.compile(r"processos?\s+seletiv|sele[çc][aã]o\s+p[uú]blic|"
                             r"sele[çc][aã]o\s+simplificad|\bpss\b|"
                             r"contrata[çc][aã]o\s+tempor", re.I),
 }
 _CULTURAL = re.compile(r"soberan|rainha|garota|majestade|realeza|rei\s+e\s+rainha", re.I)
+_LISTING_TABLE = re.compile(
+    r"\b(?:n[ºo]|numero|nro)\s*/\s*ano\s+modalidade\s+objeto\s+data\s+"
+    r"(?:da\s+)?(?:disputa|publicacao)\s+detalhes\b|"
+    r"titulo\s+do\s+edital\s+data\s+de\s+publicacao\s+data\s+para\s+inscricao\s+status",
+    re.I,
+)
+_CERTAME_DOC_TABLE = re.compile(
+    r"(?:concursos?\s+public\w*|processos?\s+seletiv\w*|sele[cç][aã]o\s+public\w*|"
+    r"\bpss\b)[^\n]{0,60}?(?<![\d./])\d{1,4}\s*/\s*20[12]\d\s+atividade\s+data\s+edital",
+    re.I,
+)
+_DETAIL_TARGET = re.compile(r"/concurso/detalhe/|/edital/", re.I)
+
+
+def _has_listing_shell(text: str, anchors: list | None) -> bool:
+    """Estructura fuerte de pagina-indice aunque hoy liste un solo certame.
+
+    No es un scorer: exige tabla de listado con link(s) a detalle, o una tabla
+    documental interna de un certame. No confirma: solo etiqueta revision barata.
+    """
+    blob = qn(text or "")
+    if _CERTAME_DOC_TABLE.search(blob):
+        return True
+    if not _LISTING_TABLE.search(blob):
+        return False
+    for a in anchors or []:
+        href = str(a.get("href", "")) if isinstance(a, dict) else ""
+        label = qn(str(a.get("text", ""))) if isinstance(a, dict) else ""
+        if _DETAIL_TARGET.search(href) or label in {"detalhes", "ver detalhes"}:
+            return True
+    return False
+
+
+def _listing_declares_bucket(title: str, bucket: str, other: str, title_declares: bool) -> bool:
+    """Declaracion de bucket suficiente SOLO para paginas con listing-shell fuerte."""
+    if title_declares:
+        return True
+    title_q = qn(title or "")
+    if bucket == "concursos":
+        return (
+            bool(re.search(r"\bconcursos?\b", title_q))
+            and not _KW[other].search(title_q)
+            and not _CULTURAL.search(title_q)
+        )
+    return False
 
 _SCHEMA = {
     "type": "object",
@@ -214,37 +282,38 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         n_verif += 1
         i = low.find(qc)
         win = low[max(0, i - 160): i + len(qc) + 160]
+        scope = _item_scope(text, cita)
         if _emissor_ajeno(it.get("emissor"), municipio):
             n_ajeno += 1
             continue
-        if _CULTURAL.search(win):          # concurso cultural (soberanas) != concurso público
+        if _CULTURAL.search(scope):         # concurso cultural (soberanas) != concurso público
             n_offtype += 1
             continue
         # Regla 1 — BINDING gana: el item nombra al certame padre (tipo + N/AAAA),
         # aunque el doc tenga su propio número. Colapsa docs de ciclo numerados.
-        b = _BINDING.search(cita) or _BINDING.search(win)
+        b = _BINDING.search(cita) or _BINDING.search(scope)
         if b:
             btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
             if btipo == bnorm:
                 certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
             continue
-        if not kw.search(win):             # tipo del bucket por ventana
+        if not kw.search(scope):           # tipo del bucket por cita/bloque local
             # fallback: título declara el tipo sin ambigüedad y el item no tiene
             # marca del OTRO tipo ni cultural en su ventana local.
-            if not (title_declares and not _KW[other].search(win) and not _CULTURAL.search(win)):
+            if not (title_declares and not _KW[other].search(scope) and not _CULTURAL.search(scope)):
                 n_offtype += 1
                 continue
         # Regla 2 — keyword de ciclo sin binding -> doc huérfano, no crea certame.
-        if _CYCLE.search(win):
+        if _CYCLE.search(scope):
             n_cycle += 1
             continue
         # Regla 3 — abertura / edital con número -> crea certame.
-        m = _NUM.search(cita) or _NUM.search(win)
+        m = _NUM.search(cita) or _NUM.search(scope)
         if m:
             certames.add((m.group(1).lstrip("0") or "0", m.group(2)))
         else:
             # Regla 4 — keyword + año sin número -> crea certame por año.
-            y = re.search(r"\b(20[12]\d)\b", win)
+            y = re.search(r"\b(20[12]\d)\b", scope)
             if y:
                 certames.add(("Y", y.group(1)))
     ev = {
@@ -252,14 +321,24 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         "certames": sorted(certames)[:8],
         "verif": n_verif, "off_type": n_offtype,
         "ciclo": n_cycle, "ajenos": n_ajeno, "piso": n_piso,
+        "title_declares": title_declares,
+        "listing_shell": _has_listing_shell(text, anchors),
     }
+    ev["listing_declares"] = _listing_declares_bucket(title, bnorm, other, title_declares)
     if len(certames) >= 2:
         return "confirmar", ev
+    if len(certames) == 1 and ev["listing_shell"]:
+        ev["estado"] = "revisar_certame_unico"
+        ev["motivo"] = "indice con estructura de listado pero un solo certame"
+        return "revisar", ev
     if len(certames) == 1:
+        ev["estado"] = "revisar"
         ev["motivo"] = "un solo certame (posible detalle)"
         return "revisar", ev
     if n_ajeno and not certames:
+        ev["estado"] = "revisar"
         ev["motivo"] = "solo editais de emisor ajeno"
         return "revisar", ev
+    ev["estado"] = "revisar"
     ev["motivo"] = "0 certames del tipo alvo"
     return "revisar", ev
