@@ -29,9 +29,12 @@ from pathlib import Path
 
 # Reuse the cascade's fetch (with curl_cffi/browser fallback) and signals, so
 # the auditor sees pages exactly as the pipeline did.
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT / "scripts" / "shared"))
 _FASE2 = Path(__file__).resolve().parents[1] / "fase2_municipios"
 sys.path.insert(0, str(_FASE2))
 import json  # noqa: E402
+import waf_guard  # noqa: E402
 
 from cascade_municipios import (  # noqa: E402
     make_session, fetch_page, is_pdf_or_file, norm,
@@ -302,6 +305,9 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
     ``{"href", "text"}`` para la topología de links del adjudicador. Returns None
     if the browser is unavailable or the load fails.
     """
+    if waf_guard.is_frozen(url):
+        print("      render skipped: waf_frozen", flush=True)
+        return None
     try:
         browser = _get_browser()
     except Exception as e:
@@ -332,6 +338,18 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
             if not _is_antibot_challenge(page.title() or "", ""):
                 break
             page.wait_for_timeout(2000)
+        if _is_antibot_challenge(page.title() or "", ""):
+            title = page.title() or ""
+            try:
+                text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                text = ""
+            if _is_antibot_challenge(title, text):
+                waf_guard.freeze(url)
+                return title, text, [{
+                    "href": "render-meta:waf_challenge",
+                    "text": "waf_challenge=1",
+                }]
         # Expand pagination so later-page/older items become visible.
         try:
             page.evaluate(_EXPAND_LISTING_JS)

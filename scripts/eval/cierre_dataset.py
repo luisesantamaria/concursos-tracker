@@ -32,15 +32,58 @@ from urllib.parse import parse_qsl, urlparse
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts" / "fase2_municipios"))
 sys.path.insert(0, str(ROOT / "scripts" / "eval"))
+sys.path.insert(0, str(ROOT / "scripts" / "shared"))
 
 import cascade_municipios as C   # noqa: E402
 import audit_fase2_rs as A       # noqa: E402
 import verdict_extract as V      # noqa: E402
+import waf_guard                 # noqa: E402
 
 BUCKETS = [
     ("concursos", "url_concursos", "confianza_concursos", "tier_concursos"),
     ("processos", "url_processos_seletivos", "confianza_processos", "tier_processos"),
 ]
+
+_FIXTURE_RENDER_LOOKUP: dict[str, dict] | None = None
+
+
+def _fixture_key_muni_bucket(municipio: str, bucket: str) -> str:
+    return f"mb:{V.qn(municipio)}|{bucket}"
+
+
+def _fixture_key_url(url: str) -> str:
+    return f"url:{C.clean_url(url or '')}"
+
+
+def _load_render_fixtures(path: Path | None = None) -> dict[str, dict]:
+    """Load frozen rendered pages for offline validation runs."""
+    fixture_dir = path or (ROOT / "tests" / "fixtures" / "render")
+    lookup: dict[str, dict] = {}
+    for p in sorted(fixture_dir.glob("*.json")):
+        try:
+            import json
+            fixture = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        bucket = fixture.get("bucket") or ""
+        municipio = fixture.get("municipio") or ""
+        if not bucket or not municipio:
+            continue
+        fixture["_fixture_path"] = str(p)
+        url = fixture.get("url") or ""
+        if url.startswith("http"):
+            lookup[_fixture_key_url(url)] = fixture
+        lookup[_fixture_key_muni_bucket(municipio, bucket)] = fixture
+    return lookup
+
+
+def _find_render_fixture(municipio: str, bucket: str, url: str) -> dict | None:
+    if _FIXTURE_RENDER_LOOKUP is None:
+        return None
+    return (
+        _FIXTURE_RENDER_LOOKUP.get(_fixture_key_url(url))
+        or _FIXTURE_RENDER_LOOKUP.get(_fixture_key_muni_bucket(municipio, bucket))
+    )
 
 # Server-side error pages served with HTTP 200 (ASP.NET "Runtime Error", PHP/SQL
 # stack traces, 500/503 bodies). Their rendered text has no listing, but the AI
@@ -313,6 +356,73 @@ def extract_verdict(session, model, municipio, bucket, title, text, anchors, tim
         return ("revisar", f"extract: {_extract_op_code(e)}: {str(e)[:80]}")
 
 
+def _extract_verdict_from_fixture(municipio: str, bucket: str, title: str,
+                                  text: str, anchors: list, items: list[dict]):
+    """Authority verdict using fixture-captured LLM items; no network calls."""
+    if (text or "").count("\n") < 3:
+        return ("revisar", "extract: revisar_op:render_aplanado")
+    decision, ev = V.adjudicate(
+        text, bucket, municipio, items or [], anchors=anchors, title=title)
+    conf = "confirmado" if decision == "confirmar" else "revisar"
+    return conf, _fmt_extract_evidence(decision, ev)
+
+
+def _verdict_from_content(session, model, municipio, bucket, url, timeout,
+                          extract_mode: str, title: str, text: str,
+                          anchors: list, *, allow_second_fetch: bool = True,
+                          fixture_items: list[dict] | None = None):
+    if not (text or "").strip():
+        return ("revisar", "revisar_op:render_vacio")
+    if A._is_antibot_challenge(title, text):
+        waf_guard.freeze(url)
+        return ("revisar", "revisar_op:waf_challenge")
+    if _is_server_error(title, text):
+        return ("revisar", "pagina de error de servidor (no es indice)")
+    if _is_not_found(title, text):
+        return ("revisar", "soft-404 / pagina no encontrada (no es indice)")
+    # Guard determinista de bajo colateral: solo paginas de DEFINICION (probadas
+    # sin colateral en golden). El guard de "editais genericos" se descarto: degradaba
+    # indices reales que mencionan chamamento/licitacao (Almirante, Anta Gorda). Lo
+    # difuso (generico, single-concurso, tipo-mixto) se deja a la IA + auditoria Chrome:
+    # NO es separable deterministamente de los indices reales sin romper buenos.
+    if _is_definition_page(text):
+        return ("revisar", "pagina de definicion sin listado (no es indice)")
+    # Regla de oro: sin >=1 item de listado real (solo la palabra clave en titulo/menu),
+    # NO es indice -> revisar.
+    if not _has_real_listing_item(text):
+        return ("revisar", "sin items de listado real (definicion/menu/vacia)")
+    if not C.gemini_api_key():
+        return ("revisar", "sin api key")
+
+    shadow_note = ""
+    if extract_mode in {"shadow", "authority"}:
+        if fixture_items is not None:
+            ex_conf, ex_motivo = _extract_verdict_from_fixture(
+                municipio, bucket, title, text, anchors, fixture_items)
+        else:
+            ex_conf, ex_motivo = extract_verdict(
+                session, model, municipio, bucket, title, text, anchors, timeout)
+        if extract_mode == "authority":
+            return ex_conf, ex_motivo
+        shadow_note = f"shadow:{ex_conf}:{ex_motivo[:220]} | "
+
+    try:
+        v, motivo = A.ai_verdict(session, model, municipio, bucket, title, text, timeout)
+    except Exception as e:
+        return ("revisar", f"{shadow_note}verdict-error: {str(e)[:60]}")
+    if v == "valido_indice":
+        # Re-fetch anti-intermitente: portales .aspx (sinsoft) dan "Runtime Error" a
+        # ratos; si estaban arriba durante el render confirmaban en falso. Una 2a lectura
+        # barata antes de sellar; si AHORA es error de servidor -> revisar. Un indice
+        # estable pasa 2 veces; solo degradamos si el 2do fetch trae marcadores de error.
+        if allow_second_fetch:
+            pg2 = C.fetch_page(session, url, timeout)
+            if pg2 and pg2.ok and _is_server_error(pg2.title, pg2.text):
+                return ("revisar", f"{shadow_note}error de servidor intermitente (2do fetch)")
+        return ("confirmado", f"{shadow_note}valido_indice: {motivo[:80]}")
+    return ("revisar", f"{shadow_note}{v}: {motivo[:80]}")
+
+
 def rendered_verdict(session, model, municipio, bucket, url, timeout,
                      extract_mode: str = "off"):
     """Render the page (browser if needed) and ask the discrete AI verdict.
@@ -330,7 +440,21 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
     # investigation/human finds the real index. Keeps `confirmado` airtight.
     if C.is_hard_detail_url(url):
         return ("revisar", "url de detalle inequivoca: no es indice (regla de fase)")
+
+    fixture = _find_render_fixture(municipio, bucket, url)
+    if fixture:
+        return _verdict_from_content(
+            session, model, municipio, bucket, url, timeout, extract_mode,
+            fixture.get("title") or "", fixture.get("text") or "",
+            fixture.get("anchors") or [], allow_second_fetch=False,
+            fixture_items=fixture.get("items_llm") or [])
+
+    if waf_guard.is_frozen(url):
+        return ("revisar", "revisar_op:waf_frozen")
+
     pg = C.fetch_page(session, url, timeout)
+    if getattr(pg, "error", "") == "waf_frozen":
+        return ("revisar", "revisar_op:waf_frozen")
     title = pg.title if (pg and pg.ok) else ""
     text = pg.text if (pg and pg.ok) else ""
     anchors = [{"href": h, "text": t} for h, t in (pg.links if (pg and pg.ok) else [])]
@@ -345,54 +469,14 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
         or not _has_real_listing_item(text)
     if need_render:
         r = A.render_page(url, timeout)
-        if r and (_has_real_listing_item(r[1]) or len((r[1] or "").strip()) >= 500):
+        if r and (A._is_antibot_challenge(r[0], r[1])
+                  or _has_real_listing_item(r[1])
+                  or (not _has_real_listing_item(text)
+                      and len((r[1] or "").strip()) >= 500)):
             title, text, anchors = r[0], r[1], r[2]
-    if not (text or "").strip():
-        return ("revisar", "revisar_op:render_vacio")
-    if _is_server_error(title, text):
-        return ("revisar", "pagina de error de servidor (no es indice)")
-    if _is_not_found(title, text):
-        return ("revisar", "soft-404 / pagina no encontrada (no es indice)")
-    # Guard determinista de bajo colateral: solo paginas de DEFINICION (probadas
-    # sin colateral en golden). El guard de "editais genericos" se descarto: degradaba
-    # indices reales que mencionan chamamento/licitacao (Almirante, Anta Gorda). Lo
-    # difuso (generico, single-concurso, tipo-mixto) se deja a la IA + auditoria Chrome:
-    # NO es separable deterministamente de los indices reales sin romper buenos.
-    if _is_definition_page(text):
-        return ("revisar", "pagina de definicion sin listado (no es indice)")
-    # Regla de oro: sin >=1 item de listado real (solo la palabra clave en titulo/menu),
-    # NO es indice -> revisar. Con el render+scroll de arriba, un indice de verdad ya
-    # mostro sus items (Pareci Novo: 50 PSS con fecha); si aun asi no hay item, es una
-    # definicion o categoria vacia (Pinhal Grande C/P). Permisivo (anio/numero/LISTING)
-    # para no tocar los que listan por anio.
-    if not _has_real_listing_item(text):
-        return ("revisar", "sin items de listado real (definicion/menu/vacia)")
-    if not C.gemini_api_key():
-        return ("revisar", "sin api key")
-
-    shadow_note = ""
-    if extract_mode in {"shadow", "authority"}:
-        ex_conf, ex_motivo = extract_verdict(
-            session, model, municipio, bucket, title, text, anchors, timeout)
-        if extract_mode == "authority":
-            return ex_conf, ex_motivo
-        shadow_note = f"shadow:{ex_conf}:{ex_motivo[:220]} | "
-
-    try:
-        v, motivo = A.ai_verdict(session, model, municipio, bucket, title, text, timeout)
-    except Exception as e:
-        return ("revisar", f"{shadow_note}verdict-error: {str(e)[:60]}")
-    if v == "valido_indice":
-        # Re-fetch anti-intermitente: portales .aspx (sinsoft) dan "Runtime Error" a
-        # ratos; si estaban arriba durante el render confirmaban en falso. Una 2a lectura
-        # barata antes de sellar; si AHORA es error de servidor -> revisar. Un indice
-        # estable pasa 2 veces; solo degradamos si el 2do fetch trae marcadores de error
-        # (un fallo de red deja pg2 sin marcadores -> no degrada un indice bueno).
-        pg2 = C.fetch_page(session, url, timeout)
-        if pg2 and pg2.ok and _is_server_error(pg2.title, pg2.text):
-            return ("revisar", f"{shadow_note}error de servidor intermitente (2do fetch)")
-        return ("confirmado", f"{shadow_note}valido_indice: {motivo[:80]}")
-    return ("revisar", f"{shadow_note}{v}: {motivo[:80]}")
+    return _verdict_from_content(
+        session, model, municipio, bucket, url, timeout, extract_mode,
+        title, text, anchors)
 
 
 # Rutas canonicas por bucket (patrones recurrentes: govbr /site/concursos, IPM /concurso,
@@ -499,14 +583,23 @@ def main() -> int:
                     help="Al final, reintentar solo buckets revisar_op:*")
     ap.add_argument("--op-retry-wait", type=float, default=5.0,
                     help="Minutos de espera antes del retry operacional (default: 5)")
+    ap.add_argument("--from-fixtures", action="store_true",
+                    help="Usar tests/fixtures/render/*.json cuando exista fixture "
+                         "del municipio+bucket/URL, sin tocar red para ese bucket")
     args = ap.parse_args()
     extract_mode = "authority" if args.extract_authority else (
         "shadow" if args.extract_shadow else "off")
+    global _FIXTURE_RENDER_LOOKUP
+    _FIXTURE_RENDER_LOOKUP = _load_render_fixtures() if args.from_fixtures else None
+    if args.from_fixtures:
+        print(f"from_fixtures: {len(_FIXTURE_RENDER_LOOKUP or {})} lookup keys", flush=True)
 
     rows = list(csv.DictReader(args.input.open(encoding="utf-8-sig")))
     if args.limit:
         rows = rows[:args.limit]
     cols = list(rows[0].keys()) if rows else []
+    if rows and "notes" not in cols:
+        cols.append("notes")
     session = C.make_session()
 
     summ = {"confirmado": 0, "revisar": 0, "sin_sitio": 0}

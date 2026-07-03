@@ -57,6 +57,9 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "shared"))
+import waf_guard  # noqa: E402
+
 DEFAULT_MUNICIPIOS_URL = "https://dados.tce.rs.gov.br/dados/auxiliar/municipios.csv"
 UF_SIGLA = "RS"
 UF_NOME = "Rio Grande do Sul"
@@ -145,9 +148,10 @@ def make_session() -> requests.Session:
 
 
 # WAF / bot-block statuses where a plain-requests fetch is worth retrying with a
-# browser TLS fingerprint (curl_cffi). Many RS municipal portals (Next.js behind
-# a WAF, Cloudflare) reject the default requests JA3 but serve a real browser.
-_BLOCK_STATUSES = {403, 406, 409, 429, 503}
+# browser TLS fingerprint (curl_cffi). 429/503 are rate/overload signals: do not
+# immediately double the request there.
+_FINGERPRINT_BLOCK_STATUSES = {403, 406, 409}
+_RATE_LIMIT_STATUSES = {429, 503}
 
 
 def _page_from_html(final_url: str, status: int, content_type: str,
@@ -217,12 +221,16 @@ def fetch_page(session: requests.Session, url: str, timeout: int = 15) -> Page:
     url = clean_url(url)
     if not url:
         return Page(url="", error="empty_url")
+    if waf_guard.is_frozen(url):
+        return Page(url=url, error="waf_frozen")
     try:
         resp = session.get(url, timeout=timeout, allow_redirects=True)
-        if resp.status_code in _BLOCK_STATUSES:
+        if resp.status_code in _FINGERPRINT_BLOCK_STATUSES:
             alt = _fetch_browser_impersonate(url, timeout)
             if alt is not None and alt.ok:
                 return alt
+        elif resp.status_code in _RATE_LIMIT_STATUSES:
+            pass
         page = _page_from_html(
             str(resp.url), resp.status_code,
             resp.headers.get("content-type", ""), resp.text)
