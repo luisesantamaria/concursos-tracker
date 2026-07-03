@@ -57,6 +57,25 @@ _META_LINE = re.compile(
     r"(?:tipo|categoria|modalidade|situa[cç][aã]o|status)\s*:)",
     re.I,
 )
+_EDITAL_NUMBER_META = re.compile(
+    r"\bnumero\s+do\s+edital\s*:?\s*(\d{1,4})\s*[/\-]\s*(20[12]\d)\b",
+    re.I,
+)
+_NUMBER_BLOCK_BOUNDARY = re.compile(
+    r"^\s*(?:fim|encerra|encerramento)\s*:|^\s*nao\s+houve\b|"
+    r"^\s*carregar\s+mais\b",
+    re.I,
+)
+
+
+def _line_index_for_cita(text: str, cita: str) -> int | None:
+    qc = qn(cita)
+    if not qc:
+        return None
+    for i, line in enumerate((text or "").splitlines()):
+        if qc in qn(line):
+            return i
+    return None
 
 
 def _item_scope(text: str, cita: str) -> str:
@@ -64,8 +83,11 @@ def _item_scope(text: str, cita: str) -> str:
     if not qc:
         return ""
     lines = (text or "").splitlines()
+    idx = _line_index_for_cita(text, cita)
+    if idx is None:
+        return qc
     for i, line in enumerate(lines):
-        if qc in qn(line):
+        if i == idx and qc in qn(line):
             block = line
             # Cards de noticia/listado suelen renderizar FECHA en la linea anterior
             # y titulo en la siguiente (Canoas P). Solo anexamos si la linea previa
@@ -114,6 +136,15 @@ _BINDING = re.compile(
     r"[^\n]{0,80}?edital\s*n?[\u00ba\u00b0o]?\s*)"
     r"(?<![\d./])"
     r"(\d{1,4})\s*[/\-]\s*(20[12]\d)\b",
+    re.I,
+)
+_STRONG_LINE_BINDING = re.compile(
+    r"\b(?P<tipo>"
+    r"concursos?(?:\s*-\s*estatutari\w*|\s+public\w*(?:\s+municipal)?|\s+municipal)|"
+    r"processos?\s+seletiv\w*(?:\s+simplificad\w*|\s+public\w*)?|sele[cç]ao\s+public\w*|"
+    r"sele[cç]ao\s+simplificad\w*|\bpss\b)"
+    r"\s*(?:n(?:o)?\s*)?"
+    r"(?<![\d./])(?P<num>\d{1,4})\s*[/\-]\s*(?P<ano>20[12]\d)\b",
     re.I,
 )
 _CYCLE = re.compile(
@@ -172,6 +203,148 @@ def _has_listing_shell(text: str, anchors: list | None) -> bool:
         if _DETAIL_TARGET.search(href) or label in {"detalhes", "ver detalhes"}:
             return True
     return False
+
+
+def _binding_bucket(tipo: str) -> str:
+    return "concursos" if "concurso" in qn(tipo) else "processos"
+
+
+def _strong_line_binding(line: str) -> tuple[str, tuple[str, str]] | None:
+    m = _STRONG_LINE_BINDING.search(qn(line))
+    if not m:
+        return None
+    return (
+        _binding_bucket(m.group("tipo")),
+        (m.group("num").lstrip("0") or "0", m.group("ano")),
+    )
+
+
+def _edital_number_meta_key(line: str) -> tuple[str, str] | None:
+    m = _EDITAL_NUMBER_META.search(qn(line))
+    if not m:
+        return None
+    return (m.group(1).lstrip("0") or "0", m.group(2))
+
+
+def _number_meta_block(lines: list[str], idx: int) -> str:
+    start = max(0, idx - 14)
+    for j in range(idx - 1, start - 1, -1):
+        q = qn(lines[j])
+        if _EDITAL_NUMBER_META.search(q) or _NUMBER_BLOCK_BOUNDARY.search(q):
+            start = j + 1
+            break
+    return "\n".join(lines[start:idx + 1])
+
+
+def _has_following_number_meta(lines: list[str], idx: int | None, year: str) -> bool:
+    if idx is None:
+        return False
+    for j in range(idx + 1, min(len(lines), idx + 15)):
+        q = qn(lines[j])
+        if _NUMBER_BLOCK_BOUNDARY.search(q):
+            return False
+        key = _edital_number_meta_key(lines[j])
+        if key and key[1] == year:
+            return True
+    return False
+
+
+def _title_certame_key(line: str, bucket: str, other: str) -> tuple[str, str] | None:
+    """Fallback for unnumbered PSS indexes that distinguish certames by role/title."""
+    if bucket != "processos":
+        return None
+    q = qn(line)
+    if not q or _num_key(q) or _KW[other].search(q):
+        return None
+    y = re.search(r"\b(20[12]\d)\b", q)
+    if not y or not _KW[bucket].search(q):
+        return None
+    q = re.sub(r"^\s*\d{1,2}\s*/\s*\d{1,2}\s*/\s*20[12]\d\s*\|\s*", "", q)
+    q = re.sub(r"\([^)]*\b(?:kb|mb)\b[^)]*\)\s*$", "", q).strip()
+    q = re.sub(r"\.pdf\s*$", "", q).strip()
+    m = re.search(
+        r"processos?\s+seletiv\w*(?:\s+\w+){0,2}?\s+"
+        r"(?:para\s+(?:contratacao\s+(?:de|em\s+carater\s+emergencial\s+de)\s+)?|"
+        r"(?:do|para\s+o|para\s+a)?\s*cargo\s+de\s+)?"
+        r"(?P<role>[a-z][a-z0-9 ]{4,80})$",
+        q,
+    )
+    if not m:
+        return None
+    role = m.group("role")
+    role = re.sub(r"\b(?:resultado|final|preliminar|homologacao|inscricoes|retificacao)\b", " ", role)
+    role = re.sub(r"\bassistencia\s+social\b", "assistente social", role)
+    role = re.sub(r"\bprofessores\b", "professor", role)
+    role = re.sub(r"\s+", " ", role).strip(" -")
+    if len(role) < 5:
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "-", role).strip("-")[:48]
+    if not slug:
+        return None
+    return ("T:" + slug, y.group(1))
+
+
+def _has_title_certame_for_year(certames: set, year: str) -> bool:
+    return any(
+        isinstance(k, tuple) and len(k) == 2 and str(k[0]).startswith("T:") and k[1] == year
+        for k in certames
+    )
+
+
+def _nearby_numbered_certame(lines: list[str], idx: int, bucket: str,
+                             other: str, year: str) -> bool:
+    for j in range(max(0, idx - 8), min(len(lines), idx + 9)):
+        line = lines[j]
+        q = qn(line)
+        key = _num_key(q)
+        if not key or key[1] != year:
+            continue
+        if _CULTURAL.search(q) or _FOREIGN.search(line):
+            continue
+        strong = _strong_line_binding(line)
+        if strong and strong[0] == bucket:
+            return True
+        b = _BINDING.search(line)
+        if b and _binding_bucket(b.group(1)) == bucket:
+            return True
+        if _KW[bucket].search(q) and not _KW[other].search(q):
+            return True
+        if re.search(r"\bedital\b", q):
+            return True
+    return False
+
+
+def _block_declares_bucket(block: str, bucket: str, other: str) -> bool:
+    q = qn(block)
+    if bucket == "concursos":
+        if re.search(r"\bmodalidade\s*:\s*concursos?(?:\s+public\w*)?\b", q):
+            return True
+    else:
+        if re.search(r"\bmodalidade\s*:\s*(?:processos?\s+seletiv\w*|sele[cç]ao\s+public\w*)\b", q):
+            return True
+    return bool(_KW[bucket].search(q) and not _KW[other].search(q))
+
+
+def _parent_key_above(text: str, idx: int | None, bucket: str,
+                      other: str) -> tuple[str, str] | None:
+    if idx is None:
+        return None
+    lines = (text or "").splitlines()
+    for j in range(idx - 1, max(-1, idx - 10), -1):
+        line = lines[j]
+        q = qn(line)
+        if not q:
+            continue
+        strong = _strong_line_binding(line)
+        if strong and strong[0] == bucket:
+            return strong[1]
+        b = _BINDING.search(line)
+        if b and _binding_bucket(b.group(1)) == bucket:
+            return (b.group(2).lstrip("0") or "0", b.group(3))
+        key = _num_key(line)
+        if key and _KW[bucket].search(q) and not _KW[other].search(q):
+            return key
+    return None
 
 
 def _listing_declares_bucket(title: str, bucket: str, other: str, title_declares: bool) -> bool:
@@ -319,6 +492,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     title_q = qn(title or "")
     title_here = bool(_KW[bnorm].search(title_q))
     title_other = bool(_KW[other].search(title_q))
+    title_combo = bool(re.search(r"\bconcursos?\b", title_q)) and bool(_KW["processos"].search(title_q))
     title_declares = title_here and not title_other
     certames: set = set()
     n_ajeno = n_verif = n_cycle = n_offtype = 0
@@ -337,7 +511,33 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
             item_here += 1
         if _KW[other].search(scope):
             item_other += 1
-    block_piso = item_other >= 2 and item_here == 0 and not title_declares
+    listing_shell = _has_listing_shell(text, anchors)
+    text_other = len(_KW[other].findall(low))
+    block_piso = (
+        (item_other >= 2 and item_here == 0)
+        or (not listing_shell and item_here == 0 and text_other >= 2)
+    ) and not title_declares
+    lines = (text or "").splitlines()
+    n_strong_floor = 0
+    allow_strong_floor = not (block_piso and title_combo and not listing_shell)
+    for line in lines:
+        if not allow_strong_floor:
+            break
+        strong = _strong_line_binding(line)
+        if not strong:
+            continue
+        btipo, key = strong
+        if btipo != bnorm:
+            continue
+        q = qn(line)
+        if _CULTURAL.search(q) or _FOREIGN.search(line):
+            continue
+        if _KW[other].search(q) and not _KW[bnorm].search(q):
+            continue
+        before = len(certames)
+        certames.add(key)
+        if len(certames) > before:
+            n_strong_floor += 1
     # PISO DETERMINISTA de alto recall: los certames con binding explícito
     # ("Concurso Público nº N/AAAA", "Processo Seletivo nº N/AAAA") se cuentan
     # directo del texto renderizado — son substrings por definición (ya quote-
@@ -347,7 +547,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     # "Processo Seletivo do CIEE..."), así que este piso no captura los ajenos.
     if not block_piso:
         for b in _BINDING.finditer(text or ""):
-            btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
+            btipo = _binding_bucket(b.group(1))
             if btipo != bnorm:
                 continue
             raw_w = (text or "")[max(0, b.start() - 120): b.end() + 120]
@@ -359,9 +559,36 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                 continue                       # "Concurso" generico dentro de bloque PSS
             certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
     n_binding_piso = len(certames)
+    n_number_meta_floor = 0
+    for i, line in enumerate(lines):
+        key = _edital_number_meta_key(line)
+        if not key:
+            continue
+        block = _number_meta_block(lines, i)
+        w = qn(block)
+        if not _block_declares_bucket(block, bnorm, other):
+            continue
+        if _CULTURAL.search(w) or _FOREIGN.search(block):
+            continue
+        before = len(certames)
+        certames.add(key)
+        if len(certames) > before:
+            n_number_meta_floor += 1
+    n_title_floor = 0
+    for i, line in enumerate(lines):
+        key = _title_certame_key(line, bnorm, other)
+        if not key:
+            continue
+        if _nearby_numbered_certame(lines, i, bnorm, other, key[1]):
+            continue
+        if _CULTURAL.search(line) or _FOREIGN.search(line):
+            continue
+        before = len(certames)
+        certames.add(key)
+        if len(certames) > before:
+            n_title_floor += 1
     n_meta_floor = 0
     if not block_piso:
-        lines = (text or "").splitlines()
         for i, line in enumerate(lines):
             key = _num_key(qn(line))
             if not key:
@@ -394,6 +621,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         n_verif += 1
         i = low.find(qc)
         win = low[max(0, i - 160): i + len(qc) + 160]
+        line_idx = _line_index_for_cita(text, cita)
         scope = _item_scope(text, cita)
         if _emissor_ajeno(it.get("emissor"), municipio):
             n_ajeno += 1
@@ -406,9 +634,21 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         # aunque el doc tenga su propio número. Colapsa docs de ciclo numerados.
         b = _BINDING.search(cita) or _BINDING.search(scope)
         if b:
-            btipo = "concursos" if re.search(r"concurso", b.group(1), re.I) else "processos"
+            btipo = _binding_bucket(b.group(1))
+            key = (b.group(2).lstrip("0") or "0", b.group(3))
             if btipo == bnorm:
-                certames.add((b.group(2).lstrip("0") or "0", b.group(3)))
+                if _CYCLE.search(scope):
+                    parent = _parent_key_above(text, line_idx, bnorm, other)
+                    other_parent = _parent_key_above(text, line_idx, other, bnorm)
+                    if other_parent and (
+                            not parent or parent == other_parent or key == other_parent):
+                        n_offtype += 1
+                        continue
+                    if parent and parent != key:
+                        certames.add(parent)
+                        n_cycle += 1
+                        continue
+                certames.add(key)
             continue
         if not kw.search(scope):           # tipo del bucket por cita/bloque local
             # fallback: título declara el tipo sin ambigüedad y el item no tiene
@@ -421,6 +661,17 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         # ciclo de un certame padre, la Regla 1 ya lo colapso por binding.
         key = _num_key(cita, scope)
         if key:
+            if _CYCLE.search(scope):
+                parent = _parent_key_above(text, line_idx, bnorm, other)
+                other_parent = _parent_key_above(text, line_idx, other, bnorm)
+                if other_parent and (
+                        not parent or parent == other_parent or key == other_parent):
+                    n_offtype += 1
+                    continue
+                if parent and parent != key:
+                    certames.add(parent)
+                    n_cycle += 1
+                    continue
             certames.add(key)
         else:
             if used_title_fallback:
@@ -432,7 +683,13 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                 continue
             # Regla 4 — keyword + año sin número -> crea certame por año.
             y = re.search(r"\b(20[12]\d)\b", scope)
-            if y:
+            if (y
+                    and not _has_following_number_meta(lines, line_idx, y.group(1))
+                    and not (
+                        line_idx is not None
+                        and _nearby_numbered_certame(lines, line_idx, bnorm, other, y.group(1))
+                    )
+                    and not _has_title_certame_for_year(certames, y.group(1))):
                 certames.add(("Y", y.group(1)))
     ev = {
         "n_certames": len(certames),
@@ -440,10 +697,12 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         "verif": n_verif, "off_type": n_offtype,
         "ciclo": n_cycle, "ajenos": n_ajeno, "piso": n_piso,
         "binding_piso": n_binding_piso, "meta_floor": n_meta_floor,
+        "strong_floor": n_strong_floor, "number_meta_floor": n_number_meta_floor,
+        "title_floor": n_title_floor,
         "piso_blocked": block_piso, "item_here": item_here,
         "item_other": item_other,
         "title_declares": title_declares,
-        "listing_shell": _has_listing_shell(text, anchors),
+        "listing_shell": listing_shell,
     }
     ev["listing_declares"] = _listing_declares_bucket(title, bnorm, other, title_declares)
     if len(certames) >= 2:
