@@ -106,7 +106,7 @@ _NUM = re.compile(r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(20[12]\d)\b")
 _NUM_SHORT_YEAR = re.compile(
     r"(?:edital|concursos?|processos?\s+seletiv\w*|sele[cç][aã]o|"
     r"\bpss\b|\bn(?:[\u00ba\u00b0]|o)?\b)\D{0,24}?"
-    r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(\d{2})\b",
+    r"(?<![\d./])(\d{1,4})\s*[/\-]\s*(\d{2})\b(?!\s*[/\-]\s*\d{2,4}\b)",
     re.I,
 )
 
@@ -133,7 +133,7 @@ _BINDING = re.compile(
     r"processos?\s+seletiv\w*|\bpss\b)(?:"
     r"(?:\s+(?:simplificad\w*|p[u\u00fa]blic\w*|public\w*|municipal|"
     r"de\s+estagi[a\u00e1]ri\w*)){0,4}\s*n?[\u00ba\u00b0o]?\s*|"
-    r"[^\n]{0,80}?edital\s*n?[\u00ba\u00b0o]?\s*)"
+    r"[^\n]{0,80}?edital(?:\s+de\s+abertura)?\s*n?[\u00ba\u00b0o]?\s*)"
     r"(?<![\d./])"
     r"(\d{1,4})\s*[/\-]\s*(20[12]\d)\b",
     re.I,
@@ -149,7 +149,11 @@ _STRONG_LINE_BINDING = re.compile(
 )
 _CYCLE = re.compile(
     r"homologa|convoca|retifica|classifica[çc]|resultad|prorroga|adiamento|errata", re.I)
-_CHILD_DOC = re.compile(r"nomea[çc]|aprovad|portaria", re.I)
+_CHILD_DOC = re.compile(
+    r"chamada|nomea[çc]|aprovad|candidat[oa]s?\s+classificad|"
+    r"contrata[çc][aã]o\s+tempor[aá]ria\s+de\s+candidat|portaria",
+    re.I,
+)
 # Entidades AJENAS conocidas (supra/extra-municipales). El default-deny no las
 # necesita para ejecutar, pero acelerarlas y explicarlas ayuda a la telemetría.
 _FOREIGN = re.compile(
@@ -203,6 +207,37 @@ def _has_listing_shell(text: str, anchors: list | None) -> bool:
         if _DETAIL_TARGET.search(href) or label in {"detalhes", "ver detalhes"}:
             return True
     return False
+
+
+_NAV_TERM = re.compile(
+    r"\b(?:lgpd|portal|transpar[eê]ncia|licita(?:con|[çc][oõ]es)|devolve\s+icms|"
+    r"plano\s+(?:municipal|anual|plurianual)|contas\s+p[uú]blicas|legisla[çc][aã]o|"
+    r"not[ií]cias|famurs|di[aá]rio\s+oficial|ouvidoria|\bsic\b|"
+    r"atendimento\s+ao\s+contribuinte|matr[ií]culas|parcerias|licenciamento|"
+    r"radar\s+da\s+transpar[eê]ncia|soberanas|portal\s+do\s+servidor|"
+    r"\b1doc\b|\bitbi\b|\bnf\s+eletr[oô]nica|julgamento\s+de\s+contas)\b",
+    re.I,
+)
+_LISTING_CONTEXT = re.compile(
+    r"\b(?:modalidade|situa[çc][aã]o|status|in[ií]cio|fim|publicado\s+em|"
+    r"objeto|data\s+de\s+publica[çc][aã]o|inscri[çc][oõ]es|n[uú]mero\s+do\s+edital)\b",
+    re.I,
+)
+
+
+def _is_navigation_cluster(lines: list[str], idx: int | None) -> bool:
+    """Detecta bloques de menú/sitemap: muchas líneas cortas de navegación,
+    sin metadatos de item de listado cerca. Una línea "Concurso Público 2019"
+    en ese bloque no debe alimentar pisos deterministas."""
+    if idx is None:
+        return False
+    window = [qn(x) for x in lines[max(0, idx - 6): min(len(lines), idx + 7)]]
+    window = [x for x in window if x]
+    if not window or any(_LISTING_CONTEXT.search(x) or _DATE_LINE.match(x) for x in window):
+        return False
+    nav_hits = sum(1 for x in window if _NAV_TERM.search(x))
+    short_lines = sum(1 for x in window if len(x) <= 90)
+    return nav_hits >= 3 and short_lines >= max(5, len(window) // 2)
 
 
 def _binding_bucket(tipo: str) -> str:
@@ -497,6 +532,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     certames: set = set()
     n_ajeno = n_verif = n_cycle = n_offtype = 0
     item_here = item_other = 0
+    lines = (text or "").splitlines()
     for it in items or []:
         cita = it.get("cita", "")
         if not cita:
@@ -505,6 +541,8 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         if not qc or qc not in low:
             continue
         scope = _item_scope(text, cita)
+        if _is_navigation_cluster(lines, _line_index_for_cita(text, cita)):
+            continue
         if _emissor_ajeno(it.get("emissor"), municipio) or _CULTURAL.search(scope):
             continue
         if _KW[bnorm].search(scope):
@@ -517,12 +555,13 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         (item_other >= 2 and item_here == 0)
         or (not listing_shell and item_here == 0 and text_other >= 2)
     ) and not title_declares
-    lines = (text or "").splitlines()
     n_strong_floor = 0
     allow_strong_floor = not (block_piso and title_combo and not listing_shell)
-    for line in lines:
+    for line_i, line in enumerate(lines):
         if not allow_strong_floor:
             break
+        if _is_navigation_cluster(lines, line_i):
+            continue
         strong = _strong_line_binding(line)
         if not strong:
             continue
@@ -549,6 +588,9 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         for b in _BINDING.finditer(text or ""):
             btipo = _binding_bucket(b.group(1))
             if btipo != bnorm:
+                continue
+            line_i = (text or "").count("\n", 0, b.start())
+            if _is_navigation_cluster(lines, line_i):
                 continue
             raw_w = (text or "")[max(0, b.start() - 120): b.end() + 120]
             w = qn(raw_w)
@@ -593,6 +635,8 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
             key = _num_key(qn(line))
             if not key:
                 continue
+            if _is_navigation_cluster(lines, i):
+                continue
             block = line
             for nxt in lines[i + 1:i + 4]:
                 if _META_LINE.match(qn(nxt)):
@@ -623,6 +667,9 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         win = low[max(0, i - 160): i + len(qc) + 160]
         line_idx = _line_index_for_cita(text, cita)
         scope = _item_scope(text, cita)
+        if _is_navigation_cluster(lines, line_idx):
+            n_offtype += 1
+            continue
         if _emissor_ajeno(it.get("emissor"), municipio):
             n_ajeno += 1
             continue
@@ -672,6 +719,19 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                     certames.add(parent)
                     n_cycle += 1
                     continue
+            if _CHILD_DOC.search(scope):
+                parent = _parent_key_above(text, line_idx, bnorm, other)
+                other_parent = _parent_key_above(text, line_idx, other, bnorm)
+                if other_parent and (
+                        not parent or parent == other_parent or key == other_parent):
+                    n_offtype += 1
+                    continue
+                if parent and parent != key:
+                    certames.add(parent)
+                    n_cycle += 1
+                    continue
+                n_cycle += 1
+                continue
             certames.add(key)
         else:
             if used_title_fallback:
