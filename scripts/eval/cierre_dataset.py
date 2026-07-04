@@ -47,7 +47,16 @@ BUCKETS = [
 ]
 
 _FIXTURE_RENDER_LOOKUP: dict[str, dict] | None = None
-_RUN_STATS = {"deterministic_first_skips": 0, "dumped_render": 0}
+_URL_CONTENT_CACHE: dict[str, dict] = {}
+_URL_CACHE_ENABLED = True
+_RUN_STATS = {
+    "deterministic_first_skips": 0,
+    "dumped_render": 0,
+    "url_cache_hits": 0,
+    "url_cache_misses": 0,
+    "url_cache_stores": 0,
+    "url_cache_gemini_skips": 0,
+}
 _DUMP_RENDER_DIR: Path | None = None
 
 
@@ -120,6 +129,36 @@ def _dump_render_snapshot(url: str, municipio: str, bucket: str, title: str,
         encoding="utf-8",
     )
     _RUN_STATS["dumped_render"] += 1
+
+
+def _cache_key(url: str) -> str:
+    return C.clean_url(url or "")
+
+
+def _cache_content(url: str, title: str, text: str, anchors: list,
+                   items: list[dict], *, items_complete: bool) -> None:
+    if not _URL_CACHE_ENABLED:
+        return
+    key = _cache_key(url)
+    if not key or not (text or "").strip():
+        return
+    _URL_CONTENT_CACHE[key] = {
+        "title": title or "",
+        "text": text or "",
+        "anchors": anchors or [],
+        "items": items or [],
+        "items_complete": bool(items_complete),
+    }
+    _RUN_STATS["url_cache_stores"] += 1
+
+
+def _cached_content(url: str) -> dict | None:
+    if not _URL_CACHE_ENABLED:
+        return None
+    key = _cache_key(url)
+    if not key:
+        return None
+    return _URL_CONTENT_CACHE.get(key)
 
 # Server-side error pages served with HTTP 200 (ASP.NET "Runtime Error", PHP/SQL
 # stack traces, 500/503 bodies). Their rendered text has no listing, but the AI
@@ -391,6 +430,8 @@ def extract_verdict(session, model, municipio, bucket, title, text, anchors, tim
                 ev0["deterministic_first"] = True
                 ev0["deterministic_first_threshold"] = deterministic_first_threshold
                 _RUN_STATS["deterministic_first_skips"] += 1
+                _cache_content(
+                    url, title, text, anchors, [], items_complete=False)
                 _dump_render_snapshot(
                     url, municipio, bucket, title, text, anchors, [], d0, ev0)
                 return "confirmado", "df=1 " + _fmt_extract_evidence(d0, ev0)
@@ -399,6 +440,8 @@ def extract_verdict(session, model, municipio, bucket, title, text, anchors, tim
         decision, ev = V.adjudicate(
             text, bucket, municipio, items, anchors=anchors, title=title)
         conf = "confirmado" if decision == "confirmar" else "revisar"
+        _cache_content(
+            url, title, text, anchors, items, items_complete=True)
         _dump_render_snapshot(
             url, municipio, bucket, title, text, anchors, items, decision, ev)
         return conf, _fmt_extract_evidence(decision, ev)
@@ -420,12 +463,16 @@ def _extract_verdict_from_fixture(municipio: str, bucket: str, title: str,
             ev0["deterministic_first"] = True
             ev0["deterministic_first_threshold"] = deterministic_first_threshold
             _RUN_STATS["deterministic_first_skips"] += 1
+            _cache_content(
+                url, title, text, anchors, [], items_complete=False)
             _dump_render_snapshot(
                 url, municipio, bucket, title, text, anchors, [], d0, ev0)
             return "confirmado", "df=1 " + _fmt_extract_evidence(d0, ev0)
     decision, ev = V.adjudicate(
         text, bucket, municipio, items or [], anchors=anchors, title=title)
     conf = "confirmado" if decision == "confirmar" else "revisar"
+    _cache_content(
+        url, title, text, anchors, items or [], items_complete=True)
     _dump_render_snapshot(
         url, municipio, bucket, title, text, anchors, items or [], decision, ev)
     return conf, _fmt_extract_evidence(decision, ev)
@@ -508,6 +555,54 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
     return ("revisar", f"{shadow_note}{v}: {motivo[:80]}")
 
 
+def _verdict_from_cache_hit(session, model, municipio, bucket, url, timeout,
+                            extract_mode: str,
+                            deterministic_first_threshold: int,
+                            cached: dict) -> tuple[str, str] | None:
+    title = cached.get("title") or ""
+    text = cached.get("text") or ""
+    anchors = cached.get("anchors") or []
+    if not (text or "").strip():
+        return None
+
+    if deterministic_first_threshold > 0:
+        d0, ev0 = V.adjudicate(
+            text, bucket, municipio, [], anchors=anchors, title=title)
+        if d0 == "confirmar" and ev0.get("piso", 0) >= deterministic_first_threshold:
+            ev0["deterministic_first"] = True
+            ev0["deterministic_first_threshold"] = deterministic_first_threshold
+            _RUN_STATS["deterministic_first_skips"] += 1
+            _RUN_STATS["url_cache_gemini_skips"] += 1
+            _dump_render_snapshot(
+                url, municipio, bucket, title, text, anchors, [], d0, ev0)
+            return "confirmado", "df=1 cache=1 " + _fmt_extract_evidence(d0, ev0)
+
+    if cached.get("items_complete"):
+        _RUN_STATS["url_cache_gemini_skips"] += 1
+        return _verdict_from_content(
+            session, model, municipio, bucket, url, timeout, extract_mode,
+            title, text, anchors, allow_second_fetch=False,
+            fixture_items=cached.get("items") or [],
+            deterministic_first_threshold=0)
+
+    # The cached content came from a previous deterministic-first skip. Reuse
+    # the render, but if this bucket does not qualify for df, populate items
+    # once so the decision remains identical to a full run.
+    if extract_mode in {"shadow", "authority"}:
+        try:
+            items = V.extract_items(
+                text, session, C.gemini_post, model, timeout, raise_errors=True)
+        except Exception as e:
+            return ("revisar", f"extract: {_extract_op_code(e)}: {str(e)[:80]}")
+        cached["items"] = items
+        cached["items_complete"] = True
+        return _verdict_from_content(
+            session, model, municipio, bucket, url, timeout, extract_mode,
+            title, text, anchors, allow_second_fetch=False,
+            fixture_items=items, deterministic_first_threshold=0)
+    return None
+
+
 def rendered_verdict(session, model, municipio, bucket, url, timeout,
                      extract_mode: str = "off",
                      deterministic_first_threshold: int = 0):
@@ -535,6 +630,18 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
             fixture.get("anchors") or [], allow_second_fetch=False,
             fixture_items=fixture.get("items_llm") or [],
             deterministic_first_threshold=deterministic_first_threshold)
+
+    if extract_mode in {"shadow", "authority"}:
+        cached = _cached_content(url)
+        if cached:
+            _RUN_STATS["url_cache_hits"] += 1
+            verdict = _verdict_from_cache_hit(
+                session, model, municipio, bucket, url, timeout, extract_mode,
+                deterministic_first_threshold, cached)
+            if verdict is not None:
+                return verdict
+        else:
+            _RUN_STATS["url_cache_misses"] += 1
 
     if waf_guard.is_frozen(url):
         return ("revisar", "revisar_op:waf_frozen")
@@ -623,12 +730,25 @@ def _repair_via_canonical(session, model, muni, bucket, current_url, site_base,
 
 
 def _is_revisar_op_reason(motivo: str) -> bool:
-    m = (motivo or "").strip()
+    m = (motivo or "").strip().lower()
     return (
         m.startswith("revisar_op:")
         or m.startswith("extract: revisar_op:")
         or "shadow:revisar:extract: revisar_op:" in m
     )
+
+
+def _load_waf_prefreeze(path: Path | None) -> int:
+    if not path:
+        return 0
+    n = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        waf_guard.prefreeze(line)
+        n += 1
+    return n
 
 
 def _append_cierre_note(row: dict, bucket: str, state: str, motivo: str,
@@ -685,6 +805,11 @@ def main() -> int:
     ap.add_argument("--dump-render", type=Path,
                     help="Directorio donde volcar snapshots offline renderizados "
                          "por municipio+bucket")
+    ap.add_argument("--no-url-cache", action="store_true",
+                    help="Desactivar cache por URL de la corrida (default: on)")
+    ap.add_argument("--waf-prefreeze", type=Path,
+                    help="Archivo de hosts/patrones/grupos WAF a congelar para "
+                         "toda la corrida antes de tocar red")
     args = ap.parse_args()
     extract_mode = "authority" if args.extract_authority else (
         "shadow" if args.extract_shadow else "off")
@@ -693,9 +818,15 @@ def main() -> int:
         df_threshold = 2
     global _DUMP_RENDER_DIR
     _DUMP_RENDER_DIR = args.dump_render
-    _RUN_STATS["deterministic_first_skips"] = 0
-    _RUN_STATS["dumped_render"] = 0
+    global _URL_CACHE_ENABLED
+    _URL_CACHE_ENABLED = not args.no_url_cache
+    _URL_CONTENT_CACHE.clear()
+    for key in _RUN_STATS:
+        _RUN_STATS[key] = 0
     C.reset_gemini_post_call_count()
+    n_prefrozen = _load_waf_prefreeze(args.waf_prefreeze)
+    if n_prefrozen:
+        print(f"waf_prefreeze: {n_prefrozen} patterns loaded", flush=True)
     global _FIXTURE_RENDER_LOOKUP
     _FIXTURE_RENDER_LOOKUP = _load_render_fixtures() if args.from_fixtures else None
     if args.from_fixtures:
@@ -735,6 +866,7 @@ def main() -> int:
             prev = (r.get(ccol) or "").strip()
             final_url, final_conf, motivo = url, None, ""
             final_tier = (r.get(tcol) or "").strip()
+            op_blocked = False
 
             # Step 1 — verify the existing URL (if any).
             if url.startswith("http"):
@@ -743,11 +875,13 @@ def main() -> int:
                     df_threshold)
                 if ver == "confirmado":
                     final_conf = "confirmado"
+                elif _is_revisar_op_reason(motivo):
+                    op_blocked = True
 
             # Step 1.5 — REPAIR: si la URL no confirmo, probar rutas canonicas del host.
             # Barato (unos fetches) y antes del investigate (cascade completo, caro). Corrige
             # el error de URL-debil (el indice real existe en la canonica) sin arriesgar FP.
-            if final_conf != "confirmado" and not args.no_repair:
+            if final_conf != "confirmado" and not args.no_repair and not op_blocked:
                 rurl, rmot = _repair_via_canonical(
                     session, args.model, muni, bk, url, r.get("site_base", ""),
                     args.timeout, extract_mode, df_threshold)
@@ -758,7 +892,7 @@ def main() -> int:
 
             # Step 2 — if not confirmed, INVESTIGATE: re-discover and verify a fresh
             # candidate (this is the "auto mano-negra" over empty AND revisar buckets).
-            if final_conf != "confirmado":
+            if final_conf != "confirmado" and not op_blocked:
                 d = investigate()
                 cand = ""
                 if d:
@@ -888,6 +1022,11 @@ def main() -> int:
     if df_threshold > 0:
         print(f"  deterministic_first: threshold {df_threshold} | "
               f"skips {_RUN_STATS['deterministic_first_skips']}")
+    if _URL_CACHE_ENABLED:
+        print(f"  url_cache: hits {_RUN_STATS['url_cache_hits']} | "
+              f"misses {_RUN_STATS['url_cache_misses']} | "
+              f"stores {_RUN_STATS['url_cache_stores']} | "
+              f"gemini_skips {_RUN_STATS['url_cache_gemini_skips']}")
     if _DUMP_RENDER_DIR is not None:
         print(f"  dump_render: {_DUMP_RENDER_DIR} | writes {_RUN_STATS['dumped_render']}")
     print(f"  salida: {args.output}")

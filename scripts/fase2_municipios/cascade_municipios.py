@@ -59,6 +59,7 @@ if hasattr(sys.stderr, "reconfigure"):
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "shared"))
 import waf_guard  # noqa: E402
+from playwright_net import new_context as new_browser_context  # noqa: E402
 
 DEFAULT_MUNICIPIOS_URL = "https://dados.tce.rs.gov.br/dados/auxiliar/municipios.csv"
 UF_SIGLA = "RS"
@@ -1177,7 +1178,8 @@ def _render_page_links(url: str, timeout: int = 20) -> list[tuple[str, str]]:
         return []
     context = None
     try:
-        context = browser.new_context(
+        context = new_browser_context(
+            browser,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -1227,7 +1229,8 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
         all_keywords.extend(kws)
 
     try:
-        context = browser.new_context(
+        context = new_browser_context(
+            browser,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"

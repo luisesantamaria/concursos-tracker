@@ -10,6 +10,7 @@ current run.
 from __future__ import annotations
 
 import ipaddress
+import fnmatch
 import socket
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 
 _HOST_GROUP_CACHE: dict[str, str] = {}
 _FREEZES: dict[str, "_Freeze"] = {}
+_PREFROZEN_HOST_PATTERNS: set[str] = set()
 _NOW = time.time
 
 _HOST_SCOPED_SUFFIXES = (
@@ -75,6 +77,8 @@ def _is_host_scoped_tenant(host: str) -> bool:
 
 def is_frozen(url: str) -> bool:
     """True when the URL's provider group is currently frozen."""
+    if _matches_prefrozen_host(url):
+        return True
     freeze_state = _FREEZES.get(group_for(url))
     if not freeze_state:
         return False
@@ -107,18 +111,72 @@ def freeze(url: str) -> dict[str, object]:
     }
 
 
+def freeze_group(group: str, *, permanent: bool = True) -> dict[str, object]:
+    """Freeze a precomputed group key, usually from a prefreeze list."""
+    state = _FREEZES.setdefault(group, _Freeze())
+    state.count += 1
+    state.until = None if permanent else _NOW() + 15 * 60
+    return {
+        "group": group,
+        "count": state.count,
+        "duration_seconds": None if permanent else 15 * 60,
+        "until": state.until,
+    }
+
+
+def prefreeze(pattern: str) -> dict[str, object]:
+    """Permanently freeze a host/url/group pattern for the current run."""
+    raw = (pattern or "").strip().lower()
+    if not raw:
+        return {"pattern": "", "kind": "empty"}
+    if raw.startswith(("host:", "ipv4:", "ip:")):
+        return {"pattern": raw, "kind": "group", **freeze_group(raw)}
+
+    host = (urlparse(raw).hostname or "").lower() if "://" in raw else raw
+    host = host.strip("/")
+    if not host:
+        return {"pattern": raw, "kind": "empty"}
+    _PREFROZEN_HOST_PATTERNS.add(host)
+
+    # Exact hosts can also freeze their provider /24. Globs stay host-pattern
+    # only because they are not resolvable.
+    if "*" not in host and "?" not in host:
+        url = raw if "://" in raw else f"https://{host}/"
+        group = group_for(url)
+        freeze_group(group, permanent=True)
+        return {"pattern": host, "kind": "host+group", "group": group}
+    return {"pattern": host, "kind": "host_pattern"}
+
+
+def _matches_prefrozen_host(url: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    if not host:
+        return False
+    for pattern in _PREFROZEN_HOST_PATTERNS:
+        if fnmatch.fnmatch(host, pattern) or host == pattern:
+            return True
+    return False
+
+
 def snapshot() -> dict[str, dict[str, object]]:
     """Expose freeze state for diagnostics/tests."""
-    return {
+    out = {
         group: {"count": state.count, "until": state.until}
         for group, state in _FREEZES.items()
     }
+    if _PREFROZEN_HOST_PATTERNS:
+        out["_prefrozen_host_patterns"] = {
+            "count": len(_PREFROZEN_HOST_PATTERNS),
+            "until": None,
+        }
+    return out
 
 
 def reset_for_tests() -> None:
     """Clear in-memory state. Intended for unit tests only."""
     _HOST_GROUP_CACHE.clear()
     _FREEZES.clear()
+    _PREFROZEN_HOST_PATTERNS.clear()
 
 
 def set_now_for_tests(now_fn) -> None:

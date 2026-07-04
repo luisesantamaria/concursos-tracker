@@ -35,6 +35,7 @@ _FASE2 = Path(__file__).resolve().parents[1] / "fase2_municipios"
 sys.path.insert(0, str(_FASE2))
 import json  # noqa: E402
 import waf_guard  # noqa: E402
+from playwright_net import new_context as new_browser_context  # noqa: E402
 
 from cascade_municipios import (  # noqa: E402
     make_session, fetch_page, is_pdf_or_file, norm,
@@ -315,7 +316,8 @@ def render_page(url: str, timeout: int = 25) -> tuple[str, str, list] | None:
         return None
     ctx = None
     try:
-        ctx = browser.new_context(
+        ctx = new_browser_context(
+            browser,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"

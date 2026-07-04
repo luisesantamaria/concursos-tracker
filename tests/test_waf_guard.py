@@ -36,6 +36,10 @@ class _Session:
 def setup_function():
     waf_guard.reset_for_tests()
     waf_guard.reset_clock_for_tests()
+    Z._URL_CONTENT_CACHE.clear()
+    Z._URL_CACHE_ENABLED = True
+    for key in Z._RUN_STATS:
+        Z._RUN_STATS[key] = 0
 
 
 def test_rate_limit_status_does_not_retry_with_impersonate(monkeypatch):
@@ -198,3 +202,88 @@ def test_from_fixtures_avoids_fetch_and_render(monkeypatch, tmp_path):
     assert Z.main() == 0
     out = list(csv.DictReader(output_csv.open(encoding="utf-8")))[0]
     assert out["confianza_processos"] == "confirmado"
+
+
+def test_url_cache_reuses_render_and_items_for_repeated_url(monkeypatch):
+    text = "\n".join([
+        "Concursos Publicos",
+        "Concurso Publico 01/2024",
+        "Publicado em 01/01/2024",
+        "Concurso Publico 02/2024",
+        "Publicado em 02/01/2024",
+    ])
+    session = _Session(_Resp(200, "<html><title>stub</title>stub</html>"))
+    render_calls: list[str] = []
+    extract_calls: list[str] = []
+
+    def fake_render(url, _timeout):
+        render_calls.append(url)
+        return "Concursos Publicos", text, []
+
+    def fake_extract(_text, *_args, **_kwargs):
+        extract_calls.append(_text)
+        return []
+
+    monkeypatch.setattr(Z.A, "render_page", fake_render)
+    monkeypatch.setattr(Z.C, "gemini_api_key", lambda: "fake-key")
+    monkeypatch.setattr(Z.V, "extract_items", fake_extract)
+
+    first = Z.rendered_verdict(
+        session, "model", "Teste", "concursos",
+        "https://one.test/indice", 1, "authority")
+    second = Z.rendered_verdict(
+        session, "model", "Teste", "concursos",
+        "https://one.test/indice", 1, "authority")
+
+    assert first[0] == "confirmado"
+    assert second[0] == "confirmado"
+    assert session.calls == 1
+    assert render_calls == ["https://one.test/indice"]
+    assert len(extract_calls) == 1
+    assert Z._RUN_STATS["url_cache_hits"] == 1
+    assert Z._RUN_STATS["url_cache_gemini_skips"] == 1
+
+
+def test_waf_prefreeze_file_cuts_before_fetch(monkeypatch, tmp_path):
+    input_csv = tmp_path / "in.csv"
+    output_csv = tmp_path / "out.csv"
+    prefreeze = tmp_path / "waf.txt"
+    prefreeze.write_text("one.test\n", encoding="utf-8")
+    cols = [
+        "municipio", "site_base",
+        "url_concursos", "confianza_concursos", "tier_concursos",
+        "url_processos_seletivos", "confianza_processos", "tier_processos",
+        "notes",
+    ]
+    with input_csv.open("w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=cols)
+        w.writeheader()
+        w.writerow({
+            "municipio": "Teste",
+            "site_base": "https://one.test",
+            "url_concursos": "https://one.test/concursos",
+            "confianza_concursos": "confirmado",
+            "tier_concursos": "t1",
+            "url_processos_seletivos": "",
+            "confianza_processos": "",
+            "tier_processos": "",
+            "notes": "",
+        })
+
+    monkeypatch.setattr(Z.C, "make_session", lambda: object())
+    monkeypatch.setattr(Z.C, "fetch_page",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fetch touched")))
+    monkeypatch.setattr(sys, "argv", [
+        "cierre_dataset.py",
+        "--input", str(input_csv),
+        "--output", str(output_csv),
+        "--no-investigate",
+        "--no-repair",
+        "--extract-authority",
+        "--waf-prefreeze", str(prefreeze),
+    ])
+
+    assert Z.main() == 0
+    out = list(csv.DictReader(output_csv.open(encoding="utf-8")))[0]
+    assert out["confianza_concursos"] == "revisar"
+    assert "revisar_op:waf_frozen" in out["notes"]
