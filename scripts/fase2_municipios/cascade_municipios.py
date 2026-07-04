@@ -689,14 +689,28 @@ def gemini_api_key() -> str:
     return os.environ.get("GEMINI_API_KEY", "")
 
 
+GEMINI_POST_CALLS = 0
+
+
+def reset_gemini_post_call_count() -> None:
+    global GEMINI_POST_CALLS
+    GEMINI_POST_CALLS = 0
+
+
+def gemini_post_call_count() -> int:
+    return GEMINI_POST_CALLS
+
+
 def gemini_post(session: requests.Session, model: str, payload: dict,
                 timeout: int = 90) -> dict:
+    global GEMINI_POST_CALLS
     key = gemini_api_key()
     if not key:
         raise RuntimeError("missing GEMINI_API_KEY")
     url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
     for attempt in range(3):
         try:
+            GEMINI_POST_CALLS += 1
             resp = session.post(url, json=payload, timeout=timeout)
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
                 if attempt == 2:

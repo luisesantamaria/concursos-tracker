@@ -137,7 +137,8 @@ def test_render_does_not_replace_static_listing_with_weaker_text(monkeypatch):
     monkeypatch.setattr(Z.A, "render_page", lambda *_args: ("Home", weak_render, []))
     monkeypatch.setattr(Z.C, "gemini_api_key", lambda: "fake-key")
 
-    def fake_extract(_session, _model, _municipio, _bucket, _title, text, _anchors, _timeout):
+    def fake_extract(_session, _model, _municipio, _bucket, _title, text, _anchors,
+                     _timeout, *_args):
         seen["text"] = text
         return "confirmado", "extract_confirmar: cert=2"
 

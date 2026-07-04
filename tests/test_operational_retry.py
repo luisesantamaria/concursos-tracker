@@ -36,7 +36,8 @@ def test_retry_operational_retries_only_op_bucket(monkeypatch, tmp_path):
 
     calls: list[str] = []
 
-    def fake_rendered(_session, _model, _municipio, bucket, _url, _timeout, _mode):
+    def fake_rendered(_session, _model, _municipio, bucket, _url, _timeout, _mode,
+                      *_args):
         calls.append(bucket)
         if len(calls) == 1:
             return "revisar", "extract: revisar_op:timeout"

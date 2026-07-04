@@ -23,9 +23,11 @@ Uso:
 from __future__ import annotations
 import argparse
 import csv
+import json
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
@@ -45,6 +47,8 @@ BUCKETS = [
 ]
 
 _FIXTURE_RENDER_LOOKUP: dict[str, dict] | None = None
+_RUN_STATS = {"deterministic_first_skips": 0, "dumped_render": 0}
+_DUMP_RENDER_DIR: Path | None = None
 
 
 def _fixture_key_muni_bucket(municipio: str, bucket: str) -> str:
@@ -84,6 +88,38 @@ def _find_render_fixture(municipio: str, bucket: str, url: str) -> dict | None:
         _FIXTURE_RENDER_LOOKUP.get(_fixture_key_url(url))
         or _FIXTURE_RENDER_LOOKUP.get(_fixture_key_muni_bucket(municipio, bucket))
     )
+
+
+def _dump_name(municipio: str, bucket: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "_", V.qn(municipio or "")).strip("_")
+    return f"{base or 'municipio'}_{bucket}.json"
+
+
+def _dump_render_snapshot(url: str, municipio: str, bucket: str, title: str,
+                          text: str, anchors: list, items: list[dict],
+                          decision: str, evidence: dict | str) -> None:
+    if _DUMP_RENDER_DIR is None:
+        return
+    payload = {
+        "url": url,
+        "municipio": municipio,
+        "bucket": bucket,
+        "title": title or "",
+        "text": text or "",
+        "anchors": anchors or [],
+        "items_llm": items or [],
+        "decision": decision,
+        "evidence": evidence,
+        "captured_decision": decision,
+        "captured_evidence": evidence,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _DUMP_RENDER_DIR.mkdir(parents=True, exist_ok=True)
+    (_DUMP_RENDER_DIR / _dump_name(municipio, bucket)).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _RUN_STATS["dumped_render"] += 1
 
 # Server-side error pages served with HTTP 200 (ASP.NET "Runtime Error", PHP/SQL
 # stack traces, 500/503 bodies). Their rendered text has no listing, but the AI
@@ -339,46 +375,87 @@ def _extract_op_code(exc: Exception) -> str:
     return "revisar_op:extract_error"
 
 
-def extract_verdict(session, model, municipio, bucket, title, text, anchors, timeout):
+def extract_verdict(session, model, municipio, bucket, title, text, anchors, timeout,
+                    deterministic_first_threshold: int = 0,
+                    url: str = ""):
     """New falsifiable extractor gate: LLM transcribes, code adjudicates."""
     if not C.gemini_api_key():
         return ("revisar", "extract: revisar_op:sin_api_key")
     if (text or "").count("\n") < 3:
         return ("revisar", "extract: revisar_op:render_aplanado")
     try:
+        if deterministic_first_threshold > 0:
+            d0, ev0 = V.adjudicate(
+                text, bucket, municipio, [], anchors=anchors, title=title)
+            if d0 == "confirmar" and ev0.get("piso", 0) >= deterministic_first_threshold:
+                ev0["deterministic_first"] = True
+                ev0["deterministic_first_threshold"] = deterministic_first_threshold
+                _RUN_STATS["deterministic_first_skips"] += 1
+                _dump_render_snapshot(
+                    url, municipio, bucket, title, text, anchors, [], d0, ev0)
+                return "confirmado", "df=1 " + _fmt_extract_evidence(d0, ev0)
         items = V.extract_items(text, session, C.gemini_post, model, timeout,
                                 raise_errors=True)
         decision, ev = V.adjudicate(
             text, bucket, municipio, items, anchors=anchors, title=title)
         conf = "confirmado" if decision == "confirmar" else "revisar"
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, items, decision, ev)
         return conf, _fmt_extract_evidence(decision, ev)
     except Exception as e:
         return ("revisar", f"extract: {_extract_op_code(e)}: {str(e)[:80]}")
 
 
 def _extract_verdict_from_fixture(municipio: str, bucket: str, title: str,
-                                  text: str, anchors: list, items: list[dict]):
+                                  text: str, anchors: list, items: list[dict],
+                                  deterministic_first_threshold: int = 0,
+                                  url: str = ""):
     """Authority verdict using fixture-captured LLM items; no network calls."""
     if (text or "").count("\n") < 3:
         return ("revisar", "extract: revisar_op:render_aplanado")
+    if deterministic_first_threshold > 0:
+        d0, ev0 = V.adjudicate(
+            text, bucket, municipio, [], anchors=anchors, title=title)
+        if d0 == "confirmar" and ev0.get("piso", 0) >= deterministic_first_threshold:
+            ev0["deterministic_first"] = True
+            ev0["deterministic_first_threshold"] = deterministic_first_threshold
+            _RUN_STATS["deterministic_first_skips"] += 1
+            _dump_render_snapshot(
+                url, municipio, bucket, title, text, anchors, [], d0, ev0)
+            return "confirmado", "df=1 " + _fmt_extract_evidence(d0, ev0)
     decision, ev = V.adjudicate(
         text, bucket, municipio, items or [], anchors=anchors, title=title)
     conf = "confirmado" if decision == "confirmar" else "revisar"
+    _dump_render_snapshot(
+        url, municipio, bucket, title, text, anchors, items or [], decision, ev)
     return conf, _fmt_extract_evidence(decision, ev)
 
 
 def _verdict_from_content(session, model, municipio, bucket, url, timeout,
                           extract_mode: str, title: str, text: str,
                           anchors: list, *, allow_second_fetch: bool = True,
-                          fixture_items: list[dict] | None = None):
+                          fixture_items: list[dict] | None = None,
+                          deterministic_first_threshold: int = 0):
     if not (text or "").strip():
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, [], "revisar",
+            {"motivo_code": "revisar_op:render_vacio"})
         return ("revisar", "revisar_op:render_vacio")
     if A._is_antibot_challenge(title, text):
         waf_guard.freeze(url)
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, [], "revisar",
+            {"motivo_code": "revisar_op:waf_challenge"})
         return ("revisar", "revisar_op:waf_challenge")
     if _is_server_error(title, text):
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, [], "revisar",
+            {"motivo": "pagina de error de servidor (no es indice)"})
         return ("revisar", "pagina de error de servidor (no es indice)")
     if _is_not_found(title, text):
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, [], "revisar",
+            {"motivo": "soft-404 / pagina no encontrada (no es indice)"})
         return ("revisar", "soft-404 / pagina no encontrada (no es indice)")
     # Guard determinista de bajo colateral: solo paginas de DEFINICION (probadas
     # sin colateral en golden). El guard de "editais genericos" se descarto: degradaba
@@ -386,10 +463,16 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
     # difuso (generico, single-concurso, tipo-mixto) se deja a la IA + auditoria Chrome:
     # NO es separable deterministamente de los indices reales sin romper buenos.
     if _is_definition_page(text):
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, [], "revisar",
+            {"motivo": "pagina de definicion sin listado (no es indice)"})
         return ("revisar", "pagina de definicion sin listado (no es indice)")
     # Regla de oro: sin >=1 item de listado real (solo la palabra clave en titulo/menu),
     # NO es indice -> revisar.
     if not _has_real_listing_item(text):
+        _dump_render_snapshot(
+            url, municipio, bucket, title, text, anchors, [], "revisar",
+            {"motivo": "sin items de listado real (definicion/menu/vacia)"})
         return ("revisar", "sin items de listado real (definicion/menu/vacia)")
     if not C.gemini_api_key():
         return ("revisar", "sin api key")
@@ -398,10 +481,12 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
     if extract_mode in {"shadow", "authority"}:
         if fixture_items is not None:
             ex_conf, ex_motivo = _extract_verdict_from_fixture(
-                municipio, bucket, title, text, anchors, fixture_items)
+                municipio, bucket, title, text, anchors, fixture_items,
+                deterministic_first_threshold, url)
         else:
             ex_conf, ex_motivo = extract_verdict(
-                session, model, municipio, bucket, title, text, anchors, timeout)
+                session, model, municipio, bucket, title, text, anchors, timeout,
+                deterministic_first_threshold, url)
         if extract_mode == "authority":
             return ex_conf, ex_motivo
         shadow_note = f"shadow:{ex_conf}:{ex_motivo[:220]} | "
@@ -424,7 +509,8 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
 
 
 def rendered_verdict(session, model, municipio, bucket, url, timeout,
-                     extract_mode: str = "off"):
+                     extract_mode: str = "off",
+                     deterministic_first_threshold: int = 0):
     """Render the page (browser if needed) and ask the discrete AI verdict.
     Returns ('confirmado'|'revisar', motivo). Never returns confirmado without a
     rendered, on-topic, valido_indice verdict.
@@ -447,7 +533,8 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
             session, model, municipio, bucket, url, timeout, extract_mode,
             fixture.get("title") or "", fixture.get("text") or "",
             fixture.get("anchors") or [], allow_second_fetch=False,
-            fixture_items=fixture.get("items_llm") or [])
+            fixture_items=fixture.get("items_llm") or [],
+            deterministic_first_threshold=deterministic_first_threshold)
 
     if waf_guard.is_frozen(url):
         return ("revisar", "revisar_op:waf_frozen")
@@ -476,7 +563,8 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
             title, text, anchors = r[0], r[1], r[2]
     return _verdict_from_content(
         session, model, municipio, bucket, url, timeout, extract_mode,
-        title, text, anchors)
+        title, text, anchors,
+        deterministic_first_threshold=deterministic_first_threshold)
 
 
 # Rutas canonicas por bucket (patrones recurrentes: govbr /site/concursos, IPM /concurso,
@@ -509,7 +597,8 @@ def _host_base(url: str) -> str:
 
 
 def _repair_via_canonical(session, model, muni, bucket, current_url, site_base,
-                          timeout, extract_mode: str = "off"):
+                          timeout, extract_mode: str = "off",
+                          deterministic_first_threshold: int = 0):
     """Prueba rutas canonicas del host; devuelve (url, motivo) de la primera que verifica
     como indice valido del tipo, o (None, '') si ninguna. Corrige el error de DESCUBRIMIENTO
     (URL debil) sin arriesgar FP (todo pasa por rendered_verdict)."""
@@ -524,7 +613,8 @@ def _repair_via_canonical(session, model, muni, bucket, current_url, site_base,
         seen.add(cand.rstrip("/"))
         try:
             ver, mot = rendered_verdict(
-                session, model, muni, bucket, cand, timeout, extract_mode)
+                session, model, muni, bucket, cand, timeout, extract_mode,
+                deterministic_first_threshold)
         except Exception:
             continue
         if ver == "confirmado":
@@ -586,9 +676,26 @@ def main() -> int:
     ap.add_argument("--from-fixtures", action="store_true",
                     help="Usar tests/fixtures/render/*.json cuando exista fixture "
                          "del municipio+bucket/URL, sin tocar red para ese bucket")
+    ap.add_argument("--deterministic-first", action="store_true",
+                    help="Antes del LLM, confirmar si el piso determinista solo "
+                         "alcanza el umbral configurado")
+    ap.add_argument("--deterministic-first-threshold", type=int, default=0,
+                    help="Umbral de certames del piso determinista para saltar "
+                         "el LLM (default: 0/off)")
+    ap.add_argument("--dump-render", type=Path,
+                    help="Directorio donde volcar snapshots offline renderizados "
+                         "por municipio+bucket")
     args = ap.parse_args()
     extract_mode = "authority" if args.extract_authority else (
         "shadow" if args.extract_shadow else "off")
+    df_threshold = max(0, args.deterministic_first_threshold)
+    if args.deterministic_first and df_threshold <= 0:
+        df_threshold = 2
+    global _DUMP_RENDER_DIR
+    _DUMP_RENDER_DIR = args.dump_render
+    _RUN_STATS["deterministic_first_skips"] = 0
+    _RUN_STATS["dumped_render"] = 0
+    C.reset_gemini_post_call_count()
     global _FIXTURE_RENDER_LOOKUP
     _FIXTURE_RENDER_LOOKUP = _load_render_fixtures() if args.from_fixtures else None
     if args.from_fixtures:
@@ -632,7 +739,8 @@ def main() -> int:
             # Step 1 — verify the existing URL (if any).
             if url.startswith("http"):
                 ver, motivo = rendered_verdict(
-                    session, args.model, muni, bk, url, args.timeout, extract_mode)
+                    session, args.model, muni, bk, url, args.timeout, extract_mode,
+                    df_threshold)
                 if ver == "confirmado":
                     final_conf = "confirmado"
 
@@ -642,7 +750,7 @@ def main() -> int:
             if final_conf != "confirmado" and not args.no_repair:
                 rurl, rmot = _repair_via_canonical(
                     session, args.model, muni, bk, url, r.get("site_base", ""),
-                    args.timeout, extract_mode)
+                    args.timeout, extract_mode, df_threshold)
                 if rurl:
                     final_url, final_conf, motivo = rurl, "confirmado", f"reparado: {rmot}"
                     final_tier = "repair"
@@ -658,7 +766,8 @@ def main() -> int:
                             else d.url_processos_seletivos) or ""
                 if cand.startswith("http") and cand != url:
                     ver2, motivo2 = rendered_verdict(
-                        session, args.model, muni, bk, cand, args.timeout, extract_mode)
+                        session, args.model, muni, bk, cand, args.timeout, extract_mode,
+                        df_threshold)
                     if ver2 == "confirmado":
                         final_url, final_conf, motivo = cand, "confirmado", motivo2
                         final_tier = (d.tier_concursos if bk == "concursos"
@@ -731,7 +840,8 @@ def main() -> int:
             if not url.startswith("http") or r.get(ccol) != "revisar":
                 continue
             ver, mot = rendered_verdict(
-                session, args.model, r["municipio"], bk, url, args.timeout, extract_mode)
+                session, args.model, r["municipio"], bk, url, args.timeout, extract_mode,
+                df_threshold)
             final_state = "confirmado" if ver == "confirmado" else "revisar"
             if ver == "confirmado":
                 ok_menu, menu_reason = apply_menu_reachability_guard(
@@ -774,6 +884,12 @@ def main() -> int:
           f"menu_risk {changed['menu_risk']}")
     if extract_mode != "off":
         print(f"  verdict_extract: {extract_mode}")
+    print(f"  gemini_post_calls: {C.gemini_post_call_count()}")
+    if df_threshold > 0:
+        print(f"  deterministic_first: threshold {df_threshold} | "
+              f"skips {_RUN_STATS['deterministic_first_skips']}")
+    if _DUMP_RENDER_DIR is not None:
+        print(f"  dump_render: {_DUMP_RENDER_DIR} | writes {_RUN_STATS['dumped_render']}")
     print(f"  salida: {args.output}")
     return 0
 

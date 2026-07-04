@@ -55,3 +55,24 @@ def test_verdict_direction_lock():
             assert decision != "confirmar", f"{path.name}: FP fixture promoted"
         if label == "tp":
             assert decision != "revisar", f"{path.name}: TP fixture degraded"
+
+
+def test_llm_items_are_monotonic_over_deterministic_floor():
+    for path in _fixtures():
+        fixture = json.loads(path.read_text(encoding="utf-8"))
+        text = fixture.get("text") or ""
+        if text.count("\n") < 3:
+            continue
+        empty_decision, empty_ev = V.adjudicate(
+            text,
+            fixture["bucket"],
+            fixture["municipio"],
+            [],
+            anchors=fixture.get("anchors") or [],
+            title=fixture.get("title") or "",
+        )
+        full_decision, full_ev = _decision(fixture)
+        assert not (empty_decision == "confirmar" and full_decision != "confirmar"), (
+            f"{path.name}: LLM items broke monotonicity; "
+            f"empty={empty_ev}; full={full_ev}"
+        )
