@@ -150,9 +150,24 @@ _STRONG_LINE_BINDING = re.compile(
 _CYCLE = re.compile(
     r"homologa|convoca|retifica|classifica[çc]|resultad|prorroga|adiamento|errata", re.I)
 _CHILD_DOC = re.compile(
-    r"chamada|nomea[çc]|aprovad|candidat[oa]s?\s+classificad|"
+    r"chamada|convoca|nomea[çc]|homologa|resultad|classifica[çc]|"
+    r"retifica|errata|aviso|comunicad|divulga[çc][aã]o\s+(?:das?\s+)?notas?|"
+    r"heteroidentifica|aprovad|candidat[oa]s?\s+classificad|"
     r"contrata[çc][aã]o\s+tempor[aá]ria\s+de\s+candidat|portaria",
     re.I,
+)
+_TITLE_ONLY_PARENT = re.compile(
+    r"\b(?:concursos?\s+p[uú]blic\w*|processos?\s+seletiv\w*|"
+    r"sele[çc][aã]o\s+p[uú]blic\w*|sele[çc][aã]o\s+simplificad\w*|"
+    r"\bpss\b)\b[^\n]{0,50}?\b(20[12]\d)\b",
+    re.I,
+)
+_NEWS_ARTICLE_MARKERS = (
+    "clique para ouvir esta noticia",
+    "noticias relacionadas",
+    "download imagem original",
+    "compartilhe",
+    "escritorio de comunicacao",
 )
 # Entidades AJENAS conocidas (supra/extra-municipales). El default-deny no las
 # necesita para ejecutar, pero acelerarlas y explicarlas ayuda a la telemetría.
@@ -238,6 +253,30 @@ def _is_navigation_cluster(lines: list[str], idx: int | None) -> bool:
     nav_hits = sum(1 for x in window if _NAV_TERM.search(x))
     short_lines = sum(1 for x in window if len(x) <= 90)
     return nav_hits >= 3 and short_lines >= max(5, len(window) // 2)
+
+
+def _is_news_article(text: str, title: str, listing_shell: bool) -> bool:
+    if listing_shell:
+        return False
+    q = qn(text or "")
+    if not q or _LISTING_TABLE.search(q) or _CERTAME_DOC_TABLE.search(q):
+        return False
+    marker_hits = sum(1 for marker in _NEWS_ARTICLE_MARKERS if marker in q)
+    if marker_hits < 2:
+        return False
+    title_q = qn(title or "")
+    generic_title = {
+        "concursos",
+        "concurso",
+        "concursos publicos",
+        "concurso publico",
+        "processos seletivos",
+        "processo seletivo",
+        "processos seletivos simplificados",
+    }
+    if title_q in generic_title:
+        return False
+    return "noticias relacionadas" in q or "clique para ouvir esta noticia" in q
 
 
 def _binding_bucket(tipo: str) -> str:
@@ -326,6 +365,13 @@ def _has_title_certame_for_year(certames: set, year: str) -> bool:
     )
 
 
+def _has_any_certame_for_year(certames: set, year: str) -> bool:
+    return any(
+        isinstance(k, tuple) and len(k) == 2 and k[1] == year
+        for k in certames
+    )
+
+
 def _nearby_numbered_certame(lines: list[str], idx: int, bucket: str,
                              other: str, year: str) -> bool:
     for j in range(max(0, idx - 8), min(len(lines), idx + 9)):
@@ -360,6 +406,53 @@ def _block_declares_bucket(block: str, bucket: str, other: str) -> bool:
     return bool(_KW[bucket].search(q) and not _KW[other].search(q))
 
 
+def _item_context_block(lines: list[str], idx: int | None, max_after: int = 10) -> str:
+    if idx is None:
+        return ""
+    out: list[str] = []
+    end = min(len(lines), idx + max_after + 1)
+    for j in range(idx, end):
+        q = qn(lines[j])
+        if j > idx and re.match(
+                r"^\s*(?:edital|concurso|processo\s+seletivo|\bpss\b)\b", q
+        ) and _num_key(q):
+            break
+        out.append(lines[j])
+    return "\n".join(out)
+
+
+def _accessory_doc(scope: str, block: str = "") -> bool:
+    w = qn((scope or "") + "\n" + (block or ""))
+    return bool(_CYCLE.search(w) or _CHILD_DOC.search(w))
+
+
+def _title_only_parent_key(line: str, bucket: str, other: str) -> tuple[str, str] | None:
+    q = qn(line)
+    if not q or _num_key(q) or _KW[other].search(q):
+        return None
+    if not _KW[bucket].search(q):
+        return None
+    m = _TITLE_ONLY_PARENT.search(q)
+    if not m:
+        return None
+    return ("Y", m.group(1))
+
+
+def _has_distinct_selection_role(scope: str, bucket: str) -> bool:
+    if bucket != "processos":
+        return False
+    q = qn(scope)
+    role_patterns = (
+        r"processos?\s+seletiv\w*(?:\s+simplificad\w*)?\s+para\s+"
+        r"(?!estagi|candidat|inscri|prova|manifestar\b)[a-z][a-z0-9 ]{3,}",
+        r"contrato\s+por\s+prazo\s+determinado\s+para\s+"
+        r"(?!candidat)[a-z][a-z0-9 ]{3,}",
+        r"contrata[çc][aã]o\s+tempor[aá]ria\s+(?:de|para)\s+"
+        r"(?!candidat)[a-z][a-z0-9 ]{3,}",
+    )
+    return any(re.search(p, q) for p in role_patterns)
+
+
 def _parent_key_above(text: str, idx: int | None, bucket: str,
                       other: str) -> tuple[str, str] | None:
     if idx is None:
@@ -378,6 +471,18 @@ def _parent_key_above(text: str, idx: int | None, bucket: str,
             return (b.group(2).lstrip("0") or "0", b.group(3))
         key = _num_key(line)
         if key and _KW[bucket].search(q) and not _KW[other].search(q):
+            return key
+    return None
+
+
+def _parent_title_key_above(text: str, idx: int | None, bucket: str,
+                            other: str) -> tuple[str, str] | None:
+    if idx is None:
+        return None
+    lines = (text or "").splitlines()
+    for j in range(idx - 1, max(-1, idx - 80), -1):
+        key = _title_only_parent_key(lines[j], bucket, other)
+        if key:
             return key
     return None
 
@@ -533,6 +638,26 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     n_ajeno = n_verif = n_cycle = n_offtype = 0
     item_here = item_other = 0
     lines = (text or "").splitlines()
+    listing_shell = _has_listing_shell(text, anchors)
+    if _is_news_article(text, title, listing_shell):
+        ev = {
+            "n_certames": 0,
+            "certames": [],
+            "verif": 0, "off_type": 0,
+            "ciclo": 0, "ajenos": 0, "piso": 0,
+            "binding_piso": 0, "meta_floor": 0,
+            "strong_floor": 0, "number_meta_floor": 0,
+            "title_floor": 0,
+            "piso_blocked": False, "item_here": 0,
+            "item_other": 0,
+            "title_declares": title_declares,
+            "listing_shell": listing_shell,
+            "listing_declares": False,
+            "estado": "revisar",
+            "motivo": "nota de prensa/noticia individual, no indice",
+            "motivo_code": "revisar_sem:noticia",
+        }
+        return "revisar", ev
     for it in items or []:
         cita = it.get("cita", "")
         if not cita:
@@ -549,7 +674,6 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
             item_here += 1
         if _KW[other].search(scope):
             item_other += 1
-    listing_shell = _has_listing_shell(text, anchors)
     text_other = len(_KW[other].findall(low))
     block_piso = (
         (item_other >= 2 and item_here == 0)
@@ -667,6 +791,9 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         win = low[max(0, i - 160): i + len(qc) + 160]
         line_idx = _line_index_for_cita(text, cita)
         scope = _item_scope(text, cita)
+        item_block = _item_context_block(lines, line_idx)
+        type_scope = qn(scope + "\n" + item_block)
+        is_accessory = _accessory_doc(scope, item_block)
         if _is_navigation_cluster(lines, line_idx):
             n_offtype += 1
             continue
@@ -679,12 +806,12 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         used_title_fallback = False
         # Regla 1 — BINDING gana: el item nombra al certame padre (tipo + N/AAAA),
         # aunque el doc tenga su propio número. Colapsa docs de ciclo numerados.
-        b = _BINDING.search(cita) or _BINDING.search(scope)
+        b = _BINDING.search(cita) or _BINDING.search(scope) or _BINDING.search(item_block)
         if b:
             btipo = _binding_bucket(b.group(1))
             key = (b.group(2).lstrip("0") or "0", b.group(3))
             if btipo == bnorm:
-                if _CYCLE.search(scope):
+                if is_accessory:
                     parent = _parent_key_above(text, line_idx, bnorm, other)
                     other_parent = _parent_key_above(text, line_idx, other, bnorm)
                     if other_parent and (
@@ -695,12 +822,20 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                         certames.add(parent)
                         n_cycle += 1
                         continue
+                    title_parent = _parent_title_key_above(text, line_idx, bnorm, other)
+                    if title_parent and title_parent != key:
+                        if _has_any_certame_for_year(certames, title_parent[1]):
+                            n_cycle += 1
+                            continue
+                        certames.add(title_parent)
+                        n_cycle += 1
+                        continue
                 certames.add(key)
             continue
-        if not kw.search(scope):           # tipo del bucket por cita/bloque local
+        if not kw.search(type_scope):      # tipo del bucket por cita/bloque local
             # fallback: título declara el tipo sin ambigüedad y el item no tiene
             # marca del OTRO tipo ni cultural en su ventana local.
-            if not (title_declares and not _KW[other].search(scope) and not _CULTURAL.search(scope)):
+            if not (title_declares and not _KW[other].search(type_scope) and not _CULTURAL.search(type_scope)):
                 n_offtype += 1
                 continue
             used_title_fallback = True
@@ -708,7 +843,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         # ciclo de un certame padre, la Regla 1 ya lo colapso por binding.
         key = _num_key(cita, scope)
         if key:
-            if _CYCLE.search(scope):
+            if is_accessory:
                 parent = _parent_key_above(text, line_idx, bnorm, other)
                 other_parent = _parent_key_above(text, line_idx, other, bnorm)
                 if other_parent and (
@@ -719,16 +854,16 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                     certames.add(parent)
                     n_cycle += 1
                     continue
-            if _CHILD_DOC.search(scope):
-                parent = _parent_key_above(text, line_idx, bnorm, other)
-                other_parent = _parent_key_above(text, line_idx, other, bnorm)
-                if other_parent and (
-                        not parent or parent == other_parent or key == other_parent):
-                    n_offtype += 1
-                    continue
-                if parent and parent != key:
-                    certames.add(parent)
+                title_parent = _parent_title_key_above(text, line_idx, bnorm, other)
+                if title_parent and title_parent != key:
+                    if _has_any_certame_for_year(certames, title_parent[1]):
+                        n_cycle += 1
+                        continue
+                    certames.add(title_parent)
                     n_cycle += 1
+                    continue
+                if _has_distinct_selection_role(type_scope, bnorm):
+                    certames.add(key)
                     continue
                 n_cycle += 1
                 continue
@@ -738,7 +873,7 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                 n_offtype += 1
                 continue
             # Regla 3 — keyword de ciclo sin número/binding -> doc huérfano.
-            if _CYCLE.search(scope):
+            if is_accessory:
                 n_cycle += 1
                 continue
             # Regla 4 — keyword + año sin número -> crea certame por año.
