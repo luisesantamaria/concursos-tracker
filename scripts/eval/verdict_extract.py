@@ -263,6 +263,11 @@ _NAV_TERM = re.compile(
     r"\b1doc\b|\bitbi\b|\bnf\s+eletr[oô]nica|julgamento\s+de\s+contas)\b",
     re.I,
 )
+_SHORTCUT_HEADER = re.compile(
+    r"^(?:acesso\s+rapido|acesso\s+direto|atalhos(?:\s+de\s+navegacao)?|"
+    r"links\s+uteis|acesso\s+a)\s*:?$",
+    re.I,
+)
 _LISTING_CONTEXT = re.compile(
     r"\b(?:modalidade|situa[çc][aã]o|status|in[ií]cio|fim|publicado\s+em|"
     r"objeto|data\s+de\s+publica[çc][aã]o|inscri[çc][oõ]es|n[uú]mero\s+do\s+edital)\b",
@@ -312,6 +317,14 @@ def _is_navigation_cluster(lines: list[str], idx: int | None) -> bool:
         return False
     nav_hits = sum(1 for x in window if _NAV_TERM.search(x))
     short_lines = sum(1 for x in window if len(x) <= 90)
+    shortcut_window = [qn(x) for x in lines[max(0, idx - 10): idx + 1]]
+    shortcut_window = [x for x in shortcut_window if x]
+    if (
+        any(_SHORTCUT_HEADER.match(x) for x in shortcut_window)
+        and not any(_LISTING_CONTEXT.search(x) or _DATE_LINE.match(x) for x in shortcut_window)
+    ):
+        shortcut_short_lines = sum(1 for x in shortcut_window if len(x) <= 90)
+        return shortcut_short_lines >= max(5, len(shortcut_window) // 2)
     return nav_hits >= 3 and short_lines >= max(5, len(window) // 2)
 
 

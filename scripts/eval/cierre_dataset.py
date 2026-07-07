@@ -1018,7 +1018,7 @@ def main() -> int:
           f"menu_risk {changed['menu_risk']}")
     if extract_mode != "off":
         print(f"  verdict_extract: {extract_mode}")
-    print(f"  gemini_post_calls: {C.gemini_post_call_count()}")
+    print(f"  gemini_post_calls: {C.gemini_post_call_summary()}")
     if df_threshold > 0:
         print(f"  deterministic_first: threshold {df_threshold} | "
               f"skips {_RUN_STATS['deterministic_first_skips']}")
