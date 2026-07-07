@@ -691,28 +691,154 @@ def gemini_api_key() -> str:
 
 
 GEMINI_POST_CALLS = 0
+GEMINI_POST_CALLS_FREE = 0
+GEMINI_POST_CALLS_PAID = 0
+
+_GEMINI_FREE_WINDOW: list[tuple[float, int]] = []
+_GEMINI_FREE_COOLDOWN_UNTIL = 0.0
+_GEMINI_FREE_COOLDOWN_STREAK = 0
+_GEMINI_FREE_DISABLED_FOR_RUN = False
+_GEMINI_FREE_DISABLED_LOGGED = False
+
+
+def gemini_free_api_key() -> str:
+    return os.environ.get("GEMINI_API_KEY_FREE", "")
+
+
+def gemini_free_model() -> str:
+    return os.environ.get("GEMINI_FREE_MODEL", "gemini-3.1-flash-lite")
+
+
+def gemini_free_first_enabled() -> bool:
+    val = os.environ.get("GEMINI_FREE_FIRST", "")
+    return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def reset_gemini_post_call_count() -> None:
-    global GEMINI_POST_CALLS
+    global GEMINI_POST_CALLS, GEMINI_POST_CALLS_FREE, GEMINI_POST_CALLS_PAID
+    global _GEMINI_FREE_COOLDOWN_UNTIL, _GEMINI_FREE_COOLDOWN_STREAK
+    global _GEMINI_FREE_DISABLED_FOR_RUN, _GEMINI_FREE_DISABLED_LOGGED
     GEMINI_POST_CALLS = 0
+    GEMINI_POST_CALLS_FREE = 0
+    GEMINI_POST_CALLS_PAID = 0
+    _GEMINI_FREE_WINDOW.clear()
+    _GEMINI_FREE_COOLDOWN_UNTIL = 0.0
+    _GEMINI_FREE_COOLDOWN_STREAK = 0
+    _GEMINI_FREE_DISABLED_FOR_RUN = False
+    _GEMINI_FREE_DISABLED_LOGGED = False
 
 
 def gemini_post_call_count() -> int:
     return GEMINI_POST_CALLS
 
 
-def gemini_post(session: requests.Session, model: str, payload: dict,
-                timeout: int = 90) -> dict:
-    global GEMINI_POST_CALLS
+def gemini_post_call_counts() -> dict[str, int]:
+    return {
+        "total": GEMINI_POST_CALLS,
+        "free": GEMINI_POST_CALLS_FREE,
+        "paid": GEMINI_POST_CALLS_PAID,
+    }
+
+
+def gemini_post_call_summary() -> str:
+    c = gemini_post_call_counts()
+    return f"total {c['total']} | free {c['free']} | paid {c['paid']}"
+
+
+def _payload_token_estimate(payload: dict) -> int:
+    try:
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        raw = str(payload)
+    return max(1, len(raw) // 4)
+
+
+def _gemini_free_limits() -> tuple[int, int]:
+    rpm = int(os.environ.get("GEMINI_FREE_RPM_LIMIT", "12") or "12")
+    tpm = int(os.environ.get("GEMINI_FREE_TPM_LIMIT", "200000") or "200000")
+    return max(0, rpm), max(0, tpm)
+
+
+def _gemini_free_limiter_allows(payload: dict, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    rpm_limit, tpm_limit = _gemini_free_limits()
+    while _GEMINI_FREE_WINDOW and now - _GEMINI_FREE_WINDOW[0][0] >= 60:
+        _GEMINI_FREE_WINDOW.pop(0)
+    tokens = _payload_token_estimate(payload)
+    if len(_GEMINI_FREE_WINDOW) >= rpm_limit:
+        return False
+    if sum(t for _, t in _GEMINI_FREE_WINDOW) + tokens > tpm_limit:
+        return False
+    _GEMINI_FREE_WINDOW.append((now, tokens))
+    return True
+
+
+def _gemini_free_available(payload: dict) -> bool:
+    if not gemini_free_first_enabled():
+        return False
+    if not gemini_free_api_key():
+        return False
+    if _GEMINI_FREE_DISABLED_FOR_RUN:
+        return False
+    now = time.time()
+    if now < _GEMINI_FREE_COOLDOWN_UNTIL:
+        return False
+    return _gemini_free_limiter_allows(payload, now)
+
+
+def _gemini_free_mark_quota() -> None:
+    global _GEMINI_FREE_COOLDOWN_UNTIL, _GEMINI_FREE_COOLDOWN_STREAK
+    global _GEMINI_FREE_DISABLED_FOR_RUN, _GEMINI_FREE_DISABLED_LOGGED
+    _GEMINI_FREE_COOLDOWN_UNTIL = time.time() + 60
+    _GEMINI_FREE_COOLDOWN_STREAK += 1
+    if _GEMINI_FREE_COOLDOWN_STREAK >= 3:
+        _GEMINI_FREE_DISABLED_FOR_RUN = True
+        if not _GEMINI_FREE_DISABLED_LOGGED:
+            print("      gemini free tier quota appears exhausted; using paid key for rest of run",
+                  flush=True)
+            _GEMINI_FREE_DISABLED_LOGGED = True
+
+
+def _gemini_free_mark_success() -> None:
+    global _GEMINI_FREE_COOLDOWN_STREAK
+    _GEMINI_FREE_COOLDOWN_STREAK = 0
+
+
+def _gemini_is_quota_response(resp: requests.Response) -> bool:
+    if resp.status_code == 429:
+        return True
+    try:
+        txt = resp.text or ""
+    except Exception:
+        txt = ""
+    txt = txt.lower()
+    return "quota" in txt or "rate limit" in txt or "resource_exhausted" in txt
+
+
+def _gemini_post_once(session: requests.Session, model: str, key: str,
+                      payload: dict, timeout: int, counter: str) -> requests.Response:
+    global GEMINI_POST_CALLS, GEMINI_POST_CALLS_FREE, GEMINI_POST_CALLS_PAID
+    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
+    GEMINI_POST_CALLS += 1
+    if counter == "free":
+        GEMINI_POST_CALLS_FREE += 1
+    else:
+        GEMINI_POST_CALLS_PAID += 1
+    return session.post(url, json=payload, timeout=timeout)
+
+
+def _redact_gemini_error(exc: BaseException) -> str:
+    return re.sub(r"([?&]key=)[^&\s)]+", r"\1<redacted>", str(exc))
+
+
+def _gemini_post_paid(session: requests.Session, model: str, payload: dict,
+                      timeout: int = 90) -> dict:
     key = gemini_api_key()
     if not key:
         raise RuntimeError("missing GEMINI_API_KEY")
-    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent?key={key}"
     for attempt in range(3):
         try:
-            GEMINI_POST_CALLS += 1
-            resp = session.post(url, json=payload, timeout=timeout)
+            resp = _gemini_post_once(session, model, key, payload, timeout, "paid")
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
                 if attempt == 2:
                     resp.raise_for_status()
@@ -721,11 +847,33 @@ def gemini_post(session: requests.Session, model: str, payload: dict,
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.RequestException as e:
-            print(f"      gemini attempt {attempt+1} failed: {e}", flush=True)
+            print(f"      gemini attempt {attempt+1} failed: {_redact_gemini_error(e)}",
+                  flush=True)
             if attempt == 2:
                 raise
             time.sleep((2 ** attempt) * 2 + random.uniform(0, 1))
     return {}
+
+
+def gemini_post(session: requests.Session, model: str, payload: dict,
+                timeout: int = 90) -> dict:
+    if _gemini_free_available(payload):
+        free_key = gemini_free_api_key()
+        free_model = gemini_free_model()
+        try:
+            resp = _gemini_post_once(
+                session, free_model, free_key, payload, timeout, "free")
+            if _gemini_is_quota_response(resp):
+                _gemini_free_mark_quota()
+                return _gemini_post_paid(session, model, payload, timeout)
+            resp.raise_for_status()
+            _gemini_free_mark_success()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            print(f"      gemini free attempt failed; falling back to paid: {_redact_gemini_error(e)}",
+                  flush=True)
+            return _gemini_post_paid(session, model, payload, timeout)
+    return _gemini_post_paid(session, model, payload, timeout)
 
 
 def tier2_grounded_search(session: requests.Session, model: str,
@@ -2157,6 +2305,9 @@ def main() -> int:
                         default=PROJECT_ROOT / "data" / "cascade_output.csv")
     parser.add_argument("--model", type=str,
                         default=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+    parser.add_argument("--gemini-free-first", action="store_true",
+                        help="Use GEMINI_API_KEY_FREE/GEMINI_FREE_MODEL first, "
+                             "falling back to GEMINI_API_KEY on quota/limits")
     parser.add_argument("--no-playwright", action="store_true",
                         help="Skip Tier 4")
     parser.add_argument("--timeout", type=int, default=15)
@@ -2181,6 +2332,9 @@ def main() -> int:
                              "reads Google's index of the page. Only ascends with real "
                              "grounding evidence (guardrail against URL-shape inference).")
     args = parser.parse_args()
+
+    if args.gemini_free_first:
+        os.environ["GEMINI_FREE_FIRST"] = "1"
 
     session = make_session()
 
@@ -2381,6 +2535,7 @@ def main() -> int:
           flush=True)
     print(f"  Processos  — confirmado: {conf_p}, probable: {prob_p}, revisar: {rev_p}",
           flush=True)
+    print(f"  Gemini calls — {gemini_post_call_summary()}", flush=True)
     return 0
 
 
