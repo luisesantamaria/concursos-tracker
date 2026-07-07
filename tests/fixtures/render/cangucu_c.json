@@ -560,9 +560,9 @@
       "emissor": "Prefeitura Municipal de Canguçu"
     }
   ],
-  "label": "fp",
-  "expected": "revisar",
-  "captured_decision": "revisar",
+  "label": "tp",
+  "expected": "confirmar",
+  "captured_decision": "confirmar",
   "captured_evidence": {
     "n_certames": 1,
     "certames": [
@@ -591,5 +591,47 @@
     "motivo": "un solo certame (posible detalle)",
     "motivo_code": "revisar_sem:certame_unico"
   },
-  "captured_at": "2026-07-05T04:04:20.044377+00:00"
+  "captured_at": "2026-07-05T04:04:20.044377+00:00",
+  "decision": "confirmar",
+  "evidence": {
+    "n_certames": 5,
+    "certames": [
+      [
+        "1",
+        "2026"
+      ],
+      [
+        "2",
+        "2024"
+      ],
+      [
+        "3",
+        "2026"
+      ],
+      [
+        "9",
+        "2025"
+      ],
+      [
+        "Y",
+        "2022"
+      ]
+    ],
+    "verif": 37,
+    "off_type": 7,
+    "ciclo": 27,
+    "ajenos": 3,
+    "piso": 4,
+    "binding_piso": 4,
+    "meta_floor": 0,
+    "strong_floor": 0,
+    "number_meta_floor": 0,
+    "title_floor": 0,
+    "piso_blocked": false,
+    "item_here": 0,
+    "item_other": 1,
+    "title_declares": true,
+    "listing_shell": false,
+    "listing_declares": true
+  }
 }
