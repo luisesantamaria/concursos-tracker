@@ -51,62 +51,21 @@ fases. **No inventes datos**: si un campo no está en la fuente, queda vacío.
 
 ## 2. Fase actual y estado EXACTO (dónde vamos)
 
-### Fase actual: Descubrimiento de índices municipales (FASE 2)
+### Fase actual: Descubrimiento de índices municipales (FASE 2) - PAUSA POR AUDITORÍA
+Estamos ejecutando un triage sistemático de todos los municipios confirmados (corpus de 618) para detectar falsos positivos (FPs) que no fueron capturados por las auditorías anteriores.
 
-Encontrar la **página índice/listado estable** de concursos y de PSS en cada
-municipio de RS. **Esta fase NO extrae editais/PDFs individuales** — eso es fase 3.
+**Hallazgos confirmados:**
+- FPs identificados en **Itaara**, **Canudos do Vale** y **Estrela**.
+- Familias de errores detectadas: "noticias con números basura", "menús de links por año" y "sobre-conteo en portales tipo Atende.net".
 
-- **Qué es válido en esta fase:** página índice / categoría / portal que lista
-  *varios* eventos; página padre desde la que se navega a editais.
-- **Qué se rechaza:** PDF directo; página de edital individual; noticia de un solo
-  concurso; anexo/cronograma/retificação; licitação/pregão/chamamento; concurso
-  cultural (soberanas/rainhas).
+**Plan de acción:**
+1. Completar el triage del "tail" (~22 casos restantes) contra el corpus congelado.
+2. Identificar y documentar todas las familias de FPs.
+3. Delegar fixes de código a Codex (sandbox sin red).
+4. Verificar con barrido completo (618) + Golden Set.
+5. Retomar chunks 5-6 de la Fase 2 una vez que el pipeline esté validado contra estos nuevos FPs.
 
-### Estado numérico actual (497 municipios de RS, corrida completa hecha)
-
-Números REALES calculados del CSV commiteado `data/fase2/municipios_rs_local.csv`
-(no de memoria), en el commit `81c601d`:
-
-| Estado | # | % |
-|---|---|---|
-| ✅ Confirmado pleno (todo bucket presente = confirmado) | 369 | 74.2% |
-| 🟡 Parcial (algún bucket en `revisar`/`probable`) | 78 | 15.7% |
-| ⚪ Sin resultado (sin URLs) | 50 | 10.1% |
-
-Por track: **concursos** confirmado 397 / probable 35 / revisar 24 / sin 41 ·
-**processos** confirmado 367 / probable 36 / revisar 46 / sin 48.
-
-- **Precisión sobre confirmados: ~99%+ (medida-hasta-ahora).** Se auditaron las
-  URLs confirmadas con métodos determinísticos + scan cross-tipo + muestra manual,
-  y se hallaron y corrigieron varios falsos positivos del patrón "bucket apuntando
-  al índice del tipo opuesto" (Erechim, São José do Inhacorá, Três Coroas, Cerro
-  Largo, etc.), bajados a `revisar` (commit `81c601d`).
-- **Esto es PRE-barrido-semántico-completo.** El número definitivo y la limpieza
-  final salen de correr la auditoría `--render --ai-all` sobre las 497 (ver §2 →
-  tarea pendiente).
-- **Golden set gate:** automatable **WRNG=0 / F-POS=0** (cero URLs inventadas).
-- **Geo-block ausente** corriendo desde Brasil; solo ~1.6% de las 497 son bloqueos
-  de red reales (Cloudflare/SSL/antibot).
-- **Auditor validado contra verdad de campo (golden):** **0 falsos HARD sobre 46
-  URLs golden verificadas a mano → auditor CONFIABLE.** Sus `OK` se pueden confiar
-  sin abrir cada página; sus `HARD` sobre el dataset completo serían FP reales.
-
-### TAREA PENDIENTE INMEDIATA (lo próximo que hay que hacer)
-
-**Correr la auditoría completa `--render --ai-all` sobre las 497** (los ~760
-confirmados). Es la pieza que convierte el 99.5% de "medido-parcial" a
-"auditado-al-100%". Los `HARD` que salgan serán **FP semánticos reales** → bajarlos
-a `revisar` en el CSV y commitear. Es larga (render + 1 llamada Gemini por URL,
-~1.5–2.5 h) y gasta ~760 llamadas Gemini (centavos-pocos dólares).
-
-```bash
-python scripts/eval/audit_fase2_rs.py \
-  --input data/fase2/municipios_rs_local.csv \
-  --render --ai-all --detalle
-```
-
-Tras eso: corregir los FP reales → fase 2 **cerrada** → arrancar **fase 3**
-(scanner de índices que entra a cada página confirmada y extrae editais/PDFs).
+**Nota:** Este documento es la fuente de verdad unificada. Todo trabajo en rama `claude/skill-files-accuracy-vd6uyt`.
 
 ---
 
@@ -335,8 +294,9 @@ Copia `data/fase2/municipios_rs_local.csv` (y `.xlsx`) de tu entorno anterior a
 
 ## 10. Roadmap
 
-- **Fase 2 (actual):** cerrar con la auditoría completa `--render --ai-all` → bajar
-  FP reales a `revisar` → set de índices confirmados limpio y verificado.
+- **Fase 2 (actual):** pausa de calidad en run497. Auditar la cola dudosa (~30
+  municipios), agrupar familias de FP (noticias, menus, sobre-conteo), corregirlas
+  en pipeline y validar contra golden antes de retomar chunks 5-6.
 - **Fase 3 (siguiente):** *scanner de índices* — entrar a cada página confirmada y
   extraer los editais/PDFs individuales (número, órgano, banca, fechas, status). El
   render de navegador que ya tiene el auditor es el primer ladrillo de esto.
@@ -355,6 +315,7 @@ Copia `data/fase2/municipios_rs_local.csv` (y `.xlsx`) de tu entorno anterior a
 5. [ ] Verifiqué que `data/fase2/municipios_rs_local.csv` (~497 filas) llegó con el
        clon — ya está versionado en GitHub, no hay que copiarlo.
 6. [ ] `git pull` antes de correr; `git push` después de cada cambio.
-7. [ ] Próximo paso: auditoría completa `--render --ai-all` sobre las 497.
+7. [ ] Próximo paso: auditar el tail dudoso de run497 y clasificar familias de FP;
+       chunks 5-6 esperan hasta validar los fixes contra golden.
 
 Bienvenida, sesión local. Tienes todo el contexto. Continúa desde el paso 7.
