@@ -67,6 +67,12 @@ Tier 4 - Agente de navegacao (Playwright)
 - Script `medir_golden_set.py` mede precisao e cobertura por tipo de portal.
 - Rodar apos QUALQUER mudanca no verificador ou seletor.
 
+### Estado atual - 2026-07-08
+
+Execucao de novos chunks do run497 pausada por qualidade antes de continuar a cobertura. A triagem manual dos 618 buckets confirmou FPs em Itaara, Canudos e Estrela, com uma cauda de ~30 municipios duvidosos ainda para auditoria um a um.
+
+Familias de FP ja detectadas: noticias individuais classificadas como indice, paginas genericas de menu sem listagem real, e sobre-conteo por resultados duplicados/inflados. Depois de mapear a cauda, corrigir cada familia no pipeline e validar contra o golden set. So entao retomar fase 2 chunks 5-6.
+
 ### Pendencias desta fase
 
 - [ ] Implementar ai_pick_best (substituir scorer numerico).
@@ -74,6 +80,7 @@ Tier 4 - Agente de navegacao (Playwright)
 - [ ] Cache de grounding por municipio.
 - [ ] Deteccao de JS e fallback Playwright dirigido (Tier 4).
 - [ ] Escalar golden set com municipios de outras letras.
+- [ ] Auditar a cauda duvidosa do run497 e classificar familias de FP antes de continuar chunks 5-6.
 
 ## Fase 3 - Scanner de Indices
 
