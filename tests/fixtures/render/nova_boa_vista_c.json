@@ -1340,8 +1340,8 @@
       "emissor": ""
     }
   ],
-  "label": "fp",
-  "expected": "revisar",
+  "label": "tp",
+  "expected": "confirmar",
   "captured_decision": "revisar",
   "captured_evidence": {
     "n_certames": 0,

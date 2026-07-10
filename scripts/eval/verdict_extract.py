@@ -960,6 +960,347 @@ def _emissor_ajeno(emissor: str, municipio: str) -> bool:
     return True                            # nombre propio no reconocido -> ajeno
 
 
+_NON_EVENT_PUBLICATION = re.compile(
+    r"\b(?:licita[çc][aã]o|preg[aã]o|chamamento|credenciamento|"
+    r"tomada\s+de\s+pre[çc]os|concorr[eê]ncia\s+p[uú]blica)\b",
+    re.I,
+)
+_NEGATIVE_EVENT = re.compile(
+    r"\b(?:n[aã]o\s+(?:foi|foram|houve|h[aá]|ser[aá])\s+(?:realizad\w*|publicad\w*)|"
+    r"sem\s+(?:concurso|processo\s+seletivo)|inexistente)\b",
+    re.I,
+)
+_YEAR_NAV_ENTRY = {
+    "concursos": re.compile(
+        r"^(?:edital\s+(?:do\s+)?)?concursos?(?:\s+public\w*)?\s+"
+        r"20[12]\d(?:\s+[ivx]+)?$", re.I),
+    "processos": re.compile(
+        r"^(?:processos?\s+seletiv\w*(?:\s+simplificad\w*)?|pss)\s+"
+        r"20[12]\d(?:\s+[ivx]+)?$", re.I),
+}
+_COMBINED_YEAR_NAV_ENTRY = re.compile(
+    r"^concursos?\s+e\s+processos?\s+seletiv\w*\s+20[12]\d$", re.I)
+_EVENT_LINE_START = {
+    "concursos": re.compile(r"^(?:edital\s+(?:de\s+)?(?:abertura\s+)?(?:do\s+)?)*concursos?\b", re.I),
+    "processos": re.compile(
+        r"^(?:edital\s+(?:de\s+)?(?:abertura\s+)?(?:do\s+)?)?"
+        r"(?:processos?\s+seletiv\w*|sele[cç][aã]o\s+(?:public\w*|simplificad\w*)|pss)\b",
+        re.I,
+    ),
+}
+_DETAIL_SECTION = re.compile(
+    r"^(?:downloads?\s+de\s+documentos?|ver\s+anexos?|documentos?|anexos?|"
+    r"atividade\s+data\s+edital)\s*:?$",
+    re.I,
+)
+_ARTICLE_DATE = re.compile(
+    r"\b\d{1,2}\s+(?:de\s+)?(?:janeiro|fevereiro|marco|abril|maio|junho|"
+    r"julho|agosto|setembro|outubro|novembro|dezembro)(?:\s+de)?\s+20[12]\d\b",
+    re.I,
+)
+_INCOMPLETE_CONTENT = re.compile(
+    r"\b(?:access\s+denied|forbidden|too\s+many\s+requests|"
+    r"just\s+a\s+moment|checking\s+your\s+browser|enable\s+javascript|"
+    r"runtime\s+error|service\s+unavailable|bad\s+gateway|gateway\s+timeout)\b",
+    re.I,
+)
+_DEFINITION_SENTENCE = re.compile(
+    r"^(?:concursos?\s+p[uú]blic\w*|processos?\s+seletiv\w*)\s+"
+    r"(?:[eé]\s+um|consiste|significa|permite|tem\s+por\s+objetivo)\b",
+    re.I,
+)
+
+
+def _bucket_name(bucket: str) -> str:
+    return bucket if bucket in _KW else ("concursos" if bucket == "C" else "processos")
+
+
+def _title_mentions_bucket(title: str, bucket: str) -> bool:
+    q = qn(title or "")
+    if bucket == "concursos":
+        return bool(re.search(r"\bconcursos?\b", q) and not _CULTURAL.search(q))
+    return bool(_KW["processos"].search(q))
+
+
+def _year_navigation_entry(line: str, bucket: str) -> bool:
+    """True only for a year/category selector, never for an event identity."""
+    q = qn(line)
+    return bool(_YEAR_NAV_ENTRY[bucket].match(q) or _COMBINED_YEAR_NAV_ENTRY.match(q))
+
+
+def _negative_event_context(lines: list[str], idx: int) -> bool:
+    context = "\n".join(lines[idx:min(len(lines), idx + 3)])
+    return bool(_NEGATIVE_EVENT.search(qn(context)))
+
+
+def _line_is_event_entry(lines: list[str], idx: int, bucket: str) -> bool:
+    """Recognise one visible event row/title, excluding menu and loose documents."""
+    line = lines[idx]
+    q = qn(line)
+    event_q = re.sub(r"^\d{1,2}\s*/\s*\d{1,2}\s*/\s*20[12]\d\s*[|:-]\s*", "", q)
+    event_q = re.sub(r"^\d{1,4}\s*[/\-]\s*20[12]\d\s*[|:-]\s*", "", event_q)
+    other = "processos" if bucket == "concursos" else "concursos"
+    if not q or not _EVENT_LINE_START[bucket].search(event_q):
+        return False
+    if _DEFINITION_SENTENCE.search(q):
+        return False
+    if _KW[other].search(q) and not _KW[bucket].search(q):
+        return False
+    if (_CULTURAL.search(q) or _FOREIGN.search(line)
+            or _NON_EVENT_PUBLICATION.search(q)):
+        return False
+    if _year_navigation_entry(q, bucket) or _negative_event_context(lines, idx):
+        return False
+    if _is_navigation_cluster(lines, idx):
+        return False
+    if _accessory_doc(line):
+        return False
+    if (_strong_line_binding(line) or _num_key(q)
+            or _title_only_parent_key(line, bucket, other)
+            or _OPENING_DOC.search(q)):
+        return True
+    # An unnumbered event title can still be an entry when it names its object or
+    # role (rather than merely saying "Processo Seletivo").
+    return bool(re.search(r"\b(?:para|de)\s+[a-z][a-z0-9 ]{3,}", q))
+
+
+def _has_bucket_card_row(lines: list[str], bucket: str) -> bool:
+    """Detect a repeated portal card whose explicit modalidade binds the row."""
+    for idx, line in enumerate(lines):
+        q = qn(line)
+        if not re.search(r"\bmodalidade\s*:\s*", q):
+            continue
+        if not _KW[bucket].search(q) or _CULTURAL.search(q):
+            continue
+        row = "\n".join(lines[max(0, idx - 7):min(len(lines), idx + 7)])
+        if _num_key(qn(row)) and _LISTING_CONTEXT.search(qn(row)):
+            return True
+    return False
+
+
+def _is_year_navigation_shell(text: str, bucket: str) -> bool:
+    """Year/category links without any visible event row are navigation only."""
+    lines = (text or "").splitlines()
+    has_year_link = any(_year_navigation_entry(line, bucket) for line in lines)
+    has_event_row = any(
+        _line_is_event_entry(lines, idx, bucket) for idx in range(len(lines))
+    )
+    has_numbered_target = any(
+        _KW[bucket].search(qn(line)) and _num_key(qn(line))
+        and not _CULTURAL.search(qn(line)) and not _NON_EVENT_PUBLICATION.search(qn(line))
+        and not _is_navigation_cluster(lines, idx)
+        for idx, line in enumerate(lines)
+    )
+    return bool(
+        has_year_link and not has_event_row and not has_numbered_target
+        and not _has_bucket_card_row(lines, bucket)
+    )
+
+
+def _declares_no_events(text: str, bucket: str) -> bool:
+    """The page explicitly states that no target event was published/held."""
+    return any(
+        _KW[bucket].search(qn(line)) and _NEGATIVE_EVENT.search(qn(line))
+        for line in (text or "").splitlines()
+    )
+
+
+def _target_number_keys(text: str, bucket: str) -> set[tuple[str, str]]:
+    """Distinct target bindings visible outside navigation chrome."""
+    lines = (text or "").splitlines()
+    keys: set[tuple[str, str]] = set()
+    for idx, line in enumerate(lines):
+        q = qn(line)
+        if (not _KW[bucket].search(q) or _is_navigation_cluster(lines, idx)
+                or _CULTURAL.search(q) or _NON_EVENT_PUBLICATION.search(q)):
+            continue
+        for match in _NUM.finditer(q):
+            keys.add((match.group(1).lstrip("0") or "0", match.group(2)))
+    return keys
+
+
+def has_event_listing(text: str, bucket: str, *, title: str = "",
+                      anchors: list | None = None, items: list | None = None,
+                      extracted_certames: set | None = None) -> bool:
+    """Return whether the page visibly enumerates at least one target event.
+
+    An event entry is a row/title for one concurso/PSS with an event identity or
+    object, or a portal card explicitly bound by ``Modalidade``. PDF/anexo links,
+    lifecycle documents, navigation/year filters, procurement and cultural
+    contests do not count. One qualifying entry is sufficient.
+    """
+    del items  # LLM transcription is supportive; visible structure is authoritative.
+    bnorm = _bucket_name(bucket)
+    listing_shell = _has_listing_shell(text, anchors)
+    if _is_news_article(text, title, listing_shell):
+        return False
+    lines = (text or "").splitlines()
+    if listing_shell:
+        other = "processos" if bnorm == "concursos" else "concursos"
+        for idx, line in enumerate(lines):
+            q = qn(line)
+            if (not _KW[bnorm].search(q) or not _num_key(q)
+                    or (_KW[other].search(q) and not _KW[bnorm].search(q))
+                    or _CULTURAL.search(q) or _NON_EVENT_PUBLICATION.search(q)
+                    or _negative_event_context(lines, idx) or _accessory_doc(line)):
+                continue
+            return True
+    if _has_bucket_card_row(lines, bnorm):
+        return True
+    event_entries = [
+        idx for idx in range(len(lines)) if _line_is_event_entry(lines, idx, bnorm)
+    ]
+    entries = bool(event_entries)
+    other = "processos" if bnorm == "concursos" else "concursos"
+    if not entries and _title_mentions_bucket(title, bnorm) and not _title_mentions_bucket(title, other):
+        entries = any(
+            _OPENING_DOC.search(qn(line)) and _num_key(qn(line))
+            and not _accessory_doc(line) and not _is_navigation_cluster(lines, idx)
+            for idx, line in enumerate(lines)
+        )
+    if not entries:
+        title_is_opposite = (
+            _title_mentions_bucket(title, other)
+            and not _title_mentions_bucket(title, bnorm)
+        )
+        repeated_target_rows = len(_target_number_keys(text, bnorm)) >= 2
+        has_repeated_extracted_events = bool(
+            extracted_certames and len(extracted_certames) >= 2
+        )
+        if (has_repeated_extracted_events and (not title_is_opposite or repeated_target_rows)
+                and not _declares_no_events(text, bnorm)
+                and not _is_year_navigation_shell(text, bnorm)):
+            return True
+        return False
+    # A lone event link under a page that explicitly declares only the opposite
+    # bucket is navigation to a sibling, not proof that this page is its index.
+    if _title_mentions_bucket(title, other) and not _title_mentions_bucket(title, bnorm):
+        return len(event_entries) >= 2
+    return True
+
+
+def is_single_article(text: str, title: str, *, has_listing: bool) -> bool:
+    """Conclusive news/article form: dated editorial body without event rows."""
+    listing_shell = _has_listing_shell(text, None)
+    if _is_news_article(text, title, listing_shell):
+        return True
+    q = qn(text or "")
+    editorial_chrome = "compartilhe" in q and (
+        "veja tambem" in q or "noticias relacionadas" in q or "credito da noticia" in q
+    )
+    dated_body = bool(_ARTICLE_DATE.search(q) and re.search(r"\b\d{1,2}:\d{2}\b", q))
+    if editorial_chrome and dated_body and not listing_shell:
+        return True
+    if has_listing:
+        return False
+    return False
+
+
+def _governing_event_parents(text: str, bucket: str) -> set[tuple[str, str]]:
+    lines = (text or "").splitlines()
+    other = "processos" if bucket == "concursos" else "concursos"
+    parents: set[tuple[str, str]] = set()
+    for idx, line in enumerate(lines):
+        q = qn(line)
+        if not q or not _KW[bucket].search(q) or _KW[other].search(q):
+            continue
+        if (_CULTURAL.search(q) or _NON_EVENT_PUBLICATION.search(q)
+                or _negative_event_context(lines, idx)):
+            continue
+        if _accessory_doc(line):
+            continue
+        key = _num_key(q) or _title_only_parent_key(line, bucket, other)
+        if key:
+            parents.add(key)
+    numbered_years = {year for number, year in parents if number != "Y"}
+    parents = {
+        key for key in parents
+        if not (key[0] == "Y" and key[1] in numbered_years)
+    }
+    return parents
+
+
+def is_single_event_document_detail(text: str, bucket: str, *, title: str = "",
+                                    anchors: list | None = None) -> bool:
+    """Detect one governing certame heading followed by its document children."""
+    bnorm = _bucket_name(bucket)
+    other = "processos" if bnorm == "concursos" else "concursos"
+    lines = (text or "").splitlines()
+    if _has_bucket_card_row(lines, bnorm):
+        return False
+    expandable_parent_rows = 0
+    for idx, line in enumerate(lines):
+        if not _KW[bnorm].search(qn(line)):
+            continue
+        following = [qn(x) for x in lines[idx + 1:min(len(lines), idx + 4)] if qn(x)]
+        if any(x == "ver anexos" for x in following):
+            expandable_parent_rows += 1
+    if expandable_parent_rows >= 2:
+        return False
+    visible_event_rows = [
+        idx for idx in range(len(lines)) if _line_is_event_entry(lines, idx, bnorm)
+    ]
+    if len(visible_event_rows) >= 2:
+        return False
+    explicit_document_section = any(_DETAIL_SECTION.match(qn(line)) for line in lines)
+    title_names_one_event = bool(
+        _title_only_parent_key(title, bnorm, other) or (
+            _KW[bnorm].search(qn(title or "")) and _num_key(qn(title or ""))
+        )
+    )
+    if not explicit_document_section and not title_names_one_event:
+        return False
+    parents = _governing_event_parents(text, bnorm)
+    if len(parents) != 1:
+        return False
+    visible_children = bool(_DOC_ACCESSORY_SIGNAL.search(qn(text or "")))
+    linked_children = any(
+        _DOC_ACCESSORY_SIGNAL.search(qn(str(anchor.get("text", ""))))
+        for anchor in (anchors or []) if isinstance(anchor, dict)
+    )
+    downloadable_children = bool(
+        re.search(r"\bbaixar\s+agora\b", qn(text or ""))
+        and re.search(r"downloads?\s+de\s+documentos?", qn(text or ""))
+    )
+    return bool(visible_children or linked_children or downloadable_children)
+
+
+def content_complete(text: str, title: str = "") -> bool:
+    """Content was structurally recovered and is not a visible error/challenge."""
+    if not (text or "").strip() or (text or "").count("\n") < 3:
+        return False
+    return not _INCOMPLETE_CONTENT.search(qn(f"{title}\n{text}"))
+
+
+def candidate_content_state(text: str, bucket: str, *, title: str = "",
+                            anchors: list | None = None,
+                            items: list | None = None,
+                            extracted_certames: set | None = None) -> tuple[str, dict[str, bool]]:
+    """Boolean state table for the final candidate acceptance gate."""
+    listing = has_event_listing(
+        text, bucket, title=title, anchors=anchors, items=items,
+        extracted_certames=extracted_certames)
+    article = is_single_article(text, title, has_listing=listing)
+    detail = is_single_event_document_detail(
+        text, bucket, title=title, anchors=anchors)
+    complete = content_complete(text, title)
+    predicates = {
+        "has_event_listing": listing,
+        "is_single_article": article,
+        "is_single_event_document_detail": detail,
+        "content_complete": complete,
+    }
+    if article or detail:
+        return "detalle_individual_rechazado", predicates
+    if listing and not article and not detail:
+        return "indice_oficial", predicates
+    if not listing and complete:
+        return "nao_encontrado", predicates
+    if not listing and not complete:
+        return "revisar", predicates
+    return "revisar", predicates
+
+
 def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
                anchors: list | None = None, title: str = "") -> tuple[str, dict]:
     """Decide 'confirmar'|'revisar' sobre la evidencia extraída. Devuelve
@@ -984,25 +1325,6 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
     item_here = item_other = 0
     lines = (text or "").splitlines()
     listing_shell = _has_listing_shell(text, anchors)
-    if _is_news_article(text, title, listing_shell):
-        ev = {
-            "n_certames": 0,
-            "certames": [],
-            "verif": 0, "off_type": 0,
-            "ciclo": 0, "ajenos": 0, "piso": 0,
-            "binding_piso": 0, "meta_floor": 0,
-            "strong_floor": 0, "number_meta_floor": 0,
-            "title_floor": 0,
-            "piso_blocked": False, "item_here": 0,
-            "item_other": 0,
-            "title_declares": title_declares,
-            "listing_shell": listing_shell,
-            "listing_declares": False,
-            "estado": "revisar",
-            "motivo": "nota de prensa/noticia individual, no indice",
-            "motivo_code": "revisar_sem:noticia",
-        }
-        return "revisar", ev
     for it in items or []:
         cita = it.get("cita", "")
         if not cita:
@@ -1257,24 +1579,29 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         "listing_shell": listing_shell,
     }
     ev["listing_declares"] = _listing_declares_bucket(title, bnorm, other, title_declares)
-    if len(certames) >= 2:
+    state, predicates = candidate_content_state(
+        text, bnorm, title=title, anchors=anchors, items=items,
+        extracted_certames=certames)
+    ev.update(predicates)
+    ev["estado"] = state
+    if state == "indice_oficial":
         return "confirmar", ev
-    if len(certames) == 1 and ev["listing_shell"]:
-        ev["estado"] = "revisar_certame_unico"
-        ev["motivo"] = "indice con estructura de listado pero un solo certame"
-        ev["motivo_code"] = "revisar_sem:certame_unico"
+    if state == "detalle_individual_rechazado":
+        if predicates["is_single_article"]:
+            ev["motivo"] = "nota de prensa/noticia individual, no indice"
+            ev["motivo_code"] = "revisar_sem:noticia"
+        else:
+            ev["motivo"] = "detalle de un solo certame con sus documentos"
+            ev["motivo_code"] = "revisar_sem:detalle_individual"
         return "revisar", ev
-    if len(certames) == 1:
-        ev["estado"] = "revisar"
-        ev["motivo"] = "un solo certame (posible detalle)"
-        ev["motivo_code"] = "revisar_sem:certame_unico"
+    if state == "nao_encontrado":
+        ev["motivo"] = "contenido completo sin entrada visible de certame"
+        ev["motivo_code"] = "revisar_sem:sin_listado"
         return "revisar", ev
     if n_ajeno and not certames:
-        ev["estado"] = "revisar"
         ev["motivo"] = "solo editais de emisor ajeno"
         ev["motivo_code"] = "revisar_sem:emisor_ajeno"
         return "revisar", ev
-    ev["estado"] = "revisar"
-    ev["motivo"] = "0 certames del tipo alvo"
-    ev["motivo_code"] = "revisar_sem:0_certames"
+    ev["motivo"] = "contenido incompleto o combinacion estructural no concluyente"
+    ev["motivo_code"] = "revisar_op:contenido_incompleto"
     return "revisar", ev
