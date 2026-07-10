@@ -431,6 +431,23 @@ def score_site_page(page: Page, municipio: str) -> int:
     return score
 
 
+def is_matching_official_municipality_domain(page: Page, municipio: str) -> bool:
+    """Confirm an official RS host whose municipal label matches the municipality.
+
+    Some official homes return a generic client-rendered shell, so their static
+    HTML has neither the municipality name nor ``prefeitura``. Domain confirmation
+    must not confuse that missing rendered content with a missing site.
+    """
+    if is_soft_404(page) or is_dead_site(page):
+        return False
+    host = (urlparse(page.url).hostname or "").lower().rstrip(".")
+    suffix = ".rs.gov.br"
+    if not host.endswith(suffix):
+        return False
+    municipal_labels = host[:-len(suffix)].split(".")
+    return slugify(municipio) in municipal_labels
+
+
 def tier0_find_site(session: requests.Session, municipio: str,
                     timeout: int = 15) -> Page | None:
     candidates = domain_candidates(municipio)
@@ -444,7 +461,8 @@ def tier0_find_site(session: requests.Session, municipio: str,
         if score > best_score:
             best_score = score
             best = page
-    if best and best_score >= 5:
+    if best and (best_score >= 5
+                 or is_matching_official_municipality_domain(best, municipio)):
         migrated = _check_migration(session, best, timeout)
         if migrated:
             return migrated
@@ -1051,7 +1069,8 @@ def tier2_find_site_grounded(session: requests.Session, model: str,
         if score > best_score:
             best_score = score
             best = page
-    if best and best_score >= 5:
+    if best and (best_score >= 5
+                 or is_matching_official_municipality_domain(best, municipio)):
         migrated = _check_migration(session, best, timeout)
         return migrated or best
     return None
