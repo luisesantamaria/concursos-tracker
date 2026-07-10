@@ -57,6 +57,7 @@ if hasattr(sys.stderr, "reconfigure"):
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "shared"))
 import waf_guard  # noqa: E402
+from browser_profile import REQUEST_HEADERS  # noqa: E402
 from playwright_net import new_context as new_browser_context  # noqa: E402
 
 DEFAULT_MUNICIPIOS_URL = "https://dados.tce.rs.gov.br/dados/auxiliar/municipios.csv"
@@ -135,14 +136,7 @@ class Page:
 # ---------------------------------------------------------------------------
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.5",
-    })
+    s.headers.update(REQUEST_HEADERS)
     return s
 
 
@@ -208,7 +202,8 @@ def _fetch_browser_impersonate(url: str, timeout: int) -> Page | None:
             proxies[scheme] = val
     try:
         resp = creq.get(url, timeout=timeout, allow_redirects=True,
-                        impersonate="chrome", proxies=proxies or None)
+                        headers=REQUEST_HEADERS, impersonate="chrome",
+                        proxies=proxies or None)
         return _page_from_html(
             str(resp.url), resp.status_code,
             resp.headers.get("content-type", ""), resp.text)
@@ -1525,6 +1520,8 @@ def _get_browser():
             "--disable-background-networking",
             "--disable-component-update",
             "--no-pings",
+            "--disable-blink-features=AutomationControlled",
+            "--lang=pt-BR",
         ]
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if proxy_url:
@@ -1563,10 +1560,6 @@ def _render_page_links(url: str, timeout: int = 20) -> list[tuple[str, str]]:
     try:
         context = new_browser_context(
             browser,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
             ignore_https_errors=True,
         )
         page = context.new_page()
@@ -1614,10 +1607,6 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
     try:
         context = new_browser_context(
             browser,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
             ignore_https_errors=True,
         )
         page = context.new_page()
@@ -1763,7 +1752,7 @@ def _render_text(url: str, timeout: int = 20) -> str:
         return ""
     ctx = None
     try:
-        ctx = browser.new_context(ignore_https_errors=True)
+        ctx = new_browser_context(browser, ignore_https_errors=True)
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         page.wait_for_timeout(2500)

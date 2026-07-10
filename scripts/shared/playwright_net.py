@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+from browser_profile import (
+    HUMAN_BROWSER_INIT_SCRIPT,
+    PLAYWRIGHT_CONTEXT_OPTIONS,
+    PLAYWRIGHT_EXTRA_HTTP_HEADERS,
+)
 
 _BLOCK_RESOURCE_TYPES = {"image", "media", "font"}
 _TRACKER_HOST_MARKERS = (
@@ -44,6 +49,12 @@ def install_resource_blocking(context) -> None:
 
 
 def new_context(browser, **kwargs):
-    ctx = browser.new_context(**kwargs)
+    context_options = dict(PLAYWRIGHT_CONTEXT_OPTIONS)
+    extra_headers = dict(PLAYWRIGHT_EXTRA_HTTP_HEADERS)
+    extra_headers.update(kwargs.pop("extra_http_headers", {}))
+    context_options.update(kwargs)
+    context_options["extra_http_headers"] = extra_headers
+    ctx = browser.new_context(**context_options)
+    ctx.add_init_script(HUMAN_BROWSER_INIT_SCRIPT)
     install_resource_blocking(ctx)
     return ctx
