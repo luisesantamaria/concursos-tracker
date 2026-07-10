@@ -11,7 +11,7 @@ costlier than Tier 3 (verifier), so it actually runs AFTER Tier 3. What each doe
     Tier 2 — Grounded search: Gemini + Google Search (only if still missing).
     Tier 3 — Gemini verifier/selector: classifies candidates with discrete
              decisions (indice_oficial, detalle_rechazado, licitacao_rechazada,
-             etc.) and picks best among valid ones (ai_pick_best).
+             etc.) and picks the best among valid candidates by content.
     Tier 4 — Playwright navigation agent: directed menu navigation as last resort.
 
 ACTUAL RUN ORDER per municipality (each step runs ONLY if buckets remain empty —
@@ -19,12 +19,10 @@ spend expensive tools only when cheap ones fail):
     1. Tier 0           · Site oficial (free slug; grounded discovery if it misses)
     2. Tier 1           · Free links (renders the menu first if the site is a SPA)
     3. Tier 3           · AI classifies Tier 1 candidates, picks the best index
-    4. Combined fill    · if one bucket filled, lend its URL to the other when the
-                          page lists BOTH types (signal + >=2 listing items)
-    5. Tier 2           · Grounded Google search for the missing bucket -> Tier 3
-    6. Directed grounding · "site:host {tipo}" per missing bucket -> Tier 3
-    7. Tier 4           · Playwright navigates the menus as a human -> Tier 3
-    8. (after ALL municipios) Batch verify the 'probable' URLs; then Grounded
+    4. Tier 2           · Grounded Google search for the missing bucket -> Tier 3
+    5. Directed grounding · "site:host {tipo}" per missing bucket -> Tier 3
+    6. Tier 4           · Playwright navigates the menus as a human -> Tier 3
+    7. (after ALL municipios) Batch verify the 'probable' URLs; then Grounded
        verify those whose preview was empty (Cloudflare/SPA), reading Google's
        index with a guardrail (>=1 chunk + evidence) against false positives.
 
@@ -47,7 +45,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import parse_qsl, urljoin, urlparse, unquote
 
 import requests
 
@@ -365,6 +363,28 @@ class Candidate:
     page: Page | None = None
     fetchable: bool = True
     content_preview: str = ""
+    # Discovery hint only. It records which bucket led us to the candidate so
+    # an uncertain classification can be returned to that bucket for review.
+    # It never decides the final bucket; forma/tipo from page content do that.
+    bucket_hint: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.bucket_hint:
+            self.bucket_hint = _discovery_bucket_hint(self.menu_text, self.url)
+
+
+def _discovery_bucket_hint(menu_text: str, url: str) -> str:
+    """Infer only the discovery origin; never the candidate's final bucket."""
+    discovery_text = norm(f"{menu_text} {unquote(urlparse(url).path)}")
+    matched = {
+        bucket for bucket, keywords in BUCKET_KEYWORDS.items()
+        if any(keyword in discovery_text for keyword in keywords)
+    }
+    if len(matched) == 1:
+        return next(iter(matched))
+    if len(matched) > 1:
+        return "ambos"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1094,7 +1114,11 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
             h = urlparse(real).netloc.lower()
             if _host_ok(h) and not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(real):
                 seen.add(real)
-                candidates.append(Candidate(url=real, source="directed_grounding"))
+                candidates.append(Candidate(
+                    url=real, source="directed_grounding",
+                    bucket_hint=("concursos" if "concurso" in norm(bucket_name)
+                                 else "processos"),
+                ))
 
     for raw in re.findall(r"https?://[^\s\]\)\"'<>]+", text_response or ""):
         url = clean_url(raw.rstrip(".,;:"))
@@ -1102,7 +1126,11 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
             h = urlparse(url).netloc.lower()
             if _host_ok(h) and not any(bad in h for bad in BAD_HOSTS) and not is_pdf_or_file(url):
                 seen.add(url)
-                candidates.append(Candidate(url=url, source="directed_grounding"))
+                candidates.append(Candidate(
+                    url=url, source="directed_grounding",
+                    bucket_hint=("concursos" if "concurso" in norm(bucket_name)
+                                 else "processos"),
+                ))
 
     print(f"      directed: {len(candidates)} candidates for {bucket_name}", flush=True)
 
@@ -1136,25 +1164,234 @@ TIER3_DECISIONS = [
     "revisar",
 ]
 
+CONTENT_FORMAS = {"indice", "detalle", "noticia", "cultural", "incierto"}
+CONTENT_TIPOS = {"concurso", "pss", "mixto", "incierto"}
+
+
+def _empty_tier3_result() -> dict:
+    return {
+        "url_concursos": "",
+        "url_processos_seletivos": "",
+        "decision_concursos": "nao_encontrado",
+        "decision_processos": "nao_encontrado",
+        "classificacoes": [],
+        "classification_complete": False,
+        "razao": "",
+    }
+
+
+def _normalized_candidate_url(url: str) -> str:
+    """Canonical key for candidate collision handling, not a quality signal."""
+    parsed = urlparse(clean_url(url))
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (parsed.path or "").rstrip("/")
+    query = "&".join(
+        f"{key.lower()}={value}" for key, value in
+        sorted(parse_qsl(parsed.query, keep_blank_values=True))
+    )
+    base = f"{host}{path}"
+    return f"{base}?{query}" if query else base
+
+
+def _classification_decision(forma: str, tipo: str) -> str:
+    """Apply the content contract precedence to one candidate."""
+    if forma == "cultural":
+        return "concurso_cultural_rechazado"
+    if forma in {"detalle", "noticia"}:
+        return "detalle_individual_rechazado"
+    if forma != "indice":
+        return "revisar"
+    if tipo == "mixto":
+        return "indice_oficial_combinado"
+    if tipo in {"concurso", "pss"}:
+        return "indice_oficial"
+    return "revisar"
+
+
+def _hint_buckets(candidate: Candidate) -> list[str]:
+    if candidate.bucket_hint == "concursos":
+        return ["concursos"]
+    if candidate.bucket_hint == "processos":
+        return ["processos"]
+    if candidate.bucket_hint == "ambos":
+        return ["concursos", "processos"]
+    return []
+
+
+def _route_classified_candidates(
+        candidates: list[Candidate], classifications: list[dict],
+        selector_picks: dict[str, int | None] | None = None) -> dict:
+    """Route verified candidates by forma/tipo, then dedupe and select.
+
+    URL/menu hints only identify the discovery origin for honest review states.
+    They do not participate in the final bucket assignment.
+    """
+    result = _empty_tier3_result()
+    selector_picks = selector_picks or {}
+    by_id = {idx: candidate for idx, candidate in enumerate(candidates)}
+    pools: dict[str, list[tuple[int, Candidate, str]]] = {
+        "concursos": [], "processos": [],
+    }
+    decisions = {"concursos": "nao_encontrado", "processos": "nao_encontrado"}
+    decision_priority = {
+        "nao_encontrado": 0,
+        "concurso_cultural_rechazado": 1,
+        "detalle_individual_rechazado": 1,
+        "revisar": 2,
+    }
+    routed: list[dict] = []
+    classified_ids: set[int] = set()
+    route_notes: list[str] = []
+
+    def mark(bucket: str, decision: str) -> None:
+        if decision_priority.get(decision, 0) > decision_priority.get(decisions[bucket], 0):
+            decisions[bucket] = decision
+
+    for raw in classifications:
+        try:
+            candidate_id = int(raw.get("id"))
+        except (TypeError, ValueError):
+            continue
+        candidate = by_id.get(candidate_id)
+        if candidate is None or candidate_id in classified_ids:
+            continue
+        classified_ids.add(candidate_id)
+        forma = str(raw.get("forma", "incierto")).strip().lower()
+        tipo = str(raw.get("tipo", "incierto")).strip().lower()
+        if forma not in CONTENT_FORMAS:
+            forma = "incierto"
+        if tipo not in CONTENT_TIPOS:
+            tipo = "incierto"
+        decision = _classification_decision(forma, tipo)
+        routed.append({
+            "id": candidate_id,
+            "url": candidate.url,
+            "bucket_hint": candidate.bucket_hint,
+            "forma": forma,
+            "tipo": tipo,
+            "decision_code": decision,
+            "razao": str(raw.get("razao", ""))[:240],
+        })
+
+        # Strict precedence: rejected or uncertain forms never enter a bucket
+        # pool and therefore can never be reassigned as the "opposite" type.
+        if decision in {
+            "concurso_cultural_rechazado",
+            "detalle_individual_rechazado",
+            "revisar",
+        }:
+            route_notes.append(f"candidate {candidate_id}: {decision}")
+            hinted = _hint_buckets(candidate)
+            # An originless uncertain classification must remain honest in both
+            # buckets. Rejections still expose their candidate decision_code,
+            # but cannot be silently promoted through an assumed bucket.
+            affected = (
+                ["concursos", "processos"]
+                if decision == "revisar" and not hinted else hinted
+            )
+            for bucket in affected:
+                mark(bucket, decision)
+            continue
+
+        if tipo == "mixto":
+            destination_buckets = ["concursos", "processos"]
+        elif tipo == "concurso":
+            destination_buckets = ["concursos"]
+        else:
+            destination_buckets = ["processos"]
+        for bucket in destination_buckets:
+            pools[bucket].append((candidate_id, candidate, decision))
+
+        hints = _hint_buckets(candidate)
+        if len(hints) == 1 and hints[0] not in destination_buckets:
+            route_notes.append(
+                f"candidate {candidate_id} reassigned {hints[0]}→{destination_buckets[0]} by content"
+            )
+
+    # An omitted/malformed classification is uncertainty, not permission to
+    # infer the bucket from the URL. Keep it attached only to its discovery
+    # origin; an originless candidate makes both outputs reviewable.
+    for candidate_id, candidate in by_id.items():
+        if candidate_id in classified_ids:
+            continue
+        buckets = _hint_buckets(candidate) or ["concursos", "processos"]
+        for bucket in buckets:
+            mark(bucket, "revisar")
+
+    for bucket, entries in pools.items():
+        deduped: dict[str, tuple[int, Candidate, str]] = {}
+        id_to_key: dict[int, str] = {}
+        for entry in entries:
+            key = _normalized_candidate_url(entry[1].url)
+            id_to_key[entry[0]] = key
+            deduped.setdefault(key, entry)
+
+        selected: tuple[int, Candidate, str] | None = None
+        if len(deduped) == 1:
+            selected = next(iter(deduped.values()))
+        elif len(deduped) > 1:
+            raw_pick = selector_picks.get(bucket)
+            try:
+                picked_id = int(raw_pick) if raw_pick is not None else None
+            except (TypeError, ValueError):
+                picked_id = None
+            picked_key = id_to_key.get(picked_id) if picked_id is not None else None
+            if picked_key in deduped:
+                selected = deduped[picked_key]
+            else:
+                mark(bucket, "revisar")
+                route_notes.append(f"{bucket}: selector did not choose among valid candidates")
+
+        if selected:
+            _, candidate, decision = selected
+            if bucket == "concursos":
+                result["url_concursos"] = candidate.url
+            else:
+                result["url_processos_seletivos"] = candidate.url
+            decisions[bucket] = decision
+
+    result["decision_concursos"] = decisions["concursos"]
+    result["decision_processos"] = decisions["processos"]
+    result["classificacoes"] = routed
+    result["classification_complete"] = len(classified_ids) == len(by_id)
+    result["razao"] = "; ".join(route_notes)
+    return result
+
 
 def tier3_classify_and_pick(session: requests.Session, model: str,
                             municipio: str, candidates: list[Candidate],
-                            timeout: int = 30) -> dict[str, str]:
-    """Send all candidates to Gemini for classification and selection.
+                            timeout: int = 30) -> dict:
+    """Classify every candidate by content, route it, then validate selection.
 
-    Returns dict with keys 'url_concursos' and 'url_processos_seletivos',
-    each either a URL string or empty string.
+    Classification and selection share the existing single Gemini call; this
+    exposes forma/tipo without adding a network call.
     """
     if not candidates:
-        return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
+        return _empty_tier3_result()
 
     fetchable = [c for c in candidates if c.fetchable and c.page]
     if not fetchable:
-        return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
+        return _empty_tier3_result()
 
     items = []
-    for i, c in enumerate(fetchable[:15]):
-        preview = re.sub(r"[\x00-\x1f]+", " ", c.content_preview[:600])
+    for i, c in enumerate(fetchable):
+        # The removed combined-fill rendered SPA/thin pages and inspected up to
+        # 4k of visible content. Preserve that evidence here so forma/tipo can
+        # classify a genuine mixed index without a post-selection shortcut.
+        classification_text = c.content_preview or (c.page.text if c.page else "")
+        if c.page and (c.page.is_spa or len((c.page.text or "").strip()) < 500):
+            rendered = _render_text(c.url)
+            if len(rendered) > len(classification_text):
+                classification_text = rendered
+        preview = re.sub(r"[\x00-\x1f]+", " ", classification_text[:4000])
+        link_samples = []
+        if c.page:
+            for _href, text in c.page.links[:12]:
+                label = re.sub(r"\s+", " ", text or "").strip()
+                if label:
+                    link_samples.append(label[:100])
         items.append({
             "id": i,
             "url": c.url,
@@ -1162,14 +1399,26 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
             "source": c.source,
             "title": (c.page.title if c.page else "")[:120],
             "content_preview": preview,
+            "link_samples": link_samples[:8],
         })
 
     prompt = (
         f"Prefeitura de {municipio} ({UF_NOME}, {UF_SIGLA}). "
-        f"Analise {len(items)} URLs candidatas e escolha a melhor pagina-INDICE "
-        f"(listagem de VARIOS editais) para concursos publicos e para processos seletivos (PSS).\n\n"
-        "Regras:\n"
-        "- Queremos pagina INDICE/LISTAGEM, NAO edital individual, PDF ou noticia.\n"
+        f"Classifique por CONTEUDO as {len(items)} candidatas e depois escolha a "
+        "melhor candidata elegivel para cada bucket. A URL e apenas identificador: "
+        "NAO use slug/caminho para decidir forma ou tipo.\n\n"
+        "Para CADA candidata devolva duas dimensoes discretas:\n"
+        "- forma: indice | detalle | noticia | cultural | incierto\n"
+        "- tipo: concurso | pss | mixto | incierto\n\n"
+        "Precedencia obrigatoria:\n"
+        "1. cultural sempre e rejeitada, nunca realocada.\n"
+        "2. detalle/noticia sempre e rejeitada: um edital, noticia ou registro unico "
+        "nao e indice, mesmo com PDF ou numa SPA.\n"
+        "3. forma incierto exige revisao; nao presuma o tipo oposto.\n"
+        "4. So forma=indice, comprovada por listagem navegavel de MULTIPLOS itens, "
+        "pode entrar nos buckets. Depois use tipo: mixto serve ambos; concurso ou pss "
+        "serve somente o bucket correspondente; tipo incierto exige revisao.\n\n"
+        "Regras do seletor (somente candidatas forma=indice e tipo compativel):\n"
         "- Prefira o INDICE CANONICO: a listagem mais ampla e estavel. Entre uma\n"
         "  vista de TODOS os anos e uma filtrada por um ano so, escolha a de todos\n"
         "  os anos.\n"
@@ -1180,7 +1429,7 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         "  o tipo desejado, mesmo que tenha menos itens.\n"
         "- Se duas sao parecidas, escolha a mais completa e atualizada.\n"
         "- Rejeite licitacao/pregao/compras e concurso cultural (soberanas/rainhas).\n"
-        "- Se nenhuma serve, deixe vazio. NAO invente URLs.\n\n"
+        "- Se nenhuma serve, use null. NAO invente IDs nem URLs.\n\n"
         "Candidatos:\n"
     )
     for item in items:
@@ -1188,13 +1437,14 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
             f"  [{item['id']}] {item['url']}\n"
             f"      menu: {item['menu_text']}\n"
             f"      title: {item['title']}\n"
-            f"      preview: {item['content_preview'][:300]}\n\n"
+            f"      preview: {item['content_preview']}\n"
+            f"      links_visiveis: {item['link_samples']}\n\n"
         )
     prompt += (
-        "Responda JSON com as URLs PRIMEIRO e a razao por ultimo "
-        "(uma frase curta, max 20 palavras): "
-        "{\"url_concursos\": \"url ou vazio\", "
-        "\"url_processos_seletivos\": \"url ou vazio\", \"razao\": \"curto\"}"
+        "Responda JSON: {\"classificacoes\":[{\"id\":0,\"forma\":\"...\","
+        "\"tipo\":\"...\",\"razao\":\"curta\"}],"
+        "\"melhor_id_concursos\":0 ou null,\"melhor_id_processos\":1 ou null,"
+        "\"razao\":\"curta\"}. Classifique TODOS os IDs."
     )
 
     payload = {
@@ -1209,51 +1459,36 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         text = "\n".join(
             p.get("text", "") for p in data["candidates"][0]["content"]["parts"]
         )
-        # Try direct parse; if truncated, attempt repair
         try:
             result = json.loads(text)
         except json.JSONDecodeError:
-            # Try extracting URLs even from truncated JSON
-            url_c_m = re.search(r'"url_concursos"\s*:\s*"(https?://[^"]+)"', text)
-            url_p_m = re.search(r'"url_processos_seletivos"\s*:\s*"(https?://[^"]+)"', text)
-            if url_c_m or url_p_m:
-                result = {
-                    "url_concursos": url_c_m.group(1) if url_c_m else "",
-                    "url_processos_seletivos": url_p_m.group(1) if url_p_m else "",
-                }
-                print(f"      tier3: recovered from truncated JSON", flush=True)
-            else:
-                print(f"      tier3: no valid JSON: {text[:300]}", flush=True)
-                return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
+            print(f"      tier3: no valid JSON: {text[:300]}", flush=True)
+            return _empty_tier3_result()
 
-        url_c = result.get("url_concursos", "")
-        url_p = result.get("url_processos_seletivos", "")
+        routed = _route_classified_candidates(
+            fetchable,
+            result.get("classificacoes") or [],
+            {
+                "concursos": result.get("melhor_id_concursos"),
+                "processos": result.get("melhor_id_processos"),
+            },
+        )
+        ai_reason = str(result.get("razao", "")).strip()
+        routed["razao"] = " | ".join(filter(None, [routed["razao"], ai_reason]))
 
-        # Validate that chosen URLs are actually in our candidate list
-        valid_urls = {c.url for c in fetchable}
-        if url_c and url_c not in valid_urls:
-            print(f"      ! url_concursos not in candidates, rejected: {url_c[:80]}", flush=True)
-            url_c = ""
-        if url_p and url_p not in valid_urls:
-            print(f"      ! url_processos not in candidates, rejected: {url_p[:80]}", flush=True)
-            url_p = ""
-
-        razao = result.get("razao", "")
-        if url_c:
-            print(f"      → concursos: {url_c}", flush=True)
-        if url_p:
-            print(f"      → processos: {url_p}", flush=True)
-        if razao:
-            print(f"      razao: {razao}", flush=True)
-        if not url_c and not url_p:
+        if routed["url_concursos"]:
+            print(f"      → concursos: {routed['url_concursos']}", flush=True)
+        if routed["url_processos_seletivos"]:
+            print(f"      → processos: {routed['url_processos_seletivos']}", flush=True)
+        if routed["razao"]:
+            print(f"      razao: {routed['razao']}", flush=True)
+        if not routed["url_concursos"] and not routed["url_processos_seletivos"]:
             print(f"      → nenhuma URL valida", flush=True)
-
-        return {"url_concursos": url_c, "url_processos_seletivos": url_p,
-                "razao": razao}
+        return routed
 
     except Exception as e:
         print(f"      tier3 parse error: {e}", flush=True)
-        return {"url_concursos": "", "url_processos_seletivos": "", "razao": ""}
+        return _empty_tier3_result()
 
 
 # ---------------------------------------------------------------------------
@@ -1477,61 +1712,6 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
 
 
 # ---------------------------------------------------------------------------
-# Combined-page detection helper
-# ---------------------------------------------------------------------------
-CONCURSO_SIGNALS = ["concurso publico", "concursos publicos", "concurso público"]
-PSS_SIGNALS = [
-    "processo seletivo", "processos seletivos", "seletivo simplificado",
-    "selecao publica", "seleção pública", "pss",
-]
-
-
-def _try_combined_fill(session: requests.Session, chosen: dict,
-                       bucket_tier: dict, razones: list,
-                       candidates: list[Candidate]) -> None:
-    """If one bucket has a URL and the other doesn't, check if the filled
-    bucket's page content mentions both types — making it a combined page."""
-    filled_key = empty_key = None
-    if chosen["url_concursos"] and not chosen["url_processos_seletivos"]:
-        filled_key, empty_key = "url_concursos", "url_processos_seletivos"
-        signals = PSS_SIGNALS
-    elif chosen["url_processos_seletivos"] and not chosen["url_concursos"]:
-        filled_key, empty_key = "url_processos_seletivos", "url_concursos"
-        signals = CONCURSO_SIGNALS
-    else:
-        return
-
-    filled_url = chosen[filled_key]
-    page = None
-    for c in candidates:
-        if c.url == filled_url and c.page:
-            page = c.page
-            break
-    if not page:
-        return
-
-    text = page.text or ""
-    # SPA (atende.net, JSF): the static body is a JS shell, so the other type's
-    # listing is invisible and the combined fill never fires. Render to see it.
-    if getattr(page, "is_spa", False) or len(text.strip()) < 500:
-        rt = _render_text(filled_url)
-        if len(rt) > len(text):
-            text = rt
-
-    content = norm((page.title or "") + " " + filled_url + " " + text[:4000])
-    # Require a signal of the OTHER type AND that the page is an actual listing
-    # (>=2 edital-like items). A lone mention can be a menu/footer link, not a
-    # combined listing — demanding listing context avoids a false combined fill.
-    has_other = any(norm(s) in content for s in signals)
-    listing_matches = len(LISTING_RE.findall(text[:4000]))
-    if has_other and listing_matches >= 2:
-        chosen[empty_key] = filled_url
-        bucket_tier[empty_key] = bucket_tier.get(filled_key, "") + "_combined"
-        razones.append(f"[combined] Page also contains {empty_key.split('_')[1]} content")
-        print(f"      combined: {empty_key} filled from {filled_key}", flush=True)
-
-
-# ---------------------------------------------------------------------------
 # Main pipeline: process one municipality
 # ---------------------------------------------------------------------------
 def _assign_confidence(tier: str) -> str:
@@ -1609,11 +1789,9 @@ def _deterministic_verify(url: str, bucket: str,
     if not cand or not cand.page:
         return False
     page = cand.page
-    # Include the page title AND the URL, not just the body: the bucket keyword
-    # frequently lives in the title ("Concursos Públicos | ...") or the URL path
-    # (/cidadao/pagina/concursos, ?titulo=CONCURSOS) even when the rendered body
-    # does not repeat it literally.
-    text = norm(page.title + " " + url + " " + page.text[:2000])
+    # Confirmation uses rendered content/title only. The URL slug may discover
+    # a candidate, but it cannot decide or confirm the final bucket.
+    text = norm(page.title + " " + page.text[:2000])
 
     kw_list = CONCURSO_VERIFY_KW if bucket == "concursos" else PSS_VERIFY_KW
     has_keyword = any(k in text for k in kw_list)
@@ -1863,14 +2041,31 @@ def process_municipio(session: requests.Session, municipio: str,
     # --- TIER 3 on Tier 1 candidates (if we have any) ---
     chosen = {"url_concursos": "", "url_processos_seletivos": ""}
     bucket_tier = {"url_concursos": "", "url_processos_seletivos": ""}
+    bucket_decision = {
+        "url_concursos": "nao_encontrado",
+        "url_processos_seletivos": "nao_encontrado",
+    }
     razones: list[str] = []
 
     def _record(picked: dict, tier_label: str) -> None:
-        """Fill empty buckets from a Tier 3 result and note which tier won."""
-        for key in ("url_concursos", "url_processos_seletivos"):
-            if not chosen[key] and picked.get(key):
-                chosen[key] = picked[key]
+        """Record a fresh selection over the complete accumulated candidate set."""
+        # A malformed/truncated response is not a new content verdict. Preserve
+        # the last complete selection instead of erasing a correct earlier tier.
+        if not picked.get("classification_complete"):
+            razones.append(f"[{tier_label}] tier3 incomplete; previous selection preserved")
+            return
+        for key, decision_key in (
+            ("url_concursos", "decision_concursos"),
+            ("url_processos_seletivos", "decision_processos"),
+        ):
+            previous = chosen[key]
+            selected = picked.get(key, "")
+            chosen[key] = selected
+            bucket_decision[key] = picked.get(decision_key, "nao_encontrado")
+            if selected and selected != previous:
                 bucket_tier[key] = tier_label
+            elif not selected:
+                bucket_tier[key] = ""
         if picked.get("razao"):
             razones.append(f"[{tier_label}] {picked['razao']}")
 
@@ -1879,11 +2074,6 @@ def process_municipio(session: requests.Session, municipio: str,
         picked = tier3_classify_and_pick(session, model, municipio, fetchable_t1, timeout)
         _record(picked, "t1")
         tiers_used.append("t3")
-
-    # --- Combined-page detection ---
-    # If Tier 3 filled one bucket but not the other, check if the chosen
-    # page's content mentions both types. If so, it's a combined page.
-    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- TIER 1.5: probe known CMS index paths (FALLBACK only) ---
     # Fires only for buckets Tier 1 + Tier 3 left empty, so it never competes
@@ -1898,9 +2088,11 @@ def process_municipio(session: requests.Session, municipio: str,
             all_candidates.extend(probe_cands)
             tiers_used.append("probe")
             print(f"    Probe: {len(probe_cands)} known-path candidate(s)...", flush=True)
-            picked = tier3_classify_and_pick(session, model, municipio, probe_cands, timeout)
+            picked = tier3_classify_and_pick(
+                session, model, municipio,
+                [c for c in all_candidates if c.fetchable], timeout,
+            )
             _record(picked, "probe")
-            _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- TIER 2: Grounded search (only for missing buckets) ---
     missing_buckets = []
@@ -1925,14 +2117,14 @@ def process_municipio(session: requests.Session, municipio: str,
             fetchable_new = [c for c in new_t2 if c.fetchable]
             if fetchable_new:
                 print(f"    Tier 3: classifying {len(fetchable_new)} grounded candidates...", flush=True)
-                picked = tier3_classify_and_pick(session, model, municipio, fetchable_new, timeout)
+                picked = tier3_classify_and_pick(
+                    session, model, municipio,
+                    [c for c in all_candidates if c.fetchable], timeout,
+                )
                 _record(picked, "t2")
         except Exception as e:
             print(f"    Tier 2 error: {e}", flush=True)
             tiers_used.append("t2_err")
-
-    # Combined-page check again after Tier 2
-    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- Directed grounding per bucket ---
     # If general grounding didn't find a bucket, search specifically for it
@@ -1957,15 +2149,13 @@ def process_municipio(session: requests.Session, municipio: str,
                 fetchable_d = [c for c in new_d if c.fetchable]
                 if fetchable_d:
                     picked = tier3_classify_and_pick(
-                        session, model, municipio, fetchable_d, timeout,
+                        session, model, municipio,
+                        [c for c in all_candidates if c.fetchable], timeout,
                     )
                     _record(picked, "t2dir")
                 tiers_used.append("t2dir")
             except Exception as e:
                 print(f"    Directed grounding error: {e}", flush=True)
-
-    # Combined check after directed grounding
-    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- TIER 4: Playwright (last resort for still-missing buckets) ---
     still_missing = []
@@ -1986,13 +2176,13 @@ def process_municipio(session: requests.Session, municipio: str,
             fetchable_t4 = [c for c in new_t4 if c.fetchable]
             if fetchable_t4 and gemini_api_key():
                 print(f"    Tier 3: classifying {len(fetchable_t4)} playwright candidates...", flush=True)
-                picked = tier3_classify_and_pick(session, model, municipio, fetchable_t4, timeout)
+                picked = tier3_classify_and_pick(
+                    session, model, municipio,
+                    [c for c in all_candidates if c.fetchable], timeout,
+                )
                 _record(picked, "t4")
         except Exception as e:
             print(f"    Tier 4 error: {e}", flush=True)
-
-    # Final combined-page check after all tiers
-    _try_combined_fill(session, chosen, bucket_tier, razones, all_candidates)
 
     # --- Assemble result ---
     result.url_concursos = chosen.get("url_concursos", "")
@@ -2005,6 +2195,15 @@ def process_municipio(session: requests.Session, municipio: str,
     # --- Confidence assignment ---
     result.confianza_concursos = _assign_confidence(result.tier_concursos)
     result.confianza_processos = _assign_confidence(result.tier_processos)
+
+    # Rejected/uncertain candidates remain explicit review outcomes when no
+    # later tier finds a valid index. A moved candidate leaves its origin as
+    # nao_encontrado unless some other candidate made that origin uncertain.
+    if not result.url_concursos and bucket_decision["url_concursos"] != "nao_encontrado":
+        result.confianza_concursos = "revisar"
+    if (not result.url_processos_seletivos
+            and bucket_decision["url_processos_seletivos"] != "nao_encontrado"):
+        result.confianza_processos = "revisar"
 
     # Deterministic upgrade: probable→confirmado if content clearly matches
     if result.confianza_concursos == "probable" and result.url_concursos:

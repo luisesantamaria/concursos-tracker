@@ -69,11 +69,14 @@ Tier 2 — Grounded search (Gemini + Google)
   Gemini solo DESCUBRE URLs. El codigo verifica.
 
 Tier 3 — Gemini verificador/selector
-  Recibe candidatas verificadas y toma decisiones discretas.
-  Cuando hay multiples candidatas validas: ai_pick_best
-  elige la mejor pagina indice por comprension de contenido.
+  Clasifica cada candidata por contenido en dos dimensiones discretas:
+  forma (indice/detalle/noticia/cultural/incierto) y
+  tipo (concurso/pss/mixto/incierto).
+  Solo forma=indice entra a un bucket; el tipo determina el bucket final.
+  Cuando hay multiples candidatas validas, el selector elige la mejor
+  pagina indice por comprension de contenido.
   NO usa scorer numerico ni constantes magicas.
-  Costo: una llamada barata sin grounding, solo para empates.
+  Clasificacion y seleccion comparten una llamada sin grounding.
 
 Tier 4 — Agente de navegacion (Playwright)
   Ultimo recurso. Abre el site en Chromium headless.
@@ -89,7 +92,11 @@ Tier 4 — Agente de navegacion (Playwright)
 
 - El DESCUBRIMIENTO lo hace requests gratis → Gemini/Google → Playwright.
 - La VERIFICACION la hace codigo deterministico: contenido manda sobre slug.
-- La SELECCION entre candidatas la hace Gemini (ai_pick_best): comprension, no puntos.
+- La SELECCION entre candidatas la hace Gemini: comprension, no puntos.
+- Una candidata indice del tipo opuesto se reasigna antes de seleccionar; si
+  colisiona con otra candidata, ambas compiten tras deduplicar la URL.
+- Cultural precede a tipo; detalle/noticia nunca son indices; cualquier
+  dimension incierta produce revisar y nunca una reasignacion supuesta.
 - Nunca se emite una URL sin verificar contra contenido real.
 - Precision sobre cobertura: si no esta seguro, queda vacio o revisar.
 - No hardcodear patrones de proveedor (multi24, subareas, IPs crus).
