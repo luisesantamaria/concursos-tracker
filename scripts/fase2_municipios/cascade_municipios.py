@@ -423,6 +423,7 @@ class Candidate:
     provenance: list[dict] = field(default_factory=list)
     bucket: str = "combinado"
     content_preview: str = ""
+    evidence_snapshot: EvidenceSnapshot | None = field(default=None, repr=False)
     # Discovery hint only. It records which bucket led us to the candidate so
     # an uncertain classification can be returned to that bucket for review.
     # It never decides the final bucket; forma/tipo from page content do that.
@@ -671,6 +672,7 @@ def candidate_from_evidence(
     candidate = Candidate(
         url=final_url, source=candidate_source, menu_text=menu_text,
         page=page, content_preview=(page.text or "")[:1200],
+        evidence_snapshot=evidence if isinstance(evidence, EvidenceSnapshot) else None,
         accessible=accessible, evidence_state=evidence_state,
         source_kind=source_kind, authority=authority, identity=identity,
         page_role=diagnostic.page_role, decision=diagnostic.decision,
@@ -689,7 +691,7 @@ def _apply_candidate_evidence(candidate: Candidate, evidence: Page | EvidenceSna
     for name in (
         "url", "source", "page", "accessible", "evidence_state", "source_kind",
         "authority", "identity", "page_role", "decision", "note", "provenance",
-        "bucket", "content_preview",
+        "bucket", "content_preview", "evidence_snapshot",
     ):
         setattr(candidate, name, getattr(evaluated, name))
     return candidate
@@ -2332,6 +2334,126 @@ def batch_gemini_verify(session: requests.Session, model: str,
         return {}
 
 
+def _usable_evidence_snapshot(snapshot: EvidenceSnapshot,
+                              requested_url: str) -> bool:
+    """Return whether preserved rendered evidence can replace the batch GET."""
+    if not (snapshot.html or "").strip() or not (snapshot.text or "").strip():
+        return False
+    if snapshot.evidence_state not in {"renderizada", "completa"}:
+        return False
+    if snapshot.status is not None and not 200 <= snapshot.status < 400:
+        return False
+    if (_normalized_candidate_url(snapshot.final_url)
+            != _normalized_candidate_url(requested_url)):
+        return False
+    page = _page_from_html(
+        snapshot.final_url, snapshot.status, "text/html; charset=UTF-8",
+        snapshot.html, requested_url=requested_url,
+    )
+    page.title = snapshot.title or page.title
+    page.text = snapshot.text or page.text
+    return bool(
+        page.ok
+        and not is_antibot_challenge(page)
+        and not is_soft_404(page)
+        and not is_dead_site(page)
+    )
+
+
+def _batch_verify_uncertain_results(
+        session: requests.Session, model: str, results: list[MunicipioResult],
+        *, timeout: int = 15, use_playwright: bool = True,
+        ) -> tuple[list[dict], dict[str, MunicipioResult], dict[str, tuple[str, str]]]:
+    """Close probable results, preferring their preserved rendered evidence."""
+    to_verify: list[dict] = []
+    verify_index: dict[str, MunicipioResult] = {}
+    for result in results:
+        for bucket, url, confidence in (
+            ("concursos", result.url_concursos, result.confianza_concursos),
+            ("processos", result.url_processos_seletivos,
+             result.confianza_processos),
+        ):
+            if confidence != "probable" or not url:
+                continue
+            item = {
+                "municipio": result.municipio, "bucket": bucket,
+                "url": url, "title": "", "preview": "",
+                "site_base": result.site_base,
+            }
+            to_verify.append(item)
+            verify_index[f"{result.municipio}|{bucket}"] = result
+
+    verdicts: dict[str, tuple[str, str]] = {}
+    legacy_items: list[dict] = []
+    for item in to_verify:
+        key = f"{item['municipio']}|{item['bucket']}"
+        result = verify_index[key]
+        snapshot = result.evidence_snapshots.get(
+            _normalized_candidate_url(item["url"]),
+        )
+        if snapshot is None or not _usable_evidence_snapshot(
+                snapshot, item["url"]):
+            legacy_items.append(item)
+            continue
+
+        candidate = candidate_from_evidence(
+            item["url"], snapshot.source, "", item["municipio"], snapshot,
+        )
+        item["title"] = candidate.page.title[:150] if candidate.page else ""
+        item["preview"] = candidate.page.text[:400] if candidate.page else ""
+        confirmed = _deterministic_verify(
+            candidate.url, item["bucket"], [candidate],
+        )
+        verdicts[key] = (
+            "confirmado" if confirmed else "revisar",
+            f"snapshot renderizado: {candidate.note}",
+        )
+
+    # Legacy path: preserve the existing HTTP fetch, optional light rendering,
+    # and Gemini batch verification exactly when no usable snapshot survived.
+    for item in legacy_items:
+        try:
+            page = fetch_page(session, item["url"], timeout=timeout)
+            item["title"] = page.title[:150] if page else ""
+            item["preview"] = page.text[:400] if page else ""
+            if (page and use_playwright
+                    and (page.is_spa or len((page.text or "").strip()) < 500)):
+                rendered_text = _render_text(item["url"], timeout)
+                if len(rendered_text) > len(page.text or ""):
+                    item["preview"] = rendered_text[:400]
+                    if not item["title"]:
+                        item["title"] = item["url"]
+        except Exception:
+            pass
+
+    if legacy_items:
+        verdicts.update(batch_gemini_verify(session, model, legacy_items))
+    for key, (batch_verdict, reason) in verdicts.items():
+        result = verify_index.get(key)
+        if not result:
+            continue
+        _, bucket = key.split("|", 1)
+        bucket_url = (
+            result.url_concursos if bucket == "concursos"
+            else result.url_processos_seletivos
+        )
+        if batch_verdict == "confirmado" and is_detail_url(bucket_url):
+            batch_verdict = "probable"
+            reason = ((reason + "; ") if reason else "") + (
+                "url de detalle: queda probable hasta verificacion renderizada"
+            )
+        if bucket == "concursos":
+            result.confianza_concursos = batch_verdict
+            if reason:
+                result.notes += f"; verify_c: {reason}"
+        else:
+            result.confianza_processos = batch_verdict
+            if reason:
+                result.notes += f"; verify_p: {reason}"
+
+    return to_verify, verify_index, verdicts
+
+
 def grounded_verify_one(session: requests.Session, model: str,
                         municipio: str, bucket: str, url: str,
                         timeout: int = 90) -> tuple[str, str]:
@@ -2428,6 +2550,9 @@ class MunicipioResult:
     confianza_processos: str = ""
     urls_extras_concursos: str = ""
     urls_extras_processos: str = ""
+    evidence_snapshots: dict[str, EvidenceSnapshot] = field(
+        default_factory=dict, repr=False,
+    )
 
 
 def process_municipio(session: requests.Session, municipio: str,
@@ -2721,6 +2846,18 @@ def process_municipio(session: requests.Session, municipio: str,
     if antibot_block:
         notes_parts.append("bloqueo_antibot: site responde challenge JS (indice no accesible)")
     result.notes = "; ".join(notes_parts)
+
+    selected_keys = {
+        _normalized_candidate_url(url)
+        for url in (result.url_concursos, result.url_processos_seletivos)
+        if url
+    }
+    result.evidence_snapshots = {
+        _normalized_candidate_url(candidate.url): candidate.evidence_snapshot
+        for candidate in all_candidates
+        if candidate.evidence_snapshot is not None
+        and _normalized_candidate_url(candidate.url) in selected_keys
+    }
 
     return result
 
@@ -3083,45 +3220,10 @@ def main() -> int:
     if to_verify and gemini_api_key():
         print(f"\n{'='*60}", flush=True)
         print(f"Batch verification: {len(to_verify)} uncertain URLs", flush=True)
-        # Re-fetch minimal content for verification
-        for item in to_verify:
-            try:
-                pg = fetch_page(session, item["url"], timeout=args.timeout)
-                item["title"] = pg.title[:150] if pg else ""
-                item["preview"] = pg.text[:400] if pg else ""
-                # SPA portals serve a JS shell, so the static preview is empty and
-                # Gemini can't see the listing. Render to capture the real content.
-                if (pg and not args.no_playwright
-                        and (pg.is_spa or len((pg.text or "").strip()) < 500)):
-                    rt = _render_text(item["url"], args.timeout)
-                    if len(rt) > len(pg.text or ""):
-                        item["preview"] = rt[:400]
-                        if not item["title"]:
-                            item["title"] = item["url"]
-            except Exception:
-                pass
-
-        verdicts = batch_gemini_verify(session, args.model, to_verify)
-        for key, (veredicto, motivo) in verdicts.items():
-            r = verify_index.get(key)
-            if not r:
-                continue
-            muni, bucket = key.split("|", 1)
-            # Batch verify works off static/lightly-rendered content; it is not
-            # authorized to promote a single-item/detail URL to `confirmado`. That
-            # promotion is reserved for the rendered closing pass. Cap at probable.
-            bucket_url = r.url_concursos if bucket == "concursos" else r.url_processos_seletivos
-            if veredicto == "confirmado" and is_detail_url(bucket_url):
-                veredicto = "probable"
-                motivo = (motivo + "; " if motivo else "") + "url de detalle: queda probable hasta verificacion renderizada"
-            if bucket == "concursos":
-                r.confianza_concursos = veredicto
-                if motivo:
-                    r.notes += f"; verify_c: {motivo}"
-            else:
-                r.confianza_processos = veredicto
-                if motivo:
-                    r.notes += f"; verify_p: {motivo}"
+        to_verify, verify_index, verdicts = _batch_verify_uncertain_results(
+            session, args.model, results, timeout=args.timeout,
+            use_playwright=not args.no_playwright,
+        )
 
         confirmed = sum(1 for _, (v, _) in verdicts.items() if v == "confirmado")
         print(f"  Verified: {confirmed}/{len(verdicts)} upgraded to confirmado",
