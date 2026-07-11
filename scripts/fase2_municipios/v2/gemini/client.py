@@ -302,7 +302,7 @@ class StructuredGeminiClient:
         config = {
             "temperature": 0.0,
             "response_mime_type": "application/json",
-            "response_schema": self.response_schema,
+            "response_json_schema": self.response_schema,
             **supplied,
         }
         _guard_grounding(config)
