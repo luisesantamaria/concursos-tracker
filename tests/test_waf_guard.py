@@ -93,7 +93,8 @@ def test_challenge_freezes_group_and_second_verdict_skips_fetch(monkeypatch):
         session, "model", "Teste", "processos",
         "https://two.test/processos", 1, "authority")
 
-    assert first == ("revisar", "revisar_op:waf_challenge")
+    assert first == (
+        "revisar", "revisar_op:incompleto_antibot: diagnostico conservado")
     assert second == ("revisar", "revisar_op:waf_frozen")
     assert session.calls == 1
 

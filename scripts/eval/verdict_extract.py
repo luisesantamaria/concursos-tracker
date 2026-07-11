@@ -16,9 +16,10 @@ determinista:
   2. Re-deriva TODO del texto, no le cree los campos al LLM: numero/ano por regex
      sobre la cita; tipo/doc por keywords en ventana determinista alrededor; emisor
      por matching contra el municipio.
-  3. Cuenta CERTAMES DISTINTOS del tipo del bucket (agrupa por (numero, ano); los
-     documentos de ciclo homologação/convocação/retificação NO suman certame nuevo).
-     >=2 certames -> índice; 1 certame + N docs -> detalle -> revisar; 0 -> revisar.
+  3. Reconoce la ESTRUCTURA estable de un recurso/listado por filtros, tabla,
+     cards, paginación, categoría o endpoint de listado. El número visible de
+     resultados (0, 1 o varios) no decide si la superficie es un índice. Un solo
+     certamen con sus documentos, sin estructura de listado, sigue siendo detalle.
   4. EMISOR default-deny: un item solo cuenta si su emisor es (vacío + dominio
      oficial) o matchea el municipio / gramática intra-municipal. Entidad ajena
      nombrada (CIEE, consórcio, otro município) -> excluye el item (arquetipo A).
@@ -32,6 +33,111 @@ import json
 import re
 import unicodedata
 import urllib.request
+from dataclasses import dataclass, field
+
+
+# ---------------------------------------------------------------------------
+# Contrato cerrado de estados de Fase 2
+# ---------------------------------------------------------------------------
+SOURCE_KINDS = frozenset({
+    "dominio_oficial_prefeitura", "portal_externo_delegado", "banca",
+    "diario", "desconocido",
+})
+TRI_STATES = frozenset({"confirmada", "rechazada", "desconocida"})
+PAGE_ROLES = frozenset({
+    "indice_listado", "indice_combinado", "detalle_individual", "noticia",
+    "menu_sin_listado", "incompleto_antibot", "desconocido",
+})
+EVIDENCE_STATES = frozenset({
+    "completa", "incompleta_antibot", "renderizada", "error_fetch",
+})
+CONTRACT_BUCKETS = frozenset({
+    "concurso_publico", "processo_seletivo", "combinado",
+})
+DECISIONS = frozenset({
+    "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
+    "detalle_individual_rechazado", "licitacao_rechazada",
+    "concurso_cultural_rechazado", "nao_encontrado", "revisar",
+})
+
+
+@dataclass(frozen=True)
+class CandidateContract:
+    """Veredicto discreto y auditable de una superficie candidata.
+
+    ``source_kind`` describe procedencia y ``page_role`` describe solamente la
+    estructura. ``authority`` e ``identity`` son tri-estados independientes: la
+    falta de prueba nunca equivale a rechazo. ``accessible`` es operacional y
+    solo es falso con ``evidence_state=error_fetch``; una shell antibot recuperada
+    es accesible, queda como ``incompleto_antibot`` y conserva su diagnóstico.
+
+    Máquina de estados: un ``indice_listado`` con autoridad e identidad confirmadas
+    deriva en ``indice_oficial``; ``indice_combinado`` en su decisión homónima; un
+    índice de ``portal_externo_delegado`` requiere cadena oficial confirmada y
+    deriva en ``portal_externo_oficial``. Detalle se rechaza; noticia deriva en
+    ``nao_encontrado``; menú sin listado y evidencia antibot derivan en ``revisar``.
+    Licitación/cultural usan sus rechazos canónicos y la ausencia de candidata
+    elegible deriva en ``nao_encontrado``.
+
+    Un índice es válido con 0, 1 o múltiples resultados visibles cuando su
+    ``page_role`` es ``indice_listado`` o ``indice_combinado`` y la estructura es
+    inequívoca.
+    """
+
+    source_kind: str = "desconocido"
+    authority: str = "desconocida"
+    identity: str = "desconocida"
+    page_role: str = "desconocido"
+    evidence_state: str = "completa"
+    accessible: bool = True
+    bucket: str = "combinado"
+    decision: str = "revisar"
+    note: str = ""
+    provenance: tuple[dict, ...] = field(default_factory=tuple)
+
+
+def _closed(value: str, vocabulary: frozenset[str], fallback: str) -> str:
+    return value if value in vocabulary else fallback
+
+
+def derive_decision(*, source_kind: str, authority: str, identity: str,
+                    page_role: str, bucket: str, evidence_state: str = "completa",
+                    accessible: bool = True, is_licitacao: bool = False,
+                    is_cultural: bool = False) -> tuple[str, str]:
+    """Derive una de las ocho decisiones canónicas sin scores ni URLs/slugs."""
+    source_kind = _closed(source_kind, SOURCE_KINDS, "desconocido")
+    authority = _closed(authority, TRI_STATES, "desconocida")
+    identity = _closed(identity, TRI_STATES, "desconocida")
+    page_role = _closed(page_role, PAGE_ROLES, "desconocido")
+    bucket = _closed(bucket, CONTRACT_BUCKETS, "combinado")
+    evidence_state = _closed(evidence_state, EVIDENCE_STATES, "error_fetch")
+    if not accessible or evidence_state == "error_fetch":
+        return "revisar", "error_fetch: evidencia no recuperada"
+    if is_licitacao:
+        return "licitacao_rechazada", "licitacao, no recurso de concurso/PSS"
+    if is_cultural:
+        return "concurso_cultural_rechazado", "concurso cultural, no concurso publico"
+    if page_role == "incompleto_antibot" or evidence_state == "incompleta_antibot":
+        return "revisar", "antibot: evidencia incompleta conservada"
+    if page_role == "detalle_individual":
+        return "detalle_individual_rechazado", "detalle individual, no indice"
+    if page_role == "noticia":
+        return "nao_encontrado", "noticia, no indice"
+    if page_role == "menu_sin_listado":
+        return "revisar", "menu por año sin listado, falta indice"
+    if page_role not in {"indice_listado", "indice_combinado"}:
+        return "nao_encontrado", "sin candidata elegible"
+    if identity != "confirmada":
+        return "revisar", f"identity={identity}: no se puede aceptar el indice"
+    if source_kind == "portal_externo_delegado":
+        if authority != "confirmada":
+            return "revisar", "portal externo sin cadena oficial confirmada"
+        return "portal_externo_oficial", "portal delegado por cadena oficial"
+    if authority != "confirmada":
+        return "revisar", f"authority={authority}: no se puede aceptar el indice"
+    if page_role == "indice_combinado" or bucket == "combinado":
+        return "indice_oficial_combinado", "indice combinado oficial"
+    return "indice_oficial", "indice oficial con estructura inequivoca"
 
 # ---------------------------------------------------------------------------
 # Normalización para quote-check: sin acentos, minúscula, espacios colapsados.
@@ -1284,18 +1390,30 @@ def content_complete(text: str, title: str = "") -> bool:
 
 def _has_structural_index_signals(text: str, *, has_listing: bool,
                                   anchors: list | None = None) -> bool:
-    """Recognise an index shell even when it currently contains only one row."""
-    if not has_listing:
-        return False
+    """Recognise an unequivocal index shell with 0, 1 or many visible rows."""
     q = qn(text or "")
-    if not _RESULT_COUNT.search(q):
-        return False
-    if _LISTING_CONTROL.search(q):
+    result_count = bool(_RESULT_COUNT.search(q))
+    table_shell = bool(_LISTING_TABLE.search(q) or _CERTAME_DOC_TABLE.search(q))
+    if result_count and (_LISTING_CONTROL.search(q) or table_shell):
         return True
-    return any(
+    paginated = any(
         re.search(r"[?&](?:page|pagina)=", str(anchor.get("href", "")), re.I)
         for anchor in (anchors or []) if isinstance(anchor, dict)
     )
+    return bool((has_listing or table_shell) and paginated)
+
+
+def has_index_structure(text: str, bucket: str, *, title: str = "",
+                        anchors: list | None = None,
+                        extracted_certames: set | None = None) -> bool:
+    """Public structural gate shared by cascade and offline closure."""
+    listing = has_event_listing(
+        text, bucket, title=title, anchors=anchors,
+        extracted_certames=extracted_certames,
+    )
+    return bool(listing or _has_structural_index_signals(
+        text, has_listing=listing, anchors=anchors,
+    ))
 
 
 def candidate_content_state(text: str, bucket: str, *, title: str = "",
@@ -1303,35 +1421,109 @@ def candidate_content_state(text: str, bucket: str, *, title: str = "",
                             items: list | None = None,
                             extracted_certames: set | None = None) -> tuple[str, dict[str, bool]]:
     """Boolean state table for the final candidate acceptance gate."""
+    bnorm = _bucket_name(bucket)
+    other = "processos" if bnorm == "concursos" else "concursos"
     listing = has_event_listing(
         text, bucket, title=title, anchors=anchors, items=items,
         extracted_certames=extracted_certames)
+    other_listing = has_event_listing(
+        text, other, title=title, anchors=anchors, items=items,
+        extracted_certames=None)
     article = is_single_article(text, title, has_listing=listing)
     detail = is_single_event_document_detail(
         text, bucket, title=title, anchors=anchors)
     complete = content_complete(text, title)
     structural_index = _has_structural_index_signals(
         text, has_listing=listing, anchors=anchors)
+    menu_only = _is_year_navigation_shell(text, bnorm)
+    incomplete_antibot = bool(_INCOMPLETE_CONTENT.search(qn(f"{title}\n{text}")))
+    combined = bool(listing and other_listing and not article and not detail)
+    if incomplete_antibot:
+        page_role = "incompleto_antibot"
+    elif article:
+        page_role = "noticia"
+    elif detail:
+        page_role = "detalle_individual"
+    elif combined:
+        page_role = "indice_combinado"
+    elif structural_index or listing:
+        page_role = "indice_listado"
+    elif menu_only:
+        page_role = "menu_sin_listado"
+    else:
+        page_role = "desconocido"
     predicates = {
         "has_event_listing": listing,
         "is_single_article": article,
         "is_single_event_document_detail": detail,
         "content_complete": complete,
         "has_structural_index_signals": structural_index,
+        "is_year_navigation_shell": menu_only,
+        "is_incomplete_antibot": incomplete_antibot,
+        "is_combined_index": combined,
+        "page_role": page_role,
     }
+    if incomplete_antibot:
+        return "revisar", predicates
     if article:
-        return "detalle_individual_rechazado", predicates
+        return "nao_encontrado", predicates
+    if combined:
+        return "indice_oficial_combinado", predicates
     if structural_index:
         return "indice_oficial", predicates
     if detail:
         return "detalle_individual_rechazado", predicates
     if listing and not article and not detail:
         return "indice_oficial", predicates
+    if menu_only:
+        return "revisar", predicates
     if not listing and complete:
         return "nao_encontrado", predicates
     if not listing and not complete:
         return "revisar", predicates
     return "revisar", predicates
+
+
+def evaluate_candidate_contract(text: str, bucket: str, *, title: str = "",
+                                anchors: list | None = None,
+                                items: list | None = None,
+                                source_kind: str = "desconocido",
+                                authority: str = "desconocida",
+                                identity: str = "desconocida",
+                                evidence_state: str = "completa",
+                                accessible: bool = True,
+                                provenance: list[dict] | tuple[dict, ...] = ()) -> CandidateContract:
+    """Evaluate content and provenance through the executable state contract."""
+    state, predicates = candidate_content_state(
+        text, bucket, title=title, anchors=anchors, items=items,
+    )
+    page_role = str(predicates.get("page_role") or "desconocido")
+    normalized_bucket = (
+        "combinado" if page_role == "indice_combinado" else
+        "concurso_publico" if _bucket_name(bucket) == "concursos" else
+        "processo_seletivo"
+    )
+    q = qn(f"{title}\n{text}")
+    is_cultural = bool(_CULTURAL.search(q))
+    is_licitacao = bool(re.search(
+        r"\b(?:licitacao|pregao|compras? publicas?|tomada de precos?)\b", q, re.I,
+    )) and not (predicates.get("has_event_listing") or predicates.get("has_structural_index_signals"))
+    decision, note = derive_decision(
+        source_kind=source_kind, authority=authority, identity=identity,
+        page_role=page_role, bucket=normalized_bucket,
+        evidence_state=evidence_state, accessible=accessible,
+        is_licitacao=is_licitacao, is_cultural=is_cultural,
+    )
+    return CandidateContract(
+        source_kind=_closed(source_kind, SOURCE_KINDS, "desconocido"),
+        authority=_closed(authority, TRI_STATES, "desconocida"),
+        identity=_closed(identity, TRI_STATES, "desconocida"),
+        page_role=page_role,
+        evidence_state=_closed(evidence_state, EVIDENCE_STATES, "error_fetch"),
+        accessible=bool(accessible and evidence_state != "error_fetch"),
+        bucket=normalized_bucket, decision=decision, note=note,
+        provenance=tuple(provenance),
+    )
 
 
 def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
@@ -1617,15 +1809,25 @@ def adjudicate(text: str, bucket: str, municipio: str, items: list[dict],
         extracted_certames=certames)
     ev.update(predicates)
     ev["estado"] = state
-    if state == "indice_oficial":
+    if state in {"indice_oficial", "indice_oficial_combinado"}:
+        ev["motivo"] = "estructura inequivoca de indice; conteo visible no es requisito"
+        ev["motivo_code"] = "confirmar:estructura_indice"
         return "confirmar", ev
+    if predicates["is_single_article"]:
+        ev["motivo"] = "nota de prensa/noticia individual, no indice"
+        ev["motivo_code"] = "revisar_sem:noticia"
+        return "revisar", ev
     if state == "detalle_individual_rechazado":
-        if predicates["is_single_article"]:
-            ev["motivo"] = "nota de prensa/noticia individual, no indice"
-            ev["motivo_code"] = "revisar_sem:noticia"
-        else:
-            ev["motivo"] = "detalle de un solo certame con sus documentos"
-            ev["motivo_code"] = "revisar_sem:detalle_individual"
+        ev["motivo"] = "detalle de un solo certame con sus documentos"
+        ev["motivo_code"] = "revisar_sem:detalle_individual"
+        return "revisar", ev
+    if predicates["is_year_navigation_shell"]:
+        ev["motivo"] = "menu por año sin listado, falta indice"
+        ev["motivo_code"] = "revisar_sem:menu_sin_listado"
+        return "revisar", ev
+    if predicates["is_incomplete_antibot"]:
+        ev["motivo"] = "antibot: evidencia incompleta conservada"
+        ev["motivo_code"] = "revisar_op:incompleto_antibot"
         return "revisar", ev
     if state == "nao_encontrado":
         ev["motivo"] = "contenido completo sin entrada visible de certame"

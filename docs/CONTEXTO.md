@@ -47,7 +47,8 @@ O pipeline de descoberta municipal tem duas fases distintas que NAO devem ser mi
 - Um golden set de 24 municipios foi construido a mao para medir precisao/cobertura.
 - O golden set revelou que ~20% dos municipios precisam de revisao humana — esse e o teto esperado de automacao, nao um bug.
 - Gemini e usado como verificador/fallback e como seletor inteligente entre candidatas validas.
-- Playwright esta planejado como ultimo recurso para sites com JS ou botoes que saltam para destinos imprevisiveis, mas so sera implementado apos medir quantos municipios realmente precisam dele.
+- Playwright esta implementado como ultimo recurso dirigido; su `EvidenceSnapshot`
+  se reutiliza sin un segundo GET y queda marcado `evidence_state=renderizada`.
 - A metrica principal e precisao (zero falsos positivos), nao cobertura.
 
 ## Tipos de Portal Conhecidos (do golden set)
@@ -69,10 +70,52 @@ Essa variedade confirma que regras hardcodeadas por tipo de portal nao convergem
 
 ## Pendencias Claras
 
-- Implementar ai_pick_best para substituir o scorer numerico.
-- Implementar deteccao de JS e fallback Playwright dirigido (Tier 4).
+- Mantener `ai_pick_best` como selector sem scorer numerico.
+- Mantener la deteccion JS y el fallback Playwright dirigido (Tier 4).
 - Cachear resultados de grounding por municipio para reprodutibilidade.
 - Escalar o golden set conforme novas letras do alfabeto sao processadas.
 - Scanner de indices (proxima fase): extrair editais individuais das paginas indice.
-- Formalizar testes automatizados.
+- Ampliar los tests automatizados a nuevos tipos de portal; el contrato estructural ya tiene matriz 10/10.
 - Estabilizar export automatico para Google Sheets.
+
+## Contrato estructural Fase 2 — 2026-07-11
+
+La unidad de verdad es una superficie oficial, estable y reutilizable; Fase 2 no
+extrae eventos ni PDFs. El contrato ejecutable vive en
+`scripts/eval/verdict_extract.py` y separa dimensiones que antes estaban
+mezcladas:
+
+- `source_kind`: `dominio_oficial_prefeitura | portal_externo_delegado | banca | diario | desconocido`.
+- `authority` e `identity`: triestado `confirmada | rechazada | desconocida`;
+  ausencia de evidencia no equivale a rechazo y la autoridad nunca se infiere
+  por slug.
+- `page_role`: `indice_listado | indice_combinado | detalle_individual |
+  noticia | menu_sin_listado | incompleto_antibot | desconocido`.
+- `evidence_state`: `completa | incompleta_antibot | renderizada | error_fetch`.
+  `accessible=False` solo corresponde a `error_fetch`.
+- `bucket`: `concurso_publico | processo_seletivo | combinado`, decidido por
+  contenido.
+- `decision`: vocabulario canónico cerrado:
+  `indice_oficial | indice_oficial_combinado | portal_externo_oficial |
+  detalle_individual_rechazado | licitacao_rechazada |
+  concurso_cultural_rechazado | nao_encontrado | revisar`.
+
+Mapeo discreto: un índice con autoridad e identidad confirmadas se acepta; el
+portal externo requiere cadena de navegación oficial explícita; noticia deriva
+en `nao_encontrado`; menú sin listado y antibot incompleto derivan en
+`revisar`; detalle, licitación y cultural conservan sus rechazos. Un índice es
+válido con **0, 1 o múltiples resultados** si filtros, tabla/cards, paginación,
+categoría o endpoint prueban inequívocamente la estructura. `certame_unico` no
+rechaza por sí solo.
+
+`Candidate.fetchable` queda como alias operacional de `accessible`; la
+elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
+permanece con `decision+note`. Un `EvidenceSnapshot` de Playwright conserva
+`renderizada` y no provoca un segundo GET.
+
+`pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
+veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;
+el replay de 618 fixtures no mostró ningún flip atribuible a ese nombre.
+
+Estado: matriz contractual 10/10 y suite offline pertinentes verdes. Listo para
+el canario aislado del Paso 6; no reanudar chunks 5/6 como parte de este cambio.

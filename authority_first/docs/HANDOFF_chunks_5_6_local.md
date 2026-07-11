@@ -119,5 +119,24 @@ Después de **cada** comando de chunk, pegar en la conversación principal:
 
 3) SIN RESULTADO / REVISAR (diagnóstico):
 <lista de municipios sin URL o en revisar; para cada uno indicar
- bloqueo de red (403/429/SSL/Cloudflare/geo) o miss real del pipeline>
+bloqueo de red (403/429/SSL/Cloudflare/geo) o miss real del pipeline>
 ```
+
+## (g) Canario Paso 6 aislado — preparado, no ejecutado
+
+Antes de reanudar chunks 5/6, ejecutar solamente Barros Cassal, Boa Vista do
+Sul y Progresso contra el staging dedicado ya creado. La lista congelada es
+`data/fase2/canario_paso6_municipios.txt` y la salida es
+`data/fase2/canario_paso6.csv`:
+
+```bash
+for municipio in "Barros Cassal" "Boa Vista do Sul" "Progresso"; do
+  .venv/bin/python scripts/fase2_municipios/cascade_municipios.py \
+    --municipio "$municipio" --append --skip-existing \
+    --output data/fase2/canario_paso6.csv
+done
+```
+
+El comando respeta la interfaz real (`--municipio` es singular) y acumula los
+tres resultados sin tocar `data/fase2/municipios_rs_local.csv`. No se ejecuta
+en el sandbox: requiere red y una IP local de Brasil.

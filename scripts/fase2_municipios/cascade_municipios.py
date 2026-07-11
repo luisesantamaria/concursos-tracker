@@ -149,6 +149,8 @@ class EvidenceSnapshot:
     final_url: str
     status: int | None = None
     source: str = "playwright"
+    evidence_state: str = "renderizada"
+    provenance: tuple[dict, ...] = field(default_factory=tuple)
 
 
 # Compatibility name for the existing Tier 0/Tier 2 browser fallback API.
@@ -410,7 +412,16 @@ class Candidate:
     source: str  # "menu_link", "container_link", "grounding", "playwright"
     menu_text: str = ""
     page: Page | None = None
-    fetchable: bool = True
+    accessible: bool = True
+    evidence_state: str = "completa"
+    source_kind: str = "desconocido"
+    authority: str = "desconocida"
+    identity: str = "desconocida"
+    page_role: str = "desconocido"
+    decision: str = "revisar"
+    note: str = ""
+    provenance: list[dict] = field(default_factory=list)
+    bucket: str = "combinado"
     content_preview: str = ""
     # Discovery hint only. It records which bucket led us to the candidate so
     # an uncertain classification can be returned to that bucket for review.
@@ -420,6 +431,23 @@ class Candidate:
     def __post_init__(self) -> None:
         if not self.bucket_hint:
             self.bucket_hint = _discovery_bucket_hint(self.menu_text, self.url)
+
+    @property
+    def fetchable(self) -> bool:
+        """Compatibility alias; fetchability now means operational accessibility."""
+        return self.accessible
+
+    @fetchable.setter
+    def fetchable(self, value: bool) -> None:
+        self.accessible = bool(value)
+        if not self.accessible:
+            self.evidence_state = "error_fetch"
+
+    @property
+    def eligible(self) -> bool:
+        return self.decision in {
+            "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
+        }
 
 
 def _discovery_bucket_hint(menu_text: str, url: str) -> str:
@@ -524,9 +552,70 @@ def _candidate_identity_matches(page: Page, municipio: str) -> bool:
     return bool(municipality and municipality in identity_blob)
 
 
+def _provenance_confirms(provenance: list[dict] | tuple[dict, ...],
+                         municipio: str) -> bool:
+    """Confirm a delegated chain from explicit official navigation evidence."""
+    target = norm(municipio)
+    for item in provenance or ():
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") not in {
+            "official_navigation", "official_referrer", "official_brand",
+        }:
+            continue
+        if norm(str(item.get("municipio", ""))) == target:
+            return True
+    return False
+
+
+def _candidate_identity_state(page: Page, municipio: str,
+                              provenance: list[dict] | tuple[dict, ...]) -> str:
+    if is_soft_404(page) or is_dead_site(page):
+        return "rechazada"
+    host = (urlparse(page.url).hostname or "").lower().rstrip(".")
+    if host.endswith(".rs.gov.br"):
+        municipal_labels = host[:-len(".rs.gov.br")].split(".")
+        if slugify(municipio) not in municipal_labels:
+            return "rechazada"
+    target = norm(municipio)
+    identity_blob = norm(f"{page.title}\n{page.text[:3000]}")
+    if target and target in identity_blob:
+        return "confirmada"
+    if _provenance_confirms(provenance, municipio):
+        return "confirmada"
+    return "desconocida"
+
+
+def _candidate_source_and_authority(
+        page: Page, municipio: str,
+        provenance: list[dict] | tuple[dict, ...], identity: str,
+        source: str = "") -> tuple[str, str]:
+    """Derive provenance independently of page structure; never from URL slug."""
+    host = (urlparse(page.url).hostname or "").lower().rstrip(".")
+    official_chain = _provenance_confirms(provenance, municipio)
+    explicitly_external = source == "portal_externo_delegado"
+    if (official_chain or explicitly_external) and not host.endswith(".rs.gov.br"):
+        if not official_chain:
+            return "portal_externo_delegado", "desconocida"
+        return "portal_externo_delegado", "confirmada"
+    if host.endswith(".rs.gov.br"):
+        official_brand = bool(re.search(
+            r"\b(?:prefeitura|municipio|portal oficial)\b",
+            norm(f"{page.title}\n{page.text[:3000]}"),
+        ))
+        return (
+            "dominio_oficial_prefeitura",
+            "confirmada" if identity == "confirmada" and official_brand else "desconocida",
+        )
+    if official_chain:
+        return "portal_externo_delegado", "confirmada"
+    return "desconocido", "desconocida"
+
+
 def candidate_from_evidence(
         requested_url: str, source: str, menu_text: str, municipio: str,
-        evidence: Page | EvidenceSnapshot) -> Candidate:
+        evidence: Page | EvidenceSnapshot,
+        provenance: list[dict] | tuple[dict, ...] = ()) -> Candidate:
     """Build and verify one Candidate from already-obtained evidence.
 
     This is the canonical evidence seam for HTTP pages and browser snapshots.
@@ -541,29 +630,68 @@ def candidate_from_evidence(
         page.title = evidence.title or page.title
         page.text = evidence.text or page.text
         candidate_source = evidence.source
+        evidence_state = (
+            "error_fetch" if evidence.status is not None and evidence.status >= 400
+            else evidence.evidence_state
+        )
+        provenance = evidence.provenance or tuple(provenance)
     else:
         page = evidence
         candidate_source = source
+        evidence_state = (
+            "error_fetch" if page.error or (
+                page.status is not None and page.status >= 400
+            ) else
+            "incompleta_antibot" if is_antibot_challenge(page) else
+            "completa"
+        )
 
     final_url = clean_url(page.url or requested_url)
-    candidate = Candidate(
-        url=final_url, source=candidate_source, menu_text=menu_text,
-        page=page, content_preview=(page.text or "")[:1200], fetchable=False,
+    accessible = evidence_state != "error_fetch"
+    identity = _candidate_identity_state(page, municipio, provenance)
+    source_kind, authority = _candidate_source_and_authority(
+        page, municipio, provenance, identity, candidate_source,
     )
-    if (not page.ok or is_antibot_challenge(page) or is_soft_404(page)
-            or is_dead_site(page) or not _candidate_identity_matches(page, municipio)):
-        return candidate
-
     anchors = [{"href": href, "text": text} for href, text in page.links]
-    states = [
-        verdict.candidate_content_state(
+    contracts = [
+        verdict.evaluate_candidate_contract(
             page.text, bucket, title=page.title, anchors=anchors,
-        )[0]
+            source_kind=source_kind, authority=authority, identity=identity,
+            evidence_state=evidence_state, accessible=accessible,
+            provenance=provenance,
+        )
         for bucket in ("concursos", "processos")
     ]
-    # The final structural adjudicator is authoritative. This also preserves a
-    # valid combined index: either/both bucket states may be indice_oficial.
-    candidate.fetchable = "indice_oficial" in states
+    accepted = next((c for c in contracts if c.decision in {
+        "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
+    }), None)
+    diagnostic = accepted or next(
+        (c for c in contracts if c.page_role != "desconocido"), contracts[0],
+    )
+    candidate = Candidate(
+        url=final_url, source=candidate_source, menu_text=menu_text,
+        page=page, content_preview=(page.text or "")[:1200],
+        accessible=accessible, evidence_state=evidence_state,
+        source_kind=source_kind, authority=authority, identity=identity,
+        page_role=diagnostic.page_role, decision=diagnostic.decision,
+        note=diagnostic.note, provenance=list(provenance), bucket=diagnostic.bucket,
+    )
+    return candidate
+
+
+def _apply_candidate_evidence(candidate: Candidate, evidence: Page | EvidenceSnapshot,
+                              municipio: str) -> Candidate:
+    """Mutate an existing discovery candidate from already captured evidence."""
+    evaluated = candidate_from_evidence(
+        candidate.url, candidate.source, candidate.menu_text, municipio, evidence,
+        provenance=candidate.provenance,
+    )
+    for name in (
+        "url", "source", "page", "accessible", "evidence_state", "source_kind",
+        "authority", "identity", "page_role", "decision", "note", "provenance",
+        "bucket", "content_preview",
+    ):
+        setattr(candidate, name, getattr(evaluated, name))
     return candidate
 
 
@@ -740,7 +868,8 @@ def _probe_page_is_index_like(page: Page) -> bool:
 
 
 def _probe_known_index_paths(session: requests.Session, home: Page,
-                             seen_urls: set[str], timeout: int = 15) -> list[Candidate]:
+                             seen_urls: set[str], municipio: str,
+                             timeout: int = 15) -> list[Candidate]:
     """Probe well-known CMS index paths derived from the site host.
 
     Returns fetched Candidates (source='probe') for paths that resolve to a real,
@@ -763,11 +892,24 @@ def _probe_known_index_paths(session: requests.Session, home: Page,
         if not _probe_page_is_index_like(page):
             continue
         seen_urls.add(url)
-        probes.append(Candidate(
+        candidate = Candidate(
             url=url, source="probe", menu_text="(probe: known index path)",
-            page=page, content_preview=page.text[:1200], fetchable=True,
-        ))
+        )
+        probes.append(_apply_candidate_evidence(candidate, page, municipio))
     return probes
+
+
+def _official_navigation_provenance(home: Page, municipio: str,
+                                    label: str) -> list[dict]:
+    """Represent an official click chain only when the home content proves it."""
+    blob = norm(f"{home.title}\n{home.text[:3000]}")
+    if norm(municipio) not in blob or not re.search(
+            r"\b(?:prefeitura|municipio|portal oficial)\b", blob):
+        return []
+    return [{
+        "kind": "official_navigation", "municipio": municipio,
+        "referrer": home.url, "label": label,
+    }]
 
 
 def tier1_collect_candidates(session: requests.Session, home: Page,
@@ -793,6 +935,7 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                 seen_urls.add(href)
                 candidates.append(Candidate(
                     url=href, source="menu_link", menu_text=link_text,
+                    provenance=_official_navigation_provenance(home, municipio, link_text),
                 ))
 
     # One level deep: follow container-like links
@@ -827,17 +970,15 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                     candidates.append(Candidate(
                         url=href, source="container_link",
                         menu_text=f"{container_text} > {link_text}",
+                        provenance=_official_navigation_provenance(
+                            home, municipio, f"{container_text} > {link_text}",
+                        ),
                     ))
 
     # Fetch each candidate page to get content for Tier 3
     for c in candidates:
         page = fetch_page(session, c.url, min(timeout, 10))
-        if page.ok and not is_soft_404(page):
-            c.page = page
-            c.content_preview = page.text[:1200]
-            c.fetchable = True
-        else:
-            c.fetchable = False
+        _apply_candidate_evidence(c, page, municipio)
 
     # Drill-down: a bucket parent page (e.g. /concurso) often links to more
     # specific sub-indexes (e.g. /concurso/categoria/25/concurso). Also follows
@@ -871,15 +1012,11 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                 drill.append(Candidate(
                     url=href, source="drilldown",
                     menu_text=f"{c.menu_text} > {link_text}",
+                    provenance=list(c.provenance),
                 ))
     for c in drill:
         page = fetch_page(session, c.url, min(timeout, 10))
-        if page.ok and not is_soft_404(page):
-            c.page = page
-            c.content_preview = page.text[:1200]
-            c.fetchable = True
-        else:
-            c.fetchable = False
+        _apply_candidate_evidence(c, page, municipio)
     candidates.extend(drill)
 
     # Parameter normalization: if a candidate has ano=YYYY, add ano=0 variant
@@ -893,15 +1030,11 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                 param_variants.append(Candidate(
                     url=variant_url, source="param_variant",
                     menu_text=f"{c.menu_text} (all years)",
+                    provenance=list(c.provenance),
                 ))
     for c in param_variants:
         page = fetch_page(session, c.url, min(timeout, 10))
-        if page.ok and not is_soft_404(page):
-            c.page = page
-            c.content_preview = page.text[:1200]
-            c.fetchable = True
-        else:
-            c.fetchable = False
+        _apply_candidate_evidence(c, page, municipio)
     candidates.extend(param_variants)
 
     return candidates
@@ -1182,12 +1315,7 @@ def tier2_grounded_search(session: requests.Session, model: str,
         page = fetch_page_with_official_fallback(
             session, c.url, municipio, site_hint, timeout, render_page,
         )
-        if page.ok and not is_soft_404(page):
-            c.page = page
-            c.content_preview = page.text[:1200]
-            c.fetchable = True
-        else:
-            c.fetchable = False
+        _apply_candidate_evidence(c, page, municipio)
 
     return candidates
 
@@ -1347,12 +1475,7 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
             c.fetchable = False
             continue
         page = fetch_page(session, c.url, timeout)
-        if page.ok and not is_soft_404(page):
-            c.page = page
-            c.content_preview = page.text[:1200]
-            c.fetchable = True
-        else:
-            c.fetchable = False
+        _apply_candidate_evidence(c, page, municipio)
 
     return candidates
 
@@ -1367,12 +1490,11 @@ TIER3_DECISIONS = [
     "detalle_individual_rechazado",
     "licitacao_rechazada",
     "concurso_cultural_rechazado",
-    "pagina_generica_rechazada",
     "nao_encontrado",
     "revisar",
 ]
 
-CONTENT_FORMAS = {"indice", "detalle", "noticia", "cultural", "incierto"}
+CONTENT_PAGE_ROLES = set(verdict.PAGE_ROLES)
 CONTENT_TIPOS = {"concurso", "pss", "mixto", "incierto"}
 
 
@@ -1403,19 +1525,30 @@ def _normalized_candidate_url(url: str) -> str:
     return f"{base}?{query}" if query else base
 
 
-def _classification_decision(forma: str, tipo: str) -> str:
-    """Apply the content contract precedence to one candidate."""
-    if forma == "cultural":
-        return "concurso_cultural_rechazado"
-    if forma in {"detalle", "noticia"}:
-        return "detalle_individual_rechazado"
-    if forma != "indice":
+def _classification_decision(page_role: str, tipo: str,
+                             candidate: Candidate | None = None,
+                             exclusion: str = "nenhuma") -> str:
+    """Apply the same closed contract used by the offline adjudicator."""
+    if page_role == "desconocido" and exclusion == "nenhuma":
         return "revisar"
-    if tipo == "mixto":
-        return "indice_oficial_combinado"
-    if tipo in {"concurso", "pss"}:
-        return "indice_oficial"
-    return "revisar"
+    if page_role in {"indice_listado", "indice_combinado"} and tipo == "incierto":
+        return "revisar"
+    source_kind = candidate.source_kind if candidate else "dominio_oficial_prefeitura"
+    authority = candidate.authority if candidate else "confirmada"
+    identity = candidate.identity if candidate else "confirmada"
+    evidence_state = candidate.evidence_state if candidate else "completa"
+    accessible = candidate.accessible if candidate else True
+    bucket = (
+        "combinado" if tipo == "mixto" or page_role == "indice_combinado" else
+        "concurso_publico" if tipo == "concurso" else
+        "processo_seletivo" if tipo == "pss" else "combinado"
+    )
+    return verdict.derive_decision(
+        source_kind=source_kind, authority=authority, identity=identity,
+        page_role=page_role, bucket=bucket, evidence_state=evidence_state,
+        accessible=accessible, is_licitacao=exclusion == "licitacao",
+        is_cultural=exclusion == "cultural",
+    )[0]
 
 
 def _hint_buckets(candidate: Candidate) -> list[str]:
@@ -1443,18 +1576,13 @@ def _route_classified_candidates(
         "concursos": [], "processos": [],
     }
     decisions = {"concursos": "nao_encontrado", "processos": "nao_encontrado"}
-    decision_priority = {
-        "nao_encontrado": 0,
-        "concurso_cultural_rechazado": 1,
-        "detalle_individual_rechazado": 1,
-        "revisar": 2,
-    }
     routed: list[dict] = []
     classified_ids: set[int] = set()
     route_notes: list[str] = []
 
     def mark(bucket: str, decision: str) -> None:
-        if decision_priority.get(decision, 0) > decision_priority.get(decisions[bucket], 0):
+        current = decisions[bucket]
+        if current == "nao_encontrado" or decision == "revisar":
             decisions[bucket] = decision
 
     for raw in classifications:
@@ -1466,29 +1594,58 @@ def _route_classified_candidates(
         if candidate is None or candidate_id in classified_ids:
             continue
         classified_ids.add(candidate_id)
-        forma = str(raw.get("forma", "incierto")).strip().lower()
+        page_role = str(raw.get("page_role", "")).strip().lower()
+        legacy_form = str(raw.get("forma", "")).strip().lower()
         tipo = str(raw.get("tipo", "incierto")).strip().lower()
-        if forma not in CONTENT_FORMAS:
-            forma = "incierto"
+        if not page_role and legacy_form:
+            page_role = {
+                "indice": "indice_combinado" if tipo == "mixto" else "indice_listado",
+                "detalle": "detalle_individual", "noticia": "noticia",
+                "incierto": "desconocido", "cultural": "desconocido",
+            }.get(legacy_form, "desconocido")
+        if page_role not in CONTENT_PAGE_ROLES:
+            page_role = "desconocido"
         if tipo not in CONTENT_TIPOS:
             tipo = "incierto"
-        decision = _classification_decision(forma, tipo)
+        exclusion = str(raw.get("exclusion", "nenhuma")).strip().lower()
+        if legacy_form == "cultural":
+            exclusion = "cultural"
+        if exclusion not in {"nenhuma", "licitacao", "cultural"}:
+            exclusion = "nenhuma"
+        if candidate.evidence_state == "incompleta_antibot":
+            page_role = "incompleto_antibot"
+        decision = _classification_decision(page_role, tipo, candidate, exclusion)
+        candidate.page_role = page_role
+        candidate.decision = decision
+        candidate.bucket = (
+            "combinado" if tipo == "mixto" else
+            "concurso_publico" if tipo == "concurso" else
+            "processo_seletivo" if tipo == "pss" else "combinado"
+        )
+        candidate.note = str(raw.get("razao", ""))[:240]
         routed.append({
             "id": candidate_id,
             "url": candidate.url,
             "bucket_hint": candidate.bucket_hint,
-            "forma": forma,
+            "page_role": page_role,
+            "forma": legacy_form or (
+                "indice" if page_role in {"indice_listado", "indice_combinado"}
+                else "detalle" if page_role == "detalle_individual"
+                else page_role if page_role == "noticia" else "incierto"
+            ),
             "tipo": tipo,
+            "source_kind": candidate.source_kind,
+            "authority": candidate.authority,
+            "identity": candidate.identity,
+            "evidence_state": candidate.evidence_state,
             "decision_code": decision,
             "razao": str(raw.get("razao", ""))[:240],
         })
 
         # Strict precedence: rejected or uncertain forms never enter a bucket
         # pool and therefore can never be reassigned as the "opposite" type.
-        if decision in {
-            "concurso_cultural_rechazado",
-            "detalle_individual_rechazado",
-            "revisar",
+        if decision not in {
+            "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
         }:
             route_notes.append(f"candidate {candidate_id}: {decision}")
             hinted = _hint_buckets(candidate)
@@ -1579,12 +1736,12 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
     if not candidates:
         return _empty_tier3_result()
 
-    fetchable = [c for c in candidates if c.fetchable and c.page]
-    if not fetchable:
+    accessible = [c for c in candidates if c.accessible and c.page]
+    if not accessible:
         return _empty_tier3_result()
 
     items = []
-    for i, c in enumerate(fetchable):
+    for i, c in enumerate(accessible):
         # The removed combined-fill rendered SPA/thin pages and inspected up to
         # 4k of visible content. Preserve that evidence here so forma/tipo can
         # classify a genuine mixed index without a post-selection shortcut.
@@ -1605,6 +1762,10 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
             "url": c.url,
             "menu_text": c.menu_text or "(encontrado via busca)",
             "source": c.source,
+            "source_kind": c.source_kind,
+            "authority": c.authority,
+            "identity": c.identity,
+            "evidence_state": c.evidence_state,
             "title": (c.page.title if c.page else "")[:120],
             "content_preview": preview,
             "link_samples": link_samples[:8],
@@ -1615,18 +1776,25 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         f"Classifique por CONTEUDO as {len(items)} candidatas e depois escolha a "
         "melhor candidata elegivel para cada bucket. A URL e apenas identificador: "
         "NAO use slug/caminho para decidir forma ou tipo.\n\n"
-        "Para CADA candidata devolva duas dimensoes discretas:\n"
-        "- forma: indice | detalle | noticia | cultural | incierto\n"
+        "Para CADA candidata devolva dimensoes discretas:\n"
+        "- page_role (SOMENTE estrutura): indice_listado | indice_combinado | "
+        "detalle_individual | noticia | menu_sin_listado | incompleto_antibot | desconocido\n"
         "- tipo: concurso | pss | mixto | incierto\n\n"
+        "- exclusion: nenhuma | licitacao | cultural\n\n"
         "Precedencia obrigatoria:\n"
         "1. cultural sempre e rejeitada, nunca realocada.\n"
-        "2. detalle/noticia sempre e rejeitada: um edital, noticia ou registro unico "
-        "nao e indice, mesmo com PDF ou numa SPA.\n"
-        "3. forma incierto exige revisao; nao presuma o tipo oposto.\n"
-        "4. So forma=indice, comprovada por listagem navegavel de MULTIPLOS itens, "
-        "pode entrar nos buckets. Depois use tipo: mixto serve ambos; concurso ou pss "
+        "2. detalle_individual e noticia nao sao indices: um edital/noticia isolado "
+        "continua inelegivel mesmo com PDFs ou numa SPA.\n"
+        "3. menu_sin_listado e incompleto_antibot exigem revisao; nao presuma o tipo.\n"
+        "4. indice_listado/indice_combinado exige ESTRUTURA inequivoca de recurso "
+        "estavel (filtros, tabela/cards, paginacao, categoria ou endpoint de listagem). "
+        "Pode mostrar 0, 1 ou varios resultados: o conteo NAO e criterio. "
+        "Depois use tipo: mixto serve ambos; concurso ou pss "
         "serve somente o bucket correspondente; tipo incierto exige revisao.\n\n"
-        "Regras do seletor (somente candidatas forma=indice e tipo compativel):\n"
+        "AUTORIDADE/IDENTIDADE ja foram determinadas pelo codigo e aparecem nos dados. "
+        "NAO invente nem confirme autoridade, identidade, cadeia oficial ou URL; NAO "
+        "aceite por slug/dominio/caminho. Classifique page_role/tipo pelo conteudo.\n\n"
+        "Regras do seletor (somente candidatas elegiveis pelo contrato e tipo compativel):\n"
         "- Prefira o INDICE CANONICO: a listagem mais ampla e estavel. Entre uma\n"
         "  vista de TODOS os anos e uma filtrada por um ano so, escolha a de todos\n"
         "  os anos.\n"
@@ -1644,13 +1812,15 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
         prompt += (
             f"  [{item['id']}] {item['url']}\n"
             f"      menu: {item['menu_text']}\n"
+            f"      procedencia: {item['source_kind']}; authority={item['authority']}; "
+            f"identity={item['identity']}; evidence={item['evidence_state']}\n"
             f"      title: {item['title']}\n"
             f"      preview: {item['content_preview']}\n"
             f"      links_visiveis: {item['link_samples']}\n\n"
         )
     prompt += (
-        "Responda JSON: {\"classificacoes\":[{\"id\":0,\"forma\":\"...\","
-        "\"tipo\":\"...\",\"razao\":\"curta\"}],"
+        "Responda JSON: {\"classificacoes\":[{\"id\":0,\"page_role\":\"...\","
+        "\"tipo\":\"...\",\"exclusion\":\"nenhuma\",\"razao\":\"curta\"}],"
         "\"melhor_id_concursos\":0 ou null,\"melhor_id_processos\":1 ou null,"
         "\"razao\":\"curta\"}. Classifique TODOS os IDs."
     )
@@ -1674,7 +1844,7 @@ def tier3_classify_and_pick(session: requests.Session, model: str,
             return _empty_tier3_result()
 
         routed = _route_classified_candidates(
-            fetchable,
+            accessible,
             result.get("classificacoes") or [],
             {
                 "concursos": result.get("melhor_id_concursos"),
@@ -2055,21 +2225,19 @@ def _deterministic_verify(url: str, bucket: str,
     if not cand or not cand.page:
         return False
     page = cand.page
-    # Confirmation uses rendered content/title only. The URL slug may discover
-    # a candidate, but it cannot decide or confirm the final bucket.
-    text = norm(page.title + " " + page.text[:2000])
-
-    kw_list = CONCURSO_VERIFY_KW if bucket == "concursos" else PSS_VERIFY_KW
-    has_keyword = any(k in text for k in kw_list)
-    listing_matches = len(LISTING_RE.findall(page.text[:3000]))
-    has_multiple_items = listing_matches >= 2
-
-    # A generic "Editais" index that already exposes several edital-like items
-    # (NN/AAAA numbers, "Edital Nº", inscrições, homologação) is a valid listing
-    # for the bucket even without the literal "concurso/processo" keyword.
-    is_editais_index = ("editais" in text or "edital" in text) and listing_matches >= 3
-
-    return (has_keyword or is_editais_index) and has_multiple_items
+    anchors = [{"href": href, "text": text} for href, text in page.links]
+    contract = verdict.evaluate_candidate_contract(
+        page.text, bucket, title=page.title, anchors=anchors,
+        source_kind=cand.source_kind, authority=cand.authority,
+        identity=cand.identity, evidence_state=cand.evidence_state,
+        accessible=cand.accessible, provenance=cand.provenance,
+    )
+    cand.page_role = contract.page_role
+    cand.decision = contract.decision
+    cand.note = contract.note
+    return contract.decision in {
+        "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
+    }
 
 
 def batch_gemini_verify(session: requests.Session, model: str,
@@ -2109,17 +2277,19 @@ def batch_gemini_verify(session: requests.Session, model: str,
         "Para cada item abaixo, responda se a URL e uma pagina INDICE/LISTAGEM "
         "valida para o bucket indicado (concursos ou processos seletivos).\n\n"
         "Criterios para CONFIRMAR:\n"
-        "- A pagina lista MULTIPLOS editais/concursos/processos (nao so um)\n"
+        "- Ha estrutura inequivoca e estavel de listagem (filtros, tabela/cards, "
+        "paginacao, categoria ou endpoint), mesmo com 0 ou 1 resultado visivel\n"
         "- O conteudo corresponde ao bucket (concursos OU processos seletivos)\n"
         "- E uma pagina de listagem, nao um edital individual ou PDF\n"
         "- Paginas combinadas (ambos tipos) sao validas para ambos buckets\n"
-        "- A URL pertence ao MESMO dominio do site oficial (ou subdominio)\n\n"
+        "- A autoridade/identidade vem da evidencia fornecida pelo codigo; NAO a "
+        "invente nem a confirme por slug, dominio ou caminho da URL\n\n"
         "Criterios para REVISAR:\n"
-        "- Pagina de um unico edital\n"
+        "- Pagina de um unico edital com anexos, sem estrutura de listagem\n"
         "- Conteudo nao corresponde ao bucket\n"
         "- Pagina generica sem editais visiveis\n"
         "- Licitacoes ou concursos culturais\n"
-        "- URL de dominio DIFERENTE do site oficial (ex: banca, fundacao, outro orgao)\n\n"
+        "- Portal externo sem cadeia oficial comprovada nos dados de procedencia\n\n"
         f"Items a verificar:\n{items_text}\n"
         "Responda JSON array. Cada elemento: "
         "{\"id\": N, \"veredicto\": \"confirmado\" ou \"revisar\", "
@@ -2185,7 +2355,9 @@ def grounded_verify_one(session: requests.Session, model: str,
         f"URL: {url}\n\n"
         "Use a busca do Google para ver o conteudo real indexado desta pagina "
         "(ela pode ter protecao anti-bot que impede leitura direta pelo crawler).\n"
-        "A pagina LISTA MULTIPLOS editais/concursos/processos (nao apenas um)?\n"
+        "A pagina mostra ESTRUTURA inequivoca e estavel de listagem (filtros, "
+        "tabela/cards, paginacao, categoria ou endpoint), mesmo com 0 ou 1 resultado? "
+        "Nao confirme autoridade por slug/dominio e nao exija multiplos resultados.\n"
         "Responda APENAS em JSON: {\"veredicto\": \"confirmado\" ou \"revisar\", "
         "\"motivo\": \"frase curta\", "
         "\"evidencia\": \"itens concretos que a busca mostrou\"}"
@@ -2355,7 +2527,9 @@ def process_municipio(session: requests.Session, municipio: str,
     if (not chosen["url_concursos"] or not chosen["url_processos_seletivos"]) \
             and gemini_api_key():
         existing_urls = {c.url for c in all_candidates}
-        probe_cands = _probe_known_index_paths(session, home, existing_urls, timeout)
+        probe_cands = _probe_known_index_paths(
+            session, home, existing_urls, municipio, timeout,
+        )
         if probe_cands:
             all_candidates.extend(probe_cands)
             tiers_used.append("probe")

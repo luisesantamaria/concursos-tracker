@@ -75,6 +75,9 @@ def _candidate(url: str, bucket_hint: str, *, title: str = "") -> C.Candidate:
         url=url,
         source="offline_fixture",
         page=page,
+        source_kind="dominio_oficial_prefeitura",
+        authority="confirmada",
+        identity="confirmada",
         content_preview=page.text,
         bucket_hint=bucket_hint,
     )
@@ -138,7 +141,7 @@ def test_run497_offline_replay_uses_closed_audit_verdicts():
     result = _route_one(tapes["url"], "processos", "noticia", "pss")
     assert result["url_concursos"] == ""
     assert result["url_processos_seletivos"] == ""
-    assert result["decision_processos"] == "detalle_individual_rechazado"
+    assert result["decision_processos"] == "nao_encontrado"
 
 
 def test_reassigned_candidate_competes_with_occupied_destination():
@@ -252,7 +255,8 @@ def test_detail_and_news_variants_never_enter_index_pools():
         )
         assert result["url_concursos"] == "", label
         assert result["url_processos_seletivos"] == "", label
-        assert result["decision_processos"] == "detalle_individual_rechazado", label
+        expected = "nao_encontrado" if forma == "noticia" else "detalle_individual_rechazado"
+        assert result["decision_processos"] == expected, label
 
 
 def test_tier3_single_call_parses_dimensions_then_applies_selector():

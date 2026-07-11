@@ -51,8 +51,9 @@ def test_year_navigation_without_listing_is_rejected():
     ])
     state, predicates = V.candidate_content_state(
         text, "concursos", title="Concursos Públicos")
-    assert state == "nao_encontrado"
+    assert state == "revisar"
     assert predicates["has_event_listing"] is False
+    assert predicates["page_role"] == "menu_sin_listado"
 
 
 def test_numeric_news_article_without_listing_is_rejected():
@@ -63,8 +64,9 @@ def test_numeric_news_article_without_listing_is_rejected():
     ])
     state, predicates = V.candidate_content_state(
         text, "concursos", title="Concurso Público — Prefeitura")
-    assert state == "detalle_individual_rechazado"
+    assert state == "nao_encontrado"
     assert predicates["is_single_article"] is True
+    assert predicates["page_role"] == "noticia"
 
 
 def test_single_event_document_detail_without_index_signals_is_rejected():
@@ -86,7 +88,9 @@ def test_single_event_document_detail_without_index_signals_is_rejected():
     candidate = C.candidate_from_evidence(
         page.url, "fixture", "Concurso Público", "Cidade Exemplo", page,
     )
-    assert candidate.fetchable is False
+    assert candidate.accessible is True
+    assert candidate.eligible is False
+    assert candidate.decision == "detalle_individual_rechazado"
 
 
 def test_multiple_event_index_remains_official():

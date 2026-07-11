@@ -482,7 +482,8 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
                           extract_mode: str, title: str, text: str,
                           anchors: list, *, allow_second_fetch: bool = True,
                           fixture_items: list[dict] | None = None,
-                          deterministic_first_threshold: int = 0):
+                          deterministic_first_threshold: int = 0,
+                          evidence_state: str = "completa"):
     if not (text or "").strip():
         _dump_render_snapshot(
             url, municipio, bucket, title, text, anchors, [], "revisar",
@@ -492,8 +493,10 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
         waf_guard.freeze(url)
         _dump_render_snapshot(
             url, municipio, bucket, title, text, anchors, [], "revisar",
-            {"motivo_code": "revisar_op:waf_challenge"})
-        return ("revisar", "revisar_op:waf_challenge")
+            {"motivo_code": "revisar_op:incompleto_antibot",
+             "page_role": "incompleto_antibot",
+             "evidence_state": "incompleta_antibot", "accessible": True})
+        return ("revisar", "revisar_op:incompleto_antibot: diagnostico conservado")
     if _is_server_error(title, text):
         _dump_render_snapshot(
             url, municipio, bucket, title, text, anchors, [], "revisar",
@@ -514,13 +517,15 @@ def _verdict_from_content(session, model, municipio, bucket, url, timeout,
             url, municipio, bucket, title, text, anchors, [], "revisar",
             {"motivo": "pagina de definicion sin listado (no es indice)"})
         return ("revisar", "pagina de definicion sin listado (no es indice)")
-    # Regla de oro: sin >=1 item de listado real (solo la palabra clave en titulo/menu),
-    # NO es indice -> revisar.
-    if not _has_real_listing_item(text):
+    # Regla de oro estructural: un indice puede mostrar 0, 1 o varios resultados.
+    # Solo se rechaza cuando no hay item real NI shell inequivoco de listado.
+    if not _has_real_listing_item(text) and not V.has_index_structure(
+            text, bucket, title=title, anchors=anchors):
         _dump_render_snapshot(
             url, municipio, bucket, title, text, anchors, [], "revisar",
-            {"motivo": "sin items de listado real (definicion/menu/vacia)"})
-        return ("revisar", "sin items de listado real (definicion/menu/vacia)")
+            {"motivo": "sin estructura inequivoca de listado",
+             "evidence_state": evidence_state, "accessible": True})
+        return ("revisar", "sin estructura inequivoca de listado")
     if not C.gemini_api_key():
         return ("revisar", "sin api key")
 
@@ -629,7 +634,8 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
             fixture.get("title") or "", fixture.get("text") or "",
             fixture.get("anchors") or [], allow_second_fetch=False,
             fixture_items=fixture.get("items_llm") or [],
-            deterministic_first_threshold=deterministic_first_threshold)
+            deterministic_first_threshold=deterministic_first_threshold,
+            evidence_state="renderizada")
 
     if extract_mode in {"shadow", "authority"}:
         cached = _cached_content(url)
@@ -661,6 +667,7 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
     need_render = force_render_for_extract or (not (pg and pg.ok)) \
         or getattr(pg, "is_spa", False) or len((text or "").strip()) < 500 \
         or not _has_real_listing_item(text)
+    used_rendered_evidence = False
     if need_render:
         r = A.render_page(url, timeout)
         if r and (A._is_antibot_challenge(r[0], r[1])
@@ -668,10 +675,13 @@ def rendered_verdict(session, model, municipio, bucket, url, timeout,
                   or (not _has_real_listing_item(text)
                       and len((r[1] or "").strip()) >= 500)):
             title, text, anchors = r[0], r[1], r[2]
+            used_rendered_evidence = True
     return _verdict_from_content(
         session, model, municipio, bucket, url, timeout, extract_mode,
         title, text, anchors,
-        deterministic_first_threshold=deterministic_first_threshold)
+        allow_second_fetch=not used_rendered_evidence,
+        deterministic_first_threshold=deterministic_first_threshold,
+        evidence_state="renderizada" if used_rendered_evidence else "completa")
 
 
 # Rutas canonicas por bucket (patrones recurrentes: govbr /site/concursos, IPM /concurso,

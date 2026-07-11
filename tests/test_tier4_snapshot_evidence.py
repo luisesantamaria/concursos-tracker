@@ -126,8 +126,10 @@ def test_snapshot_none_status_is_neutral_but_captured_http_error_is_rejected():
     neutral, _ = collect_one(snapshot(status=None))
     failed, _ = collect_one(snapshot(status=503))
 
-    assert neutral[0].fetchable is True
-    assert failed[0].fetchable is False
+    assert neutral[0].accessible is True
+    assert neutral[0].evidence_state == "renderizada"
+    assert failed[0].accessible is False
+    assert failed[0].evidence_state == "error_fetch"
 
 
 def test_canonical_candidate_api_accepts_http_or_playwright_evidence():
@@ -151,11 +153,11 @@ def test_canonical_candidate_api_accepts_http_or_playwright_evidence():
 INVALID_RENDER_CASES = [
     pytest.param(
         "Página não encontrada\nErro 404\nConteúdo indisponível\nPrefeitura Municipal de Nova Esperança",
-        "Página não encontrada", id="soft404",
+        "Página não encontrada", "nao_encontrado", id="soft404",
     ),
     pytest.param(
         "Prefeitura Municipal de Nova Esperança\nSite em construção\nVolte em breve\nSem publicações",
-        "Site em construção", id="dead-site",
+        "Site em construção", "nao_encontrado", id="dead-site",
     ),
     pytest.param(
         "\n".join([
@@ -164,14 +166,14 @@ INVALID_RENDER_CASES = [
             "A administração anunciou a futura banca.", "Veja também",
             "Notícias relacionadas",
         ]),
-        "Concurso Público — Prefeitura", id="noticia",
+        "Concurso Público — Prefeitura", "nao_encontrado", id="noticia",
     ),
     pytest.param(
         "\n".join([
             "Prefeitura Municipal de Nova Esperança", "Concursos Públicos",
             "Escolha o ano", "Concursos Públicos 2024", "Concursos Públicos 2025",
         ]),
-        "Concursos Públicos", id="menu-sin-listado",
+        "Concursos Públicos", "revisar", id="menu-sin-listado",
     ),
     pytest.param(
         "\n".join([
@@ -179,16 +181,21 @@ INVALID_RENDER_CASES = [
             "CONCURSO PÚBLICO 2025", "DOWNLOADS DE DOCUMENTOS:",
             "EDITAL DE CONVOCAÇÃO Nº 02/2026", "Baixar agora!",
         ]),
-        "Concurso Público 2025", id="detalle-individual",
+        "Concurso Público 2025", "detalle_individual_rechazado",
+        id="detalle-individual",
     ),
 ]
 
 
-@pytest.mark.parametrize(("text", "title"), INVALID_RENDER_CASES)
-def test_t3_invalid_render_is_rejected_by_canonical_gates(text, title):
+@pytest.mark.parametrize(("text", "title", "expected_decision"), INVALID_RENDER_CASES)
+def test_t3_invalid_render_is_rejected_by_canonical_gates(
+        text, title, expected_decision):
     candidates, _ = collect_one(snapshot(text=text, title=title))
     assert len(candidates) == 1
-    assert candidates[0].fetchable is False
+    assert candidates[0].accessible is True
+    assert candidates[0].eligible is False
+    assert candidates[0].decision == expected_decision
+    assert candidates[0].note
 
 
 def test_t4_other_official_municipality_and_nonmunicipal_third_party_are_rejected():
@@ -204,8 +211,12 @@ def test_t4_other_official_municipality_and_nonmunicipal_third_party_are_rejecte
     other_candidates, _ = collect_one(other_official)
     third_candidates, _ = collect_one(third_party)
 
-    assert other_candidates[0].fetchable is False
-    assert third_candidates[0].fetchable is False
+    assert other_candidates[0].accessible is True
+    assert other_candidates[0].identity == "rechazada"
+    assert other_candidates[0].eligible is False
+    assert third_candidates[0].accessible is True
+    assert third_candidates[0].identity == "desconocida"
+    assert third_candidates[0].eligible is False
 
 
 @pytest.mark.parametrize(("initial_url", "final_url", "expected"), [
@@ -220,7 +231,8 @@ def test_t4_other_official_municipality_and_nonmunicipal_third_party_are_rejecte
 ])
 def test_t5_identity_uses_final_url_after_redirect(initial_url, final_url, expected):
     candidates, renderer = collect_one(snapshot(final_url), href=initial_url)
-    assert candidates[0].fetchable is expected
+    assert candidates[0].eligible is expected
+    assert candidates[0].accessible is True
     assert candidates[0].url == final_url
     assert candidates[0].page.url == final_url
     renderer.assert_called_once_with(initial_url)
@@ -249,5 +261,8 @@ def test_t6_multiple_playwright_candidates_are_validated_individually():
     ], MUNICIPIO, renderer)
 
     assert renderer.call_count == 2
-    assert [candidate.url for candidate in candidates if candidate.fetchable] == [valid_url]
-    assert [candidate.url for candidate in candidates if not candidate.fetchable] == [invalid_url]
+    assert [candidate.url for candidate in candidates if candidate.eligible] == [valid_url]
+    assert [candidate.url for candidate in candidates if not candidate.eligible] == [invalid_url]
+    assert all(candidate.accessible for candidate in candidates)
+    assert candidates[1].decision == "nao_encontrado"
+    assert candidates[1].page_role == "noticia"

@@ -67,20 +67,22 @@ Tier 4 - Agente de navegacao (Playwright)
 - Script `medir_golden_set.py` mede precisao e cobertura por tipo de portal.
 - Rodar apos QUALQUER mudanca no verificador ou seletor.
 
-### Estado atual - 2026-07-08
+### Estado atual - 2026-07-11
 
-Execucao de novos chunks do run497 pausada por qualidade antes de continuar a cobertura. A triagem manual dos 618 buckets confirmou FPs em Itaara, Canudos e Estrela, com uma cauda de ~30 municipios duvidosos ainda para auditoria um a um.
+Execucao ampla continua pausada, mas o contrato estrutural e a cauda de risco ja
+foram validados offline. O proximo passo autorizado e apenas o canario isolado de
+Barros Cassal, Boa Vista do Sul e Progresso; chunks 5-6 seguem sem execucao.
 
 Familias de FP ja detectadas: noticias individuais classificadas como indice, paginas genericas de menu sem listagem real, e sobre-conteo por resultados duplicados/inflados. Depois de mapear a cauda, corrigir cada familia no pipeline e validar contra o golden set. So entao retomar fase 2 chunks 5-6.
 
 ### Pendencias desta fase
 
-- [ ] Implementar ai_pick_best (substituir scorer numerico).
-- [ ] Headers de navegador real (corrigir 406 anti-bot).
+- [x] Implementar ai_pick_best sem scorer numerico.
+- [x] Headers de navegador real para reduzir 406 anti-bot.
 - [ ] Cache de grounding por municipio.
-- [ ] Deteccao de JS e fallback Playwright dirigido (Tier 4).
+- [x] Deteccao de JS e fallback Playwright dirigido (Tier 4), con snapshot reutilizable.
 - [ ] Escalar golden set com municipios de outras letras.
-- [ ] Auditar a cauda duvidosa do run497 e classificar familias de FP antes de continuar chunks 5-6.
+- [x] Auditar la cola de riesgo run497 y cerrar noticia/menu/detalle; overcount ya no decide por conteo.
 
 ## Fase 3 - Scanner de Indices
 
@@ -125,3 +127,45 @@ Gate para publicar: (a) "edital"/"processo seletivo" no nome, (b) fonte oficial,
 - Matching por perfil do usuario.
 - Alertas de ciclo de vida.
 - Atualizacao incremental diaria (cron nocturno).
+
+## Contrato estructural Fase 2 — 2026-07-11
+
+La unidad de verdad es una superficie oficial, estable y reutilizable; Fase 2 no
+extrae eventos ni PDFs. El contrato ejecutable vive en
+`scripts/eval/verdict_extract.py` y separa dimensiones que antes estaban
+mezcladas:
+
+- `source_kind`: `dominio_oficial_prefeitura | portal_externo_delegado | banca | diario | desconocido`.
+- `authority` e `identity`: triestado `confirmada | rechazada | desconocida`;
+  ausencia de evidencia no equivale a rechazo y la autoridad nunca se infiere
+  por slug.
+- `page_role`: `indice_listado | indice_combinado | detalle_individual |
+  noticia | menu_sin_listado | incompleto_antibot | desconocido`.
+- `evidence_state`: `completa | incompleta_antibot | renderizada | error_fetch`.
+  `accessible=False` solo corresponde a `error_fetch`.
+- `bucket`: `concurso_publico | processo_seletivo | combinado`, decidido por
+  contenido.
+- `decision`: vocabulario canónico cerrado:
+  `indice_oficial | indice_oficial_combinado | portal_externo_oficial |
+  detalle_individual_rechazado | licitacao_rechazada |
+  concurso_cultural_rechazado | nao_encontrado | revisar`.
+
+Mapeo discreto: un índice con autoridad e identidad confirmadas se acepta; el
+portal externo requiere cadena de navegación oficial explícita; noticia deriva
+en `nao_encontrado`; menú sin listado y antibot incompleto derivan en
+`revisar`; detalle, licitación y cultural conservan sus rechazos. Un índice es
+válido con **0, 1 o múltiples resultados** si filtros, tabla/cards, paginación,
+categoría o endpoint prueban inequívocamente la estructura. `certame_unico` no
+rechaza por sí solo.
+
+`Candidate.fetchable` queda como alias operacional de `accessible`; la
+elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
+permanece con `decision+note`. Un `EvidenceSnapshot` de Playwright conserva
+`renderizada` y no provoca un segundo GET.
+
+`pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
+veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;
+el replay de 618 fixtures no mostró ningún flip atribuible a ese nombre.
+
+Estado: matriz contractual 10/10 y suite offline pertinentes verdes. Listo para
+el canario aislado del Paso 6; no reanudar chunks 5/6 como parte de este cambio.
