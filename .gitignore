@@ -33,6 +33,7 @@ build/
 
 # Runtime output and generated files
 /staging/fase2_v2/memory/
+/staging/fase2_v2/eval/
 logs/
 log/
 output/

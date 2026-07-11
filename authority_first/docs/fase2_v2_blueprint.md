@@ -630,6 +630,62 @@ CSV canónico ni `authority_first/data/`. La promoción a cualquier consumidor d
 producción queda fuera de esta arquitectura de staging y requiere una ronda y
 autorización explícitas.
 
+## Runner golden y diferencial V1/V2 reproducible (ronda 8)
+
+El runner vive en `scripts/fase2_municipios/v2/eval/golden_runner.py`. Su unidad
+es `(municipio, bucket)`, con los buckets cerrados `concurso_publico` y
+`processo_seletivo`: proceden respectivamente de `url_concursos` más
+`urls_concursos_extra`, y `url_processos_seletivos` más
+`urls_processos_extra` del golden. `indice_oficial_combinado` confirma la unidad
+evaluada de ambos buckets; `portal_externo_oficial` confirma solo el bucket que
+declara la unidad del corpus.
+
+El artefacto fuente de verdad es JSON schema 1 en UTF-8, claves ordenadas, listas
+ordenadas, LF final y sin timestamps, rutas absolutas ni metadata del entorno.
+Cada fila contiene golden, decisión/recurso/evidencia V1, decisión/recurso/citas/
+evidencia V2 y las tres clasificaciones cerradas. `flip_v1_v2` admite solamente
+`both_confirm_same_resource`, `both_confirm_distinct_resource`,
+`v2_confirm_v1_review`, `v1_confirm_v2_review`, `both_review`, `both_negative`,
+`v2_confirm_v1_negative`, `v1_confirm_v2_negative`,
+`v2_review_v1_negative` y `v1_review_v2_negative`. `v1_vs_golden` y
+`v2_vs_golden` admiten `match`, `differ` o `golden_na`. El CSV es una vista
+derivada para humanos, no la base del determinismo.
+
+`replay` consume un corpus schema 1 congelado por unidad: bloque V1 con decisión
+y evidencia propia; bloque V2 con `EvidenceSnapshot`, propuestas A/B y casete de
+C. Las citas se vuelven a validar contra el snapshot y el resultado V2 se obtiene
+mediante `ABCOrchestrator`. La identidad del recurso importa
+`cascade_municipios._normalized_candidate_url`; la paridad golden llama a
+`scripts/eval/medir_golden_set.py`, sin copiar métricas. Falta de unidad,
+evidencia, fuente, propuesta o casete aborta explícitamente y nunca fabrica
+`nao_encontrado`. Los fixtures bajo `eval/tests/fixtures/` son sintéticos y no
+son el corpus representativo de 24 municipios.
+
+La hoja `adjudication` incluye únicamente divergencias y mantiene bloques V1 y
+V2 separados: snapshot ref, autoridad, identidad, motivo y, solo para V2,
+fuentes y citas ancladas. Un flip o diferencia contra golden se informa y nunca
+es gate automático. La confirmación sigue sujeta al gate determinista V2; la
+adjudicación humana conserva la política de cero falsos positivos.
+
+`live` exige adaptadores inyectados de fetch/modelo/reloj. Antes de delegar una
+request, valida proveedor `gemini_free`, los tres modelos de `RoleModels`,
+credencial free explícita, ausencia de `GEMINI_API_KEY_PAID`, `GEMINI_API_KEY` y
+`GOOGLE_APPLICATION_CREDENTIALS`, y grounding desactivado mediante el knob real
+del SDK/config: `tools` debe estar ausente o ser `None`. El CLI permite validar
+el contrato offline con:
+
+```bash
+GEMINI_API_KEY_FREE=<free-key> python -m \
+  scripts.fase2_municipios.v2.eval.golden_runner live \
+  --provider gemini_free --tools none --validate-only
+```
+
+Para la ejecución real Orion inyecta sus adaptadores en `run_live`; este módulo
+no agrega fallback pago ni ADC. V1 no ofrece hoy un seam live limpio que elimine
+su fallback histórico, por lo que el replay lo envuelve externamente y no cambia
+su lógica. Los artefactos de corrida van en `staging/fase2_v2/eval/`, ignorado
+por Git. El golden, CSV canónico, V1 y skills permanecen intactos.
+
 ## Decisiones abiertas para el CEREBRO
 
 - Revisar periódicamente la disponibilidad free de los modelos fijados en ronda
@@ -647,6 +703,8 @@ autorización explícitas.
   mediante content-addressed storage y cuáles son las reglas de redacción.
 - Resolver la divergencia Python local 3.14.4 versus objetivo 3.12 antes de una
   implementación de producción.
+- Aportar el corpus replay real de los 24 municipios; los fixtures sintéticos
+  solo prueban el contrato y no constituyen una medición representativa.
 
 Decisiones triviales resueltas conservadoramente en este paso: UTF-8 explícito,
 orden lexicográfico/fijo, contratos mínimos que no exigen opcionales, búsqueda de

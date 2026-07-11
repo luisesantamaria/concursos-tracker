@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "municipio": "Fixture Dual",
+      "bucket": "concurso_publico",
+      "v1": {
+        "decision": "indice_oficial",
+        "url": "https://www.example.invalid/concursos/?b=2&a=1#top",
+        "evidence": {
+          "snapshot_ref": "v1-sha256:synthetic-concurso",
+          "authority": "confirmada",
+          "identity": "confirmada",
+          "reason": "synthetic V1 evidence"
+        }
+      },
+      "v2": {
+        "evidence": {
+          "snapshot_ref": "v2-sha256:synthetic-concurso",
+          "authority": "confirmada",
+          "identity": "confirmada",
+          "reason": "synthetic V2 evidence",
+          "sources": [
+            {
+              "source_id": "main",
+              "url": "http://example.invalid/concursos?a=1&b=2",
+              "retrieved_at": "2026-07-11T12:00:00+00:00",
+              "content": "Official index"
+            }
+          ]
+        },
+        "citations": [
+          {
+            "source_id": "main",
+            "start": 0,
+            "end": 14,
+            "quote": "Official index"
+          }
+        ],
+        "candidate": {
+          "candidate_id": "candidate-synthetic-concurso",
+          "url": "http://example.invalid/concursos?a=1&b=2",
+          "decision": "indice_oficial",
+          "bucket": "concurso_publico",
+          "authority": "confirmada",
+          "identity": "confirmada",
+          "evidence_state": "completa",
+          "source_kind": "dominio_oficial_prefeitura"
+        },
+        "proposal_a": {
+          "decision": "indice_oficial",
+          "bucket": "concurso_publico",
+          "candidate_id": "candidate-synthetic-concurso",
+          "resource_url": "http://example.invalid/concursos?a=1&b=2",
+          "citations": [
+            {
+              "source_id": "main",
+              "start": 0,
+              "end": 14,
+              "quote": "Official index"
+            }
+          ],
+          "reason": "synthetic A"
+        },
+        "proposal_b": {
+          "decision": "indice_oficial",
+          "bucket": "concurso_publico",
+          "candidate_id": "candidate-synthetic-concurso",
+          "resource_url": "http://example.invalid/concursos?a=1&b=2",
+          "citations": [
+            {
+              "source_id": "main",
+              "start": 0,
+              "end": 14,
+              "quote": "Official index"
+            }
+          ],
+          "reason": "synthetic B"
+        },
+        "judge_response": {
+          "decision": "aceptar_A",
+          "reason": "unused consensus cassette"
+        }
+      }
+    },
+    {
+      "municipio": "Fixture Dual",
+      "bucket": "processo_seletivo",
+      "v1": {
+        "decision": "revisar",
+        "url": "",
+        "evidence": {
+          "snapshot_ref": "v1-sha256:synthetic-pss",
+          "authority": "desconocida",
+          "identity": "desconocida",
+          "reason": "synthetic V1 review"
+        }
+      },
+      "v2": {
+        "evidence": {
+          "snapshot_ref": "v2-sha256:synthetic-pss",
+          "authority": "desconocida",
+          "identity": "desconocida",
+          "reason": "synthetic V2 review",
+          "sources": [
+            {
+              "source_id": "main",
+              "url": "https://example.invalid/review",
+              "retrieved_at": "2026-07-11T12:00:00+00:00",
+              "content": "Official index"
+            }
+          ]
+        },
+        "citations": [],
+        "candidate": null,
+        "proposal_a": {
+          "decision": "revisar",
+          "bucket": "processo_seletivo",
+          "candidate_id": "",
+          "resource_url": "",
+          "citations": [],
+          "reason": "synthetic A review"
+        },
+        "proposal_b": {
+          "decision": "revisar",
+          "bucket": "processo_seletivo",
+          "candidate_id": "",
+          "resource_url": "",
+          "citations": [],
+          "reason": "synthetic B review"
+        },
+        "judge_response": {
+          "decision": "revisar",
+          "reason": "unused review consensus cassette"
+        }
+      }
+    }
+  ]
+}
