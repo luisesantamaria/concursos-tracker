@@ -700,6 +700,18 @@ su fallback histórico, por lo que el replay lo envuelve externamente y no cambi
 su lógica. Los artefactos de corrida van en `staging/fase2_v2/eval/`, ignorado
 por Git. El golden, CSV canónico, V1 y skills permanecen intactos.
 
+El entrypoint turnkey está en
+`scripts/fase2_municipios/v2/eval/run_golden_live.py`. Exige dos inputs que no
+se derivan del golden: un CSV dirigido `municipio,bucket,url` con una unidad por
+bucket y un directorio V1 completo compatible con `Run497V1Source`. Recorre las
+unidades mediante `run_live(enable_live_abc=True)`, publica el cassette solo si
+las 48 unidades están completas y genera `differential.json`,
+`differential.csv`, `flips.json` y `live_audit.json`. Un fallo por unidad queda
+en el audit como `revisar`, continúa las unidades restantes y bloquea la
+publicación de cassette/diferencial parcial. La CLI restringe `--output-dir` a
+`staging/fase2_v2/eval/` y exige explícitamente `--provider gemini_free`,
+`--tools none` y `--grounding off`.
+
 ## Selector estratificado para staging live (ronda 9)
 
 El selector offline vive en
