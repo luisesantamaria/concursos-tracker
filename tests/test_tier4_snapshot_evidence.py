@@ -92,9 +92,8 @@ def test_t1_tier4_snapshot_reaches_end_to_end_acceptance_despite_checkpoint_get(
         patch.object(C, "tier2_directed_bucket_search", return_value=[]),
         patch.object(C, "tier4_playwright_collect", side_effect=tier4),
         patch.object(C, "gemini_api_key", return_value="offline-key"),
-        patch.object(C, "gemini_post", return_value=gemini_response),
+        patch.object(C, "gemini_post", return_value=gemini_response) as selector,
         patch.object(C, "fetch_page", checkpoint_get),
-        patch.object(C, "_render_text", return_value=""),
     ):
         result = C.process_municipio(
             object(), MUNICIPIO, "gemini-2.5-flash", use_playwright=True,
@@ -106,6 +105,7 @@ def test_t1_tier4_snapshot_reaches_end_to_end_acceptance_despite_checkpoint_get(
     assert result.confianza_processos == "confirmado"
     renderer.assert_called_once_with(INDEX)
     checkpoint_get.assert_not_called()
+    selector.assert_not_called()  # one eligible combined record needs no AI tie-break
 
 
 def test_t2_valid_snapshot_prevents_second_requests_read():

@@ -426,8 +426,17 @@ class OfficialFetchFallbackContractTest(unittest.TestCase):
             final_url=self.official_url,
         ))
         index_page = C.Page(
-            url=index_url, status=200, title="Concursos Públicos",
-            text="Concurso Público Edital 01/2026 Edital 02/2025",
+            url=index_url, status=200,
+            title="Prefeitura Municipal de Barros Cassal - Concursos Públicos",
+            text=(
+                "Prefeitura Municipal de Barros Cassal\nConcursos Públicos\n"
+                "Formulário de filtro\nBuscar\n2 resultados encontrados\n"
+                "Concurso Público 01/2026\nConcurso Público 02/2025"
+            ),
+            html=(
+                "<html><body>Prefeitura Municipal de Barros Cassal "
+                "Concursos Públicos 2 resultados encontrados</body></html>"
+            ),
         )
         picked = {
             "url_concursos": index_url,

@@ -353,7 +353,7 @@ def test_valid_rendered_snapshot_confirms_without_second_get() -> None:
             object(), MUNICIPIO, "gemini-2.5-flash", use_playwright=True,
         )
 
-    assert result.confianza_concursos == "probable"
+    assert result.confianza_concursos == "confirmado"
     assert result.selected_evidence["concursos"].snapshot is rendered
     http_fetch = Mock(side_effect=AssertionError("second GET must not happen"))
 
@@ -397,7 +397,7 @@ def test_checkpoint_snapshot_does_not_confirm_by_url() -> None:
         )
 
     assert result.confianza_concursos == "revisar"
-    http_fetch.assert_called_once_with(session, INDEX, timeout=15)
+    http_fetch.assert_not_called()
 
 
 def test_missing_snapshot_keeps_legacy_fetch_path() -> None:
@@ -411,9 +411,7 @@ def test_missing_snapshot_keeps_legacy_fetch_path() -> None:
 
     with (
         patch.object(cascade, "fetch_page", return_value=http_page) as http_fetch,
-        patch.object(cascade, "batch_gemini_verify", return_value={
-            f"{MUNICIPIO}|concursos": ("confirmado", "conteudo legado valido"),
-        }) as gemini_verify,
+        patch.object(cascade, "batch_gemini_verify") as gemini_verify,
     ):
         cascade._batch_verify_uncertain_results(
             session, "gemini-2.5-flash", [result], timeout=15,
@@ -422,7 +420,8 @@ def test_missing_snapshot_keeps_legacy_fetch_path() -> None:
 
     assert result.confianza_concursos == "confirmado"
     http_fetch.assert_called_once_with(session, INDEX, timeout=15)
-    gemini_verify.assert_called_once()
+    gemini_verify.assert_not_called()
+    assert result.final_decisions["concursos"].reason
 
 
 def test_snapshot_from_other_municipality_fails_identity_gate() -> None:

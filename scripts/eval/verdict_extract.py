@@ -27,6 +27,12 @@ determinista:
 Estabilidad validada empíricamente (9/9 estable entre corridas sobre el caché):
 la única libertad del LLM es QUÉ líneas cita, y esa varianza es detectable
 (item aparece/desaparece, quote-check falla), no el conteo silencioso que oscilaba.
+
+En la cascada Fase 2 este contrato se ejecuta una sola vez al construir el
+``CandidateRecord`` inmutable. Tier 3 solo selecciona un ``candidate_id`` entre
+records elegibles; ``SelectedResource`` conserva la instancia exacta y
+``FinalDecision`` deriva de ella sin refetch ni re-adjudicación. La adaptación
+legacy obtiene evidencia una vez y entra por el mismo constructor central.
 """
 from __future__ import annotations
 import json

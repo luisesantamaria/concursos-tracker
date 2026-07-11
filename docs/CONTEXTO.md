@@ -19,7 +19,7 @@ A arquitetura mudou para **authority-first**:
 3. Depois diarios oficiais/FAMURS/portais municipais.
 4. Por ultimo Ache/PCI/outros radares como auditoria de cobertura.
 
-Depois, o pipeline de descoberta municipal evoluiu de um sistema de probes de URLs adivinhadas para uma **cascata de 5 tiers** (site oficial → links gratuitos → grounding → IA verificadora/seletora → agente de navegacao Playwright).
+Depois, o pipeline de descoberta municipal evoluiu de um sistema de probes de URLs adivinhadas para una **cascata de 5 tiers** (site oficial → links gratuitos → grounding → adjudicador determinista + IA seletora → agente de navegacao Playwright).
 
 Uma licao critica dessa evolucao: o sistema tentou usar um scorer numerico com ~50 constantes magicas para escolher entre URLs candidatas. Isso recriou o mesmo problema que o projeto fugiu — complexidade inmanejavel onde cada ajuste quebrava outro caso. O scorer foi abolido e substituido por decisoes discretas + Gemini como seletor inteligente (ai_pick_best).
 
@@ -46,7 +46,8 @@ O pipeline de descoberta municipal tem duas fases distintas que NAO devem ser mi
 - `authority_first/` e a implementacao canonica.
 - Um golden set de 24 municipios foi construido a mao para medir precisao/cobertura.
 - O golden set revelou que ~20% dos municipios precisam de revisao humana — esse e o teto esperado de automacao, nao um bug.
-- Gemini e usado como verificador/fallback e como seletor inteligente entre candidatas validas.
+- Gemini Tier 3 e usado somente como seletor inteligente entre candidatas ya
+  adjudicadas; no confirma ni reclassifica dimensiones.
 - Playwright esta implementado como ultimo recurso dirigido; su `EvidenceSnapshot`
   se reutiliza sin un segundo GET y queda marcado `evidence_state=renderizada`.
 - A metrica principal e precisao (zero falsos positivos), nao cobertura.
@@ -113,9 +114,33 @@ elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
 permanece con `decision+note`. Un `EvidenceSnapshot` de Playwright conserva
 `renderizada` y no provoca un segundo GET.
 
+La cadena ejecutable única es `CandidateRecord -> SelectedResource ->
+FinalDecision`. `CandidateRecord` y `EvidenceSnapshot` son profundamente
+inmutables: autoridad, identidad, rol, estado de evidencia, bucket, decisión y
+razón se calculan una vez, antes de Tier 3. Tier 3 recibe solo records elegibles
+y devuelve un `candidate_id`; un ID inexistente/incompatible o una selección no
+resuelta produce `revisar` con razón, sin modificar el record.
+
+`candidate_id` v1 es `v1:` + SHA-1 de JSON determinista con URL final normalizada
+(host minúsculo/sin `www`, fragmento descartado, slash final removido y query
+ordenada), source, tier, municipio normalizado, bucket adjudicado y SHA-1 del
+snapshot completo. Distingue buckets/capturas y sirve solo para auditoría, nunca
+para reconstruir records. Redirect/canonical conserva `requested_url` y
+`final_url`; autoridad e identidad se evalúan únicamente sobre la final y su
+contenido.
+
+La instancia exacta seleccionada llega a `FinalDecision`; no hay refetch ni
+segunda adjudicación batch. La compatibilidad URL-only obtiene una evidencia una
+vez, construye un record mediante el mismo adjudicador central y siempre emite
+razón. El CSV no cambia de esquema: URL/confianza/tier siguen en sus columnas y
+provenance (`candidate_id`, tier, requested/final) + razón se serializan en
+`razao`/`notes`. Telemetría JSON estable por candidato y bucket usa el logger
+`fase2.cascade` en stderr, configurable con `FASE2_LOG_LEVEL`.
+
 `pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
 veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;
 el replay de 618 fixtures no mostró ningún flip atribuible a ese nombre.
 
-Estado: matriz contractual 10/10 y suite offline pertinentes verdes. Listo para
-el canario aislado del Paso 6; no reanudar chunks 5/6 como parte de este cambio.
+Estado: cadena única y canario Barros Cassal verdes offline, matriz contractual
+10/10, suite completa verde y replay run497 sin flips frente a 2b0dc11. Los
+chunks reales 5/6 siguen fuera de alcance de este cambio.

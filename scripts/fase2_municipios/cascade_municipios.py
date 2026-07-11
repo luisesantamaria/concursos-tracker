@@ -9,22 +9,21 @@ costlier than Tier 3 (verifier), so it actually runs AFTER Tier 3. What each doe
     Tier 0 — Site oficial: find/confirm the prefeitura's base domain.
     Tier 1 — Free link discovery: HTML menus, anchors, sitemap, transparência.
     Tier 2 — Grounded search: Gemini + Google Search (only if still missing).
-    Tier 3 — Gemini verifier/selector: classifies candidates with discrete
-             decisions (indice_oficial, detalle_rechazado, licitacao_rechazada,
-             etc.) and picks the best among valid candidates by content.
+    Tier 3 — Gemini selector: receives immutable, deterministically adjudicated
+             CandidateRecords and returns a candidate_id for each bucket.
     Tier 4 — Playwright navigation agent: directed menu navigation as last resort.
 
 ACTUAL RUN ORDER per municipality (each step runs ONLY if buckets remain empty —
 spend expensive tools only when cheap ones fail):
     1. Tier 0           · Site oficial (free slug; grounded discovery if it misses)
     2. Tier 1           · Free links (renders the menu first if the site is a SPA)
-    3. Tier 3           · AI classifies Tier 1 candidates, picks the best index
+    3. Tier 3           · AI picks among eligible Tier 1 CandidateRecords
     4. Tier 2           · Grounded Google search for the missing bucket -> Tier 3
     5. Directed grounding · "site:host {tipo}" per missing bucket -> Tier 3
     6. Tier 4           · Playwright navigates the menus as a human -> Tier 3
-    7. (after ALL municipios) Batch verify the 'probable' URLs; then Grounded
-       verify those whose preview was empty (Cloudflare/SPA), reading Google's
-       index with a guardrail (>=1 chunk + evidence) against false positives.
+    7. FinalDecision derives directly from each exact SelectedResource. The
+       compatibility batch adapts URL-only legacy rows through the same central
+       adjudicator; selected records are never fetched or adjudicated again.
 
 The 'method' field records which tiers fired (e.g. 't0+t1+t3'). UF/scope is set
 by UF_SIGLA / UF_NOME below; the discovery logic itself is state-agnostic.
@@ -34,7 +33,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -42,7 +43,7 @@ import sys
 import time
 import traceback
 import unicodedata
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urljoin, urlparse, unquote
@@ -66,6 +67,16 @@ DEFAULT_MUNICIPIOS_URL = "https://dados.tce.rs.gov.br/dados/auxiliar/municipios.
 UF_SIGLA = "RS"
 UF_NOME = "Rio Grande do Sul"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+LOGGER = logging.getLogger("fase2.cascade")
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.propagate = False
+LOGGER.setLevel(getattr(
+    logging, os.environ.get("FASE2_LOG_LEVEL", "WARNING").upper(), logging.WARNING,
+))
 
 BAD_HOSTS = [
     "facebook.", "instagram.", "youtube.", "twitter.", "x.com",
@@ -141,7 +152,7 @@ class Page:
 
 @dataclass(frozen=True)
 class EvidenceSnapshot:
-    """Immutable evidence detached from the browser context that produced it."""
+    """Deeply immutable evidence detached from its HTTP/browser producer."""
 
     html: str
     text: str
@@ -151,6 +162,15 @@ class EvidenceSnapshot:
     status: int | None = None
     source: str = "playwright"
     evidence_state: str = "renderizada"
+    links: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        # Callers may still hand in Page.links (a list of lists/tuples). Detach it
+        # now so later browser/page mutation cannot alter the adjudicated record.
+        object.__setattr__(self, "links", tuple(
+            (str(link[0]), str(link[1]))
+            for link in (self.links or ()) if len(link) >= 2
+        ))
 
 
 # Compatibility name for the existing Tier 0/Tier 2 browser fallback API.
@@ -425,8 +445,9 @@ class Candidate:
     content_preview: str = ""
     evidence_snapshot: EvidenceSnapshot | None = field(default=None, repr=False)
     source_tier: str = ""
+    record: CandidateRecord | None = field(default=None, repr=False)
     # Discovery hint only. It records which bucket led us to the candidate so
-    # an uncertain classification can be returned to that bucket for review.
+    # an uncertain adjudication can be returned to that bucket for review.
     # It never decides the final bucket; forma/tipo from page content do that.
     bucket_hint: str = ""
 
@@ -451,13 +472,142 @@ class Candidate:
             "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
         }
 
+    @property
+    def candidate_id(self) -> str:
+        return self.record.candidate_id if self.record else ""
+
+
+def _candidate_url_key(url: str) -> str:
+    """Normalize a URL with the repository's existing comparison semantics."""
+    parsed = urlparse(clean_url(url))
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (parsed.path or "").rstrip("/")
+    query = "&".join(
+        f"{key.lower()}={value}" for key, value in
+        sorted(parse_qsl(parsed.query, keep_blank_values=True))
+    )
+    base = f"{host}{path}"
+    return f"{base}?{query}" if query else base
+
+
+def _freeze_provenance(
+        provenance: list[dict] | tuple[dict, ...],
+        ) -> tuple[tuple[tuple[str, str], ...], ...]:
+    """Detach arbitrary provenance mappings into deterministic immutable pairs."""
+    frozen = []
+    for item in provenance or ():
+        if not isinstance(item, dict):
+            continue
+        frozen.append(tuple(sorted(
+            (str(key), json.dumps(value, ensure_ascii=False, sort_keys=True))
+            for key, value in item.items()
+        )))
+    return tuple(frozen)
+
+
+@dataclass(frozen=True)
+class CandidateRecord:
+    """Immutable, fully adjudicated candidate built before Tier 3 selection.
+
+    ``candidate_id`` is ``v1:`` plus SHA-1 over a deterministic JSON payload
+    containing the normalized final URL (lower-case host, no fragment, no
+    trailing slash, sorted query using the repository URL normalizer), source,
+    tier, normalized municipality, adjudicated bucket and a SHA-1 fingerprint
+    of the complete immutable EvidenceSnapshot. Including the snapshot digest
+    distinguishes different captures of the same URL. The ID is only an audit
+    and serialization key; a CandidateRecord must never be reconstructed from it.
+    """
+
+    candidate_id: str
+    requested_url: str
+    final_url: str
+    source: str
+    tier: str
+    municipio: str
+    bucket_hint: str
+    evidence_snapshot: EvidenceSnapshot = field(repr=False)
+    authority: str = "desconocida"
+    identity: str = "desconocida"
+    page_role: str = "desconocido"
+    evidence_state: str = "error_fetch"
+    bucket: str = "combinado"
+    decision: str = "revisar"
+    reason: str = "sin razon"
+    source_kind: str = "desconocido"
+    accessible: bool = False
+    provenance: tuple[tuple[tuple[str, str], ...], ...] = field(
+        default_factory=tuple, repr=False,
+    )
+    menu_text: str = ""
+
+    @property
+    def eligible(self) -> bool:
+        return self.decision in {
+            "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
+        }
+
+    @property
+    def url(self) -> str:
+        return self.final_url
+
+    @property
+    def source_tier(self) -> str:
+        return self.tier
+
+    @property
+    def note(self) -> str:
+        return self.reason
+
+    @property
+    def fetchable(self) -> bool:
+        return self.accessible
+
+    @property
+    def page(self) -> Page:
+        snapshot = self.evidence_snapshot
+        page = _page_from_html(
+            snapshot.final_url, snapshot.status, "text/html; charset=UTF-8",
+            snapshot.html, requested_url=snapshot.requested_url,
+        )
+        page.title = snapshot.title or page.title
+        page.text = snapshot.text or page.text
+        page.links = list(snapshot.links)
+        return page
+
+    @property
+    def content_preview(self) -> str:
+        return self.evidence_snapshot.text[:1200]
+
+
+@dataclass(frozen=True)
+class SelectedResource:
+    """Exact CandidateRecord instance selected for one canonical bucket."""
+
+    bucket: str
+    candidate: CandidateRecord
+    reason: str = "selector eligio candidate_id existente y elegible"
+
+
+@dataclass(frozen=True)
+class FinalDecision:
+    """CSV-facing state derived only from SelectedResource and the contract."""
+
+    bucket: str
+    status: str
+    decision: str
+    url: str
+    candidate_id: str
+    reason: str
+
 
 @dataclass(frozen=True)
 class BucketCandidateEvidence:
     """Independent bucket association for one selected candidate and evidence."""
 
     bucket: str
-    candidate: Candidate
+    candidate: Candidate | CandidateRecord
     snapshot: EvidenceSnapshot
 
 
@@ -623,72 +773,175 @@ def _candidate_source_and_authority(
     return "desconocido", "desconocida"
 
 
-def candidate_from_evidence(
-        requested_url: str, source: str, menu_text: str, municipio: str,
-        evidence: Page | EvidenceSnapshot,
-        provenance: list[dict] | tuple[dict, ...] = ()) -> Candidate:
-    """Build and verify one Candidate from already-obtained evidence.
+def _snapshot_fingerprint(snapshot: EvidenceSnapshot) -> str:
+    payload = {
+        "html": snapshot.html,
+        "text": snapshot.text,
+        "title": snapshot.title,
+        "final_url": _candidate_url_key(snapshot.final_url),
+        "requested_url": snapshot.requested_url,
+        "status": snapshot.status,
+        "source": snapshot.source,
+        "evidence_state": snapshot.evidence_state,
+        "links": snapshot.links,
+    }
+    raw = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
 
-    This is the canonical evidence seam for HTTP pages and browser snapshots.
-    It never fetches. Browser evidence therefore has strict precedence over a
-    second requests GET, while traversing the same deterministic content gates.
+
+def _candidate_record_id(*, final_url: str, source: str, tier: str,
+                         municipio: str, bucket: str,
+                         snapshot: EvidenceSnapshot) -> str:
+    payload = {
+        "url": _candidate_url_key(final_url),
+        "source": source,
+        "tier": tier,
+        "municipio": norm(municipio),
+        "bucket": bucket,
+        "snapshot": _snapshot_fingerprint(snapshot),
+    }
+    raw = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return "v1:" + hashlib.sha1(raw).hexdigest()
+
+
+def build_candidate_record(
+        *, requested_url: str, source: str, tier: str, municipio: str,
+        bucket_hint: str, evidence: EvidenceSnapshot,
+        menu_text: str = "",
+        provenance: list[dict] | tuple[dict, ...] = (),
+        ) -> CandidateRecord:
+    """Run the one deterministic adjudicator over an already captured snapshot.
+
+    This function never performs I/O. All authority, identity, structure,
+    evidence, bucket, decision and reason dimensions are fixed here exactly once.
     """
-    if isinstance(evidence, EvidenceSnapshot):
-        snapshot_requested_url = evidence.requested_url or requested_url
-        page = _page_from_html(
-            evidence.final_url, evidence.status, "text/html; charset=UTF-8",
-            evidence.html, requested_url=snapshot_requested_url,
-        )
-        page.title = evidence.title or page.title
-        page.text = evidence.text or page.text
-        candidate_source = source
-        evidence_state = (
-            "error_fetch" if evidence.status is not None and evidence.status >= 400
-            else evidence.evidence_state
-        )
-    else:
-        page = evidence
-        candidate_source = source
-        evidence_state = (
-            "error_fetch" if page.error or (
-                page.status is not None and page.status >= 400
-            ) else
-            "incompleta_antibot" if is_antibot_challenge(page) else
-            "completa"
-        )
-
-    final_url = clean_url(page.url or requested_url)
+    requested = evidence.requested_url or requested_url
+    final_url = clean_url(evidence.final_url or requested)
+    page = _page_from_html(
+        final_url, evidence.status, "text/html; charset=UTF-8",
+        evidence.html, requested_url=requested,
+    )
+    page.title = evidence.title or page.title
+    page.text = evidence.text or page.text
+    page.links = list(evidence.links) or page.links
+    evidence_state = (
+        "error_fetch" if evidence.status is not None and evidence.status >= 400
+        else "incompleta_antibot" if is_antibot_challenge(page)
+        else evidence.evidence_state
+    )
     accessible = evidence_state != "error_fetch"
     identity = _candidate_identity_state(page, municipio, provenance)
     source_kind, authority = _candidate_source_and_authority(
-        page, municipio, provenance, identity, candidate_source,
+        page, municipio, provenance, identity, source,
     )
     anchors = [{"href": href, "text": text} for href, text in page.links]
-    contracts = [
-        verdict.evaluate_candidate_contract(
+    contracts = {
+        bucket: verdict.evaluate_candidate_contract(
             page.text, bucket, title=page.title, anchors=anchors,
             source_kind=source_kind, authority=authority, identity=identity,
             evidence_state=evidence_state, accessible=accessible,
             provenance=provenance,
         )
         for bucket in ("concursos", "processos")
-    ]
-    accepted = next((c for c in contracts if c.decision in {
+    }
+    accepted = [contract for contract in contracts.values() if contract.decision in {
         "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
-    }), None)
-    diagnostic = accepted or next(
-        (c for c in contracts if c.page_role != "desconocido"), contracts[0],
+    }]
+    hint_key = (
+        "concursos" if bucket_hint == "concursos" else
+        "processos" if bucket_hint == "processos" else ""
     )
-    candidate = Candidate(
-        url=final_url, source=candidate_source, menu_text=menu_text,
-        page=page, content_preview=(page.text or "")[:1200],
-        evidence_snapshot=evidence if isinstance(evidence, EvidenceSnapshot) else None,
-        accessible=accessible, evidence_state=evidence_state,
-        source_kind=source_kind, authority=authority, identity=identity,
-        page_role=diagnostic.page_role, decision=diagnostic.decision,
-        note=diagnostic.note, provenance=list(provenance), bucket=diagnostic.bucket,
+    if accepted:
+        diagnostic = next((
+            contract for contract in accepted
+            if contract.bucket == "combinado"
+        ), None) or (
+            contracts.get(hint_key) if contracts.get(hint_key) in accepted else accepted[0]
+        )
+    elif hint_key:
+        diagnostic = contracts[hint_key]
+    else:
+        diagnostic = next(
+            (contract for contract in contracts.values()
+             if contract.page_role != "desconocido"),
+            contracts["concursos"],
+        )
+    reason = diagnostic.note or f"decision={diagnostic.decision} sin detalle"
+    candidate_id = _candidate_record_id(
+        final_url=final_url, source=source, tier=tier,
+        municipio=municipio, bucket=diagnostic.bucket, snapshot=evidence,
     )
-    return candidate
+    record = CandidateRecord(
+        candidate_id=candidate_id,
+        requested_url=requested,
+        final_url=final_url,
+        source=source,
+        tier=tier,
+        municipio=municipio,
+        bucket_hint=bucket_hint,
+        evidence_snapshot=evidence,
+        authority=diagnostic.authority,
+        identity=diagnostic.identity,
+        page_role=diagnostic.page_role,
+        evidence_state=diagnostic.evidence_state,
+        bucket=diagnostic.bucket,
+        decision=diagnostic.decision,
+        reason=reason,
+        source_kind=diagnostic.source_kind,
+        accessible=diagnostic.accessible,
+        provenance=_freeze_provenance(provenance),
+        menu_text=menu_text,
+    )
+    LOGGER.info("candidate_record %s", json.dumps({
+        "candidate_id": record.candidate_id,
+        "municipio": record.municipio,
+        "source": record.source,
+        "tier": record.tier,
+        "requested_url": record.requested_url,
+        "final_url": record.final_url,
+        "authority": record.authority,
+        "identity": record.identity,
+        "page_role": record.page_role,
+        "evidence_state": record.evidence_state,
+        "bucket": record.bucket,
+        "decision": record.decision,
+        "reason": record.reason,
+    }, ensure_ascii=False, sort_keys=True))
+    return record
+
+
+def candidate_from_evidence(
+        requested_url: str, source: str, menu_text: str, municipio: str,
+        evidence: Page | EvidenceSnapshot,
+        provenance: list[dict] | tuple[dict, ...] = (), *,
+        tier: str = "", bucket_hint: str = "") -> Candidate:
+    """Compatibility adapter around the canonical CandidateRecord adjudicator."""
+    snapshot = (
+        _snapshot_with_requested_url(evidence, requested_url)
+        if isinstance(evidence, EvidenceSnapshot)
+        else _snapshot_from_page(requested_url, evidence)
+    )
+    record = build_candidate_record(
+        requested_url=requested_url, source=source, tier=tier,
+        municipio=municipio, bucket_hint=bucket_hint,
+        evidence=snapshot, menu_text=menu_text, provenance=provenance,
+    )
+    page = record.page
+    return Candidate(
+        url=record.final_url, source=source, menu_text=menu_text,
+        page=page, content_preview=record.content_preview,
+        evidence_snapshot=snapshot, accessible=record.accessible,
+        evidence_state=record.evidence_state, source_kind=record.source_kind,
+        authority=record.authority, identity=record.identity,
+        page_role=record.page_role, decision=record.decision,
+        note=record.reason, provenance=[dict(item) for item in provenance],
+        bucket=record.bucket, source_tier=tier, bucket_hint=bucket_hint,
+        record=record,
+    )
 
 
 def _snapshot_from_page(requested_url: str, page: Page) -> EvidenceSnapshot:
@@ -705,6 +958,7 @@ def _snapshot_from_page(requested_url: str, page: Page) -> EvidenceSnapshot:
         requested_url=page.requested_url or requested_url,
         final_url=page.url or requested_url, status=page.status,
         source="requests", evidence_state=evidence_state,
+        links=tuple(page.links),
     )
 
 
@@ -718,6 +972,7 @@ def _snapshot_with_requested_url(snapshot: EvidenceSnapshot,
         requested_url=requested_url, final_url=snapshot.final_url,
         status=snapshot.status, source=snapshot.source,
         evidence_state=snapshot.evidence_state,
+        links=snapshot.links,
     )
 
 
@@ -752,9 +1007,8 @@ def hydrate_candidate(
     evaluated = candidate_from_evidence(
         requested_url, candidate.source, candidate.menu_text, municipio, snapshot,
         provenance=tuple(dict(item) for item in candidate.provenance),
+        tier=candidate.source_tier, bucket_hint=candidate.bucket_hint,
     )
-    evaluated.source_tier = candidate.source_tier
-    evaluated.bucket_hint = candidate.bucket_hint
     return evaluated
 
 
@@ -766,6 +1020,7 @@ def _apply_candidate_evidence(candidate: Candidate, evidence: Page | EvidenceSna
         "url", "source", "page", "accessible", "evidence_state", "source_kind",
         "authority", "identity", "page_role", "decision", "note", "provenance",
         "bucket", "content_preview", "evidence_snapshot", "source_tier",
+        "record",
     ):
         setattr(candidate, name, getattr(evaluated, name))
     return candidate
@@ -1622,361 +1877,333 @@ def _empty_tier3_result() -> dict:
 
 def _normalized_candidate_url(url: str) -> str:
     """Canonical key for candidate collision handling, not a quality signal."""
-    parsed = urlparse(clean_url(url))
-    host = parsed.netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    path = (parsed.path or "").rstrip("/")
-    query = "&".join(
-        f"{key.lower()}={value}" for key, value in
-        sorted(parse_qsl(parsed.query, keep_blank_values=True))
-    )
-    base = f"{host}{path}"
-    return f"{base}?{query}" if query else base
-
-
-def _classification_decision(page_role: str, tipo: str,
-                             candidate: Candidate | None = None,
-                             exclusion: str = "nenhuma") -> str:
-    """Apply the same closed contract used by the offline adjudicator."""
-    if page_role == "desconocido" and exclusion == "nenhuma":
-        return "revisar"
-    if page_role in {"indice_listado", "indice_combinado"} and tipo == "incierto":
-        return "revisar"
-    source_kind = candidate.source_kind if candidate else "dominio_oficial_prefeitura"
-    authority = candidate.authority if candidate else "confirmada"
-    identity = candidate.identity if candidate else "confirmada"
-    evidence_state = candidate.evidence_state if candidate else "completa"
-    accessible = candidate.accessible if candidate else True
-    bucket = (
-        "combinado" if tipo == "mixto" or page_role == "indice_combinado" else
-        "concurso_publico" if tipo == "concurso" else
-        "processo_seletivo" if tipo == "pss" else "combinado"
-    )
-    return verdict.derive_decision(
-        source_kind=source_kind, authority=authority, identity=identity,
-        page_role=page_role, bucket=bucket, evidence_state=evidence_state,
-        accessible=accessible, is_licitacao=exclusion == "licitacao",
-        is_cultural=exclusion == "cultural",
-    )[0]
-
-
-def _hint_buckets(candidate: Candidate) -> list[str]:
-    if candidate.bucket_hint == "concursos":
-        return ["concursos"]
-    if candidate.bucket_hint == "processos":
-        return ["processos"]
-    if candidate.bucket_hint == "ambos":
-        return ["concursos", "processos"]
-    return []
+    return _candidate_url_key(url)
 
 
 def _route_classified_candidates(
-        candidates: list[Candidate], classifications: list[dict],
-        selector_picks: dict[str, int | None] | None = None) -> dict:
-    """Route verified candidates by forma/tipo, then dedupe and select.
+        candidates: list[Candidate | CandidateRecord],
+        classifications: list[dict],
+        selector_picks: dict[str, int | str | None] | None = None) -> dict:
+    """Compatibility router that ignores historical AI classifications.
 
-    URL/menu hints only identify the discovery origin for honest review states.
-    They do not participate in the final bucket assignment.
+    Candidate dimensions are already immutable. Only selector picks are read,
+    and an integer pick is translated to the corresponding existing record ID.
     """
+    records = [
+        record for candidate in candidates
+        if (record := _record_from_candidate(candidate)) is not None
+    ]
     result = _empty_tier3_result()
+    result["classification_complete"] = len(records) == len(candidates)
+    result["selected_resources"] = {}
+    reasons = ["classificacoes legacy ignoradas; records pre-adjudicados"]
     selector_picks = selector_picks or {}
-    by_id = {idx: candidate for idx, candidate in enumerate(candidates)}
-    pools: dict[str, list[tuple[int, Candidate, str]]] = {
-        "concursos": [], "processos": [],
-    }
-    decisions = {"concursos": "nao_encontrado", "processos": "nao_encontrado"}
-    routed: list[dict] = []
-    classified_ids: set[int] = set()
-    route_notes: list[str] = []
-
-    def mark(bucket: str, decision: str) -> None:
-        current = decisions[bucket]
-        if current == "nao_encontrado" or decision == "revisar":
-            decisions[bucket] = decision
-
-    for raw in classifications:
-        try:
-            candidate_id = int(raw.get("id"))
-        except (TypeError, ValueError):
-            continue
-        candidate = by_id.get(candidate_id)
-        if candidate is None or candidate_id in classified_ids:
-            continue
-        classified_ids.add(candidate_id)
-        page_role = str(raw.get("page_role", "")).strip().lower()
-        legacy_form = str(raw.get("forma", "")).strip().lower()
-        tipo = str(raw.get("tipo", "incierto")).strip().lower()
-        if not page_role and legacy_form:
-            page_role = {
-                "indice": "indice_combinado" if tipo == "mixto" else "indice_listado",
-                "detalle": "detalle_individual", "noticia": "noticia",
-                "incierto": "desconocido", "cultural": "desconocido",
-            }.get(legacy_form, "desconocido")
-        if page_role not in CONTENT_PAGE_ROLES:
-            page_role = "desconocido"
-        if tipo not in CONTENT_TIPOS:
-            tipo = "incierto"
-        exclusion = str(raw.get("exclusion", "nenhuma")).strip().lower()
-        if legacy_form == "cultural":
-            exclusion = "cultural"
-        if exclusion not in {"nenhuma", "licitacao", "cultural"}:
-            exclusion = "nenhuma"
-        if candidate.evidence_state == "incompleta_antibot":
-            page_role = "incompleto_antibot"
-        decision = _classification_decision(page_role, tipo, candidate, exclusion)
-        candidate.page_role = page_role
-        candidate.decision = decision
-        candidate.bucket = (
-            "combinado" if tipo == "mixto" else
-            "concurso_publico" if tipo == "concurso" else
-            "processo_seletivo" if tipo == "pss" else "combinado"
-        )
-        candidate.note = str(raw.get("razao", ""))[:240]
-        routed.append({
-            "id": candidate_id,
-            "url": candidate.url,
-            "bucket_hint": candidate.bucket_hint,
-            "page_role": page_role,
-            "forma": legacy_form or (
-                "indice" if page_role in {"indice_listado", "indice_combinado"}
-                else "detalle" if page_role == "detalle_individual"
-                else page_role if page_role == "noticia" else "incierto"
-            ),
-            "tipo": tipo,
-            "source_kind": candidate.source_kind,
-            "authority": candidate.authority,
-            "identity": candidate.identity,
-            "evidence_state": candidate.evidence_state,
-            "decision_code": decision,
-            "razao": str(raw.get("razao", ""))[:240],
-        })
-
-        # Strict precedence: rejected or uncertain forms never enter a bucket
-        # pool and therefore can never be reassigned as the "opposite" type.
-        if decision not in {
-            "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
-        }:
-            route_notes.append(f"candidate {candidate_id}: {decision}")
-            hinted = _hint_buckets(candidate)
-            # An originless uncertain classification must remain honest in both
-            # buckets. Rejections still expose their candidate decision_code,
-            # but cannot be silently promoted through an assumed bucket.
-            affected = (
-                ["concursos", "processos"]
-                if decision == "revisar" and not hinted else hinted
-            )
-            for bucket in affected:
-                mark(bucket, decision)
-            continue
-
-        if tipo == "mixto":
-            destination_buckets = ["concursos", "processos"]
-        elif tipo == "concurso":
-            destination_buckets = ["concursos"]
+    for short_bucket, canonical, url_key, decision_key in (
+        ("concursos", "concurso_publico", "url_concursos", "decision_concursos"),
+        ("processos", "processo_seletivo", "url_processos_seletivos", "decision_processos"),
+    ):
+        raw_pick = selector_picks.get(short_bucket)
+        picked_id = None
+        if isinstance(raw_pick, int) and 0 <= raw_pick < len(candidates):
+            picked_record = _record_from_candidate(candidates[raw_pick])
+            picked_id = picked_record.candidate_id if picked_record else None
+        elif isinstance(raw_pick, str):
+            picked_id = raw_pick
+        resolved = resolve_selector_pick(records, canonical, picked_id)
+        if isinstance(resolved, SelectedResource):
+            result["selected_resources"][short_bucket] = resolved
+            result[url_key] = resolved.candidate.final_url
+            result[decision_key] = resolved.candidate.decision
+            reasons.append(f"{short_bucket}: {resolved.reason}")
         else:
-            destination_buckets = ["processos"]
-        for bucket in destination_buckets:
-            pools[bucket].append((candidate_id, candidate, decision))
-
-        hints = _hint_buckets(candidate)
-        if len(hints) == 1 and hints[0] not in destination_buckets:
-            route_notes.append(
-                f"candidate {candidate_id} reassigned {hints[0]}→{destination_buckets[0]} by content"
-            )
-
-    # An omitted/malformed classification is uncertainty, not permission to
-    # infer the bucket from the URL. Keep it attached only to its discovery
-    # origin; an originless candidate makes both outputs reviewable.
-    for candidate_id, candidate in by_id.items():
-        if candidate_id in classified_ids:
-            continue
-        buckets = _hint_buckets(candidate) or ["concursos", "processos"]
-        for bucket in buckets:
-            mark(bucket, "revisar")
-
-    for bucket, entries in pools.items():
-        deduped: dict[str, tuple[int, Candidate, str]] = {}
-        id_to_key: dict[int, str] = {}
-        for entry in entries:
-            key = _normalized_candidate_url(entry[1].url)
-            id_to_key[entry[0]] = key
-            deduped.setdefault(key, entry)
-
-        selected: tuple[int, Candidate, str] | None = None
-        if len(deduped) == 1:
-            selected = next(iter(deduped.values()))
-        elif len(deduped) > 1:
-            raw_pick = selector_picks.get(bucket)
-            try:
-                picked_id = int(raw_pick) if raw_pick is not None else None
-            except (TypeError, ValueError):
-                picked_id = None
-            picked_key = id_to_key.get(picked_id) if picked_id is not None else None
-            if picked_key in deduped:
-                selected = deduped[picked_key]
-            else:
-                mark(bucket, "revisar")
-                route_notes.append(f"{bucket}: selector did not choose among valid candidates")
-
-        if selected:
-            _, candidate, decision = selected
-            if bucket == "concursos":
-                result["url_concursos"] = candidate.url
-            else:
-                result["url_processos_seletivos"] = candidate.url
-            decisions[bucket] = decision
-
-    result["decision_concursos"] = decisions["concursos"]
-    result["decision_processos"] = decisions["processos"]
-    result["classificacoes"] = routed
-    result["classification_complete"] = len(classified_ids) == len(by_id)
-    result["razao"] = "; ".join(route_notes)
+            result[decision_key] = resolved.decision
+            reasons.append(f"{short_bucket}: {resolved.reason}")
+    result["razao"] = "; ".join(reasons)
     return result
 
 
-def tier3_classify_and_pick(session: requests.Session, model: str,
-                            municipio: str, candidates: list[Candidate],
-                            timeout: int = 30) -> dict:
-    """Classify every candidate by content, route it, then validate selection.
+def _canonical_bucket(bucket: str) -> str:
+    return {
+        "concursos": "concurso_publico",
+        "concurso_publico": "concurso_publico",
+        "processos": "processo_seletivo",
+        "processo_seletivo": "processo_seletivo",
+        "combinado": "combinado",
+    }.get(bucket, "")
 
-    Classification and selection share the existing single Gemini call; this
-    exposes forma/tipo without adding a network call.
-    """
-    if not candidates:
-        return _empty_tier3_result()
 
-    accessible = [c for c in candidates if c.accessible and c.page]
-    if not accessible:
-        return _empty_tier3_result()
+def _record_from_candidate(
+        candidate: Candidate | CandidateRecord,
+        ) -> CandidateRecord | None:
+    if isinstance(candidate, CandidateRecord):
+        return candidate
+    return candidate.record
 
-    items = []
-    for i, c in enumerate(accessible):
-        # The removed combined-fill rendered SPA/thin pages and inspected up to
-        # 4k of visible content. Preserve that evidence here so forma/tipo can
-        # classify a genuine mixed index without a post-selection shortcut.
-        classification_text = c.content_preview or (c.page.text if c.page else "")
-        if c.page and (c.page.is_spa or len((c.page.text or "").strip()) < 500):
-            rendered = _render_text(c.url)
-            if len(rendered) > len(classification_text):
-                classification_text = rendered
-        preview = re.sub(r"[\x00-\x1f]+", " ", classification_text[:4000])
-        link_samples = []
-        if c.page:
-            for _href, text in c.page.links[:12]:
-                label = re.sub(r"\s+", " ", text or "").strip()
-                if label:
-                    link_samples.append(label[:100])
-        items.append({
-            "id": i,
-            "url": c.url,
-            "menu_text": c.menu_text or "(encontrado via busca)",
-            "source": c.source,
-            "source_kind": c.source_kind,
-            "authority": c.authority,
-            "identity": c.identity,
-            "evidence_state": c.evidence_state,
-            "title": (c.page.title if c.page else "")[:120],
-            "content_preview": preview,
-            "link_samples": link_samples[:8],
-        })
 
-    prompt = (
-        f"Prefeitura de {municipio} ({UF_NOME}, {UF_SIGLA}). "
-        f"Classifique por CONTEUDO as {len(items)} candidatas e depois escolha a "
-        "melhor candidata elegivel para cada bucket. A URL e apenas identificador: "
-        "NAO use slug/caminho para decidir forma ou tipo.\n\n"
-        "Para CADA candidata devolva dimensoes discretas:\n"
-        "- page_role (SOMENTE estrutura): indice_listado | indice_combinado | "
-        "detalle_individual | noticia | menu_sin_listado | incompleto_antibot | desconocido\n"
-        "- tipo: concurso | pss | mixto | incierto\n\n"
-        "- exclusion: nenhuma | licitacao | cultural\n\n"
-        "Precedencia obrigatoria:\n"
-        "1. cultural sempre e rejeitada, nunca realocada.\n"
-        "2. detalle_individual e noticia nao sao indices: um edital/noticia isolado "
-        "continua inelegivel mesmo com PDFs ou numa SPA.\n"
-        "3. menu_sin_listado e incompleto_antibot exigem revisao; nao presuma o tipo.\n"
-        "4. indice_listado/indice_combinado exige ESTRUTURA inequivoca de recurso "
-        "estavel (filtros, tabela/cards, paginacao, categoria ou endpoint de listagem). "
-        "Pode mostrar 0, 1 ou varios resultados: o conteo NAO e criterio. "
-        "Depois use tipo: mixto serve ambos; concurso ou pss "
-        "serve somente o bucket correspondente; tipo incierto exige revisao.\n\n"
-        "AUTORIDADE/IDENTIDADE ja foram determinadas pelo codigo e aparecem nos dados. "
-        "NAO invente nem confirme autoridade, identidade, cadeia oficial ou URL; NAO "
-        "aceite por slug/dominio/caminho. Classifique page_role/tipo pelo conteudo.\n\n"
-        "Regras do seletor (somente candidatas elegiveis pelo contrato e tipo compativel):\n"
-        "- Prefira o INDICE CANONICO: a listagem mais ampla e estavel. Entre uma\n"
-        "  vista de TODOS os anos e uma filtrada por um ano so, escolha a de todos\n"
-        "  os anos.\n"
-        "- Se existem paginas SEPARADAS para concursos e para PSS, use a especifica\n"
-        "  de cada bucket; so use uma pagina combinada se nao houver separadas.\n"
-        "- Uma pagina de CATEGORIA especifica (ex: /concurso/categoria/25/concurso)\n"
-        "  e MELHOR que a pagina raiz generica (/concurso) porque filtra exatamente\n"
-        "  o tipo desejado, mesmo que tenha menos itens.\n"
-        "- Se duas sao parecidas, escolha a mais completa e atualizada.\n"
-        "- Rejeite licitacao/pregao/compras e concurso cultural (soberanas/rainhas).\n"
-        "- Se nenhuma serve, use null. NAO invente IDs nem URLs.\n\n"
-        "Candidatos:\n"
+def _record_supports_bucket(record: CandidateRecord, bucket: str) -> bool:
+    canonical = _canonical_bucket(bucket)
+    return bool(canonical and (
+        record.bucket == canonical or record.bucket == "combinado"
+    ))
+
+
+def _eligible_records_for_bucket(
+        records: list[CandidateRecord], bucket: str,
+        ) -> list[CandidateRecord]:
+    canonical = _canonical_bucket(bucket)
+    if canonical not in {"concurso_publico", "processo_seletivo"}:
+        return []
+    eligible = [
+        record for record in records
+        if record.eligible and _record_supports_bucket(record, canonical)
+    ]
+    # Contract preference: a combined index is eligible only when no dedicated
+    # surface exists for this bucket. This is discrete precedence, not scoring.
+    specific = [record for record in eligible if record.bucket == canonical]
+    return specific or eligible
+
+
+def _review_final(bucket: str, reason: str, *, decision: str = "revisar",
+                  candidate_id: str = "",
+                  record: CandidateRecord | None = None) -> FinalDecision:
+    final = FinalDecision(
+        bucket=_canonical_bucket(bucket) or bucket,
+        status="revisar",
+        decision=decision,
+        url="",
+        candidate_id=candidate_id,
+        reason=reason or "revisar sin razon recibida",
     )
-    for item in items:
-        prompt += (
-            f"  [{item['id']}] {item['url']}\n"
-            f"      menu: {item['menu_text']}\n"
-            f"      procedencia: {item['source_kind']}; authority={item['authority']}; "
-            f"identity={item['identity']}; evidence={item['evidence_state']}\n"
-            f"      title: {item['title']}\n"
-            f"      preview: {item['content_preview']}\n"
-            f"      links_visiveis: {item['link_samples']}\n\n"
+    LOGGER.info("final_decision %s", json.dumps({
+        "bucket": final.bucket,
+        "status": final.status,
+        "decision": final.decision,
+        "url": final.url,
+        "candidate_id": final.candidate_id,
+        "authority": record.authority if record else "sin_record",
+        "identity": record.identity if record else "sin_record",
+        "page_role": record.page_role if record else "sin_record",
+        "evidence_state": record.evidence_state if record else "sin_record",
+        "record_bucket": record.bucket if record else "sin_record",
+        "reason": final.reason,
+    }, ensure_ascii=False, sort_keys=True))
+    return final
+
+
+def resolve_selector_pick(
+        records: list[CandidateRecord], bucket: str,
+        candidate_id: str | None,
+        ) -> SelectedResource | FinalDecision:
+    """Validate a Tier3 ID against already adjudicated, eligible records."""
+    canonical = _canonical_bucket(bucket)
+    if canonical not in {"concurso_publico", "processo_seletivo"}:
+        return _review_final(bucket, f"bucket desconocido: {bucket}")
+    pool = _eligible_records_for_bucket(records, canonical)
+    if not pool:
+        return _review_final(canonical, "sin CandidateRecord elegible para el bucket")
+
+    unique: dict[str, CandidateRecord] = {}
+    for record in pool:
+        unique.setdefault(record.candidate_id, record)
+
+    if candidate_id:
+        by_all_id = {record.candidate_id: record for record in records}
+        if candidate_id not in by_all_id:
+            return _review_final(
+                canonical, f"Tier3 devolvio candidate_id inexistente: {candidate_id}",
+                candidate_id=candidate_id,
+            )
+        if candidate_id not in unique:
+            return _review_final(
+                canonical,
+                f"Tier3 devolvio candidate_id no elegible o incompatible: {candidate_id}",
+                candidate_id=candidate_id,
+            )
+        return SelectedResource(canonical, unique[candidate_id])
+
+    if len(unique) == 1:
+        selected = next(iter(unique.values()))
+        reason = (
+            "duplicado elegible colapsado deterministicamente por candidate_id"
+            if len(pool) > 1 else
+            "unico CandidateRecord elegible; seleccion determinista"
         )
-    prompt += (
-        "Responda JSON: {\"classificacoes\":[{\"id\":0,\"page_role\":\"...\","
-        "\"tipo\":\"...\",\"exclusion\":\"nenhuma\",\"razao\":\"curta\"}],"
-        "\"melhor_id_concursos\":0 ou null,\"melhor_id_processos\":1 ou null,"
-        "\"razao\":\"curta\"}. Classifique TODOS os IDs."
+        return SelectedResource(canonical, selected, reason)
+    return _review_final(
+        canonical,
+        "empate entre CandidateRecord elegibles: Tier3 no devolvio candidate_id",
     )
 
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.0, "maxOutputTokens": 4096,
-            "responseMimeType": "application/json",
-        },
+
+def derive_final_decision(selected: SelectedResource) -> FinalDecision:
+    """Derive the final state without fetching or re-adjudicating evidence."""
+    record = selected.candidate
+    canonical = _canonical_bucket(selected.bucket)
+    provenance_reason = (
+        f"candidate_id={record.candidate_id}; tier={record.tier}; "
+        f"requested_url={record.requested_url}; final_url={record.final_url}"
+    )
+    if canonical not in {"concurso_publico", "processo_seletivo"}:
+        return _review_final(selected.bucket, f"bucket desconocido: {selected.bucket}")
+    accepted = {
+        "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
     }
-    data = gemini_post(session, model, payload, timeout=60)
-    try:
-        text = "\n".join(
-            p.get("text", "") for p in data["candidates"][0]["content"]["parts"]
+    blockers = []
+    if record.authority != "confirmada":
+        blockers.append(f"authority={record.authority}")
+    if record.identity != "confirmada":
+        blockers.append(f"identity={record.identity}")
+    if not record.accessible or record.evidence_state not in {"completa", "renderizada"}:
+        blockers.append(f"evidence_state={record.evidence_state}")
+    if record.decision not in accepted:
+        blockers.append(f"decision={record.decision}")
+    if not _record_supports_bucket(record, canonical):
+        blockers.append(f"bucket_incompatible={record.bucket}")
+    if blockers:
+        return _review_final(
+            canonical,
+            f"{record.reason}; {provenance_reason}; " + "; ".join(blockers),
+            decision=record.decision,
+            candidate_id=record.candidate_id,
+            record=record,
         )
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError:
-            print(f"      tier3: no valid JSON: {text[:300]}", flush=True)
-            return _empty_tier3_result()
 
-        routed = _route_classified_candidates(
-            accessible,
-            result.get("classificacoes") or [],
-            {
-                "concursos": result.get("melhor_id_concursos"),
-                "processos": result.get("melhor_id_processos"),
+    reason = (
+        f"{record.reason}; {selected.reason}; {provenance_reason}; "
+        "snapshot preservado sin refetch"
+    )
+    final = FinalDecision(
+        bucket=canonical,
+        status="confirmado",
+        decision=record.decision,
+        url=record.final_url,
+        candidate_id=record.candidate_id,
+        reason=reason,
+    )
+    LOGGER.info("final_decision %s", json.dumps({
+        "bucket": final.bucket,
+        "status": final.status,
+        "decision": final.decision,
+        "url": final.url,
+        "candidate_id": final.candidate_id,
+        "authority": record.authority,
+        "identity": record.identity,
+        "page_role": record.page_role,
+        "evidence_state": record.evidence_state,
+        "record_bucket": record.bucket,
+        "reason": final.reason,
+    }, ensure_ascii=False, sort_keys=True))
+    return final
+
+
+# Public Tier 3 seam: selector-only contract.
+def tier3_classify_and_pick(session: requests.Session, model: str,
+                            municipio: str,
+                            candidates: list[Candidate | CandidateRecord],
+                            timeout: int = 30) -> dict:
+    """Tier 3 selector: return IDs only; never classify or mutate records."""
+    records = [
+        record for candidate in candidates
+        if (record := _record_from_candidate(candidate)) is not None
+    ]
+    result = _empty_tier3_result()
+    result["classification_complete"] = True
+    result["selected_resources"] = {}
+    result["classificacoes"] = [{
+        "candidate_id": record.candidate_id,
+        "url": record.final_url,
+        "authority": record.authority,
+        "identity": record.identity,
+        "page_role": record.page_role,
+        "evidence_state": record.evidence_state,
+        "bucket": record.bucket,
+        "decision_code": record.decision,
+        "razao": record.reason,
+    } for record in records]
+    if not records:
+        result["razao"] = "Tier3 sin CandidateRecord adjudicado"
+        return result
+
+    pools = {
+        "concursos": _eligible_records_for_bucket(records, "concurso_publico"),
+        "processos": _eligible_records_for_bucket(records, "processo_seletivo"),
+    }
+    ai_picks: dict[str, str | None] = {"concursos": None, "processos": None}
+    needs_ai = {
+        bucket: pool for bucket, pool in pools.items()
+        if len({record.candidate_id for record in pool}) > 1
+    }
+    ai_reason = ""
+    if needs_ai:
+        items = []
+        seen_ids = set()
+        for pool in needs_ai.values():
+            for record in pool:
+                if record.candidate_id in seen_ids:
+                    continue
+                seen_ids.add(record.candidate_id)
+                items.append({
+                    "candidate_id": record.candidate_id,
+                    "url": record.final_url,
+                    "bucket": record.bucket,
+                    "decision": record.decision,
+                    "title": record.evidence_snapshot.title[:160],
+                    "content_preview": record.evidence_snapshot.text[:2400],
+                })
+        prompt = (
+            f"Prefeitura de {municipio} ({UF_NOME}, {UF_SIGLA}). "
+            "As candidatas abaixo JA foram adjudicadas deterministicamente e "
+            "todas as dimensoes sao imutaveis. Atue SOMENTE como seletor. "
+            "Escolha o candidate_id do indice mais amplo, estavel e canonico "
+            "para cada bucket. Nao classifique, confirme, altere dimensoes nem "
+            "invente IDs. Paginas especificas ja tiveram precedencia sobre "
+            "paginas combinadas no pool.\n\n"
+            f"Candidatas: {json.dumps(items, ensure_ascii=False)}\n\n"
+            "Responda JSON: {\"candidate_id_concursos\": \"v1:...\" ou null, "
+            "\"candidate_id_processos\": \"v1:...\" ou null, "
+            "\"razao\": \"curta\"}."
+        )
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0, "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
             },
-        )
-        ai_reason = str(result.get("razao", "")).strip()
-        routed["razao"] = " | ".join(filter(None, [routed["razao"], ai_reason]))
+        }
+        try:
+            data = gemini_post(session, model, payload, timeout=60)
+            text = "\n".join(
+                part.get("text", "")
+                for part in data["candidates"][0]["content"]["parts"]
+            )
+            raw = json.loads(text)
+            ai_picks = {
+                "concursos": raw.get("candidate_id_concursos"),
+                "processos": raw.get("candidate_id_processos"),
+            }
+            ai_reason = str(raw.get("razao", "")).strip()
+        except Exception as exc:
+            ai_reason = f"Tier3 selector no pudo elegir: {type(exc).__name__}"
 
-        if routed["url_concursos"]:
-            print(f"      → concursos: {routed['url_concursos']}", flush=True)
-        if routed["url_processos_seletivos"]:
-            print(f"      → processos: {routed['url_processos_seletivos']}", flush=True)
-        if routed["razao"]:
-            print(f"      razao: {routed['razao']}", flush=True)
-        if not routed["url_concursos"] and not routed["url_processos_seletivos"]:
-            print(f"      → nenhuma URL valida", flush=True)
-        return routed
-
-    except Exception as e:
-        print(f"      tier3 parse error: {e}", flush=True)
-        return _empty_tier3_result()
+    reasons = []
+    for short_bucket, canonical, url_key, decision_key in (
+        ("concursos", "concurso_publico", "url_concursos", "decision_concursos"),
+        ("processos", "processo_seletivo", "url_processos_seletivos", "decision_processos"),
+    ):
+        pick = ai_picks[short_bucket] if short_bucket in needs_ai else None
+        resolved = resolve_selector_pick(records, canonical, pick)
+        if isinstance(resolved, SelectedResource):
+            result["selected_resources"][short_bucket] = resolved
+            result[url_key] = resolved.candidate.final_url
+            result[decision_key] = resolved.candidate.decision
+            reasons.append(f"{short_bucket}: {resolved.reason}")
+        else:
+            result[decision_key] = resolved.decision
+            reasons.append(f"{short_bucket}: {resolved.reason}")
+    if ai_reason:
+        reasons.append(f"selector: {ai_reason}")
+    result["razao"] = "; ".join(reasons)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2052,12 +2279,18 @@ def render_page_sync(url: str) -> RenderedPage | None:
             url, wait_until="domcontentloaded", timeout=20000,
         )
         browser_page.wait_for_timeout(2000)
+        links = browser_page.eval_on_selector_all(
+            "a[href]",
+            "els => els.map(el => [el.href, (el.innerText || '').trim()])",
+        )
         return RenderedPage(
             html=browser_page.content(),
             text=browser_page.locator("body").inner_text(),
             title=browser_page.title(),
+            requested_url=url,
             final_url=browser_page.url,
             status=response.status if response is not None else None,
+            links=tuple((href, text) for href, text in links),
         )
     except Exception as e:
         print(f"      challenge render error: {e}", flush=True)
@@ -2231,6 +2464,10 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
                     href, wait_until="domcontentloaded", timeout=15000,
                 )
                 candidate_page.wait_for_timeout(1500)
+                candidate_links = candidate_page.eval_on_selector_all(
+                    "a[href]",
+                    "els => els.map(el => [el.href, (el.innerText || '').trim()])",
+                )
                 return EvidenceSnapshot(
                     html=candidate_page.content(),
                     text=candidate_page.locator("body").inner_text(),
@@ -2239,6 +2476,10 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
                     final_url=candidate_page.url,
                     status=response.status if response is not None else None,
                     source="playwright",
+                    links=tuple(
+                        (link_href, link_text)
+                        for link_href, link_text in candidate_links
+                    ),
                 )
             finally:
                 candidate_page.close()
@@ -2265,25 +2506,11 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
 # ---------------------------------------------------------------------------
 # Main pipeline: process one municipality
 # ---------------------------------------------------------------------------
-def _assign_confidence(tier: str) -> str:
-    """Initial confidence from tier. May be upgraded later by verification."""
-    if not tier:
-        return ""
-    if tier in ("t1",):
-        return "confirmado"
-    if tier in ("t2", "t2dir", "t4"):
-        return "probable"
-    if tier.endswith("_combined"):
-        # A combined fill starts as "probable" (not "revisar") so the batch Gemini
-        # verification — which only checks "probable" URLs — actually re-examines
-        # it and can upgrade a real combined index to confirmado.
-        return "probable"
-    return "probable"
-
-
+# Compatibility export consumed by the read-only Fase 2 auditor. It identifies
+# textual listing events; it is not used to score or finalize CandidateRecords.
 LISTING_SIGNALS = [
-    r"\b\d{1,3}/20[12]\d\b",       # edital numbers like 001/2024
-    r"edital\s+n",                  # "Edital Nº"
+    r"\b\d{1,3}/20[12]\d\b",
+    r"edital\s+n",
     r"inscri[cç][oõ]es\s+(aberta|encerrada)",
     r"resultado\s+(final|parcial|preliminar)",
     r"homologa[cç][aã]o",
@@ -2291,199 +2518,26 @@ LISTING_SIGNALS = [
 ]
 LISTING_RE = re.compile("|".join(LISTING_SIGNALS), re.I)
 
-CONCURSO_VERIFY_KW = [
-    "concurso publico", "concursos publicos", "concurso público",
-    "concursos públicos",
-]
-PSS_VERIFY_KW = [
-    "processo seletivo", "processos seletivos", "seletivo simplificado",
-    "selecao publica", "seleção pública", "pss ",
-]
-
-
-def _render_text(url: str, timeout: int = 20) -> str:
-    """Open a URL in a real browser and return the visible text.
-
-    For SPA portals (atende.net, IPM, JSF) whose listing only exists after
-    client-side rendering: the static fetch returns a shell, so verification
-    can't see the items. Returns "" if the browser is unavailable or load fails.
-    """
-    try:
-        browser = _get_browser()
-    except Exception:
-        return ""
-    ctx = None
-    try:
-        ctx = new_browser_context(browser, ignore_https_errors=True)
-        page = ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-        page.wait_for_timeout(2500)
-        return page.evaluate(
-            "() => document.body ? document.body.innerText : ''") or ""
-    except Exception:
-        return ""
-    finally:
-        if ctx is not None:
-            try:
-                ctx.close()
-            except Exception:
-                pass
-
 
 def _deterministic_verify(url: str, bucket: str,
-                          all_candidates: list[Candidate]) -> bool:
-    """Check if URL content looks like a real listing page for this bucket.
-
-    Returns True if confident enough to upgrade probable→confirmado.
-    """
-    cand = next((c for c in all_candidates if c.url == url and c.page), None)
-    if not cand or not cand.page:
-        return False
-    page = cand.page
-    anchors = [{"href": href, "text": text} for href, text in page.links]
-    contract = verdict.evaluate_candidate_contract(
-        page.text, bucket, title=page.title, anchors=anchors,
-        source_kind=cand.source_kind, authority=cand.authority,
-        identity=cand.identity, evidence_state=cand.evidence_state,
-        accessible=cand.accessible, provenance=cand.provenance,
-    )
-    cand.page_role = contract.page_role
-    cand.decision = contract.decision
-    cand.note = contract.note
-    return contract.decision in {
-        "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
-    }
-
-
-def batch_gemini_verify(session: requests.Session, model: str,
-                        to_verify: list[dict],
-                        timeout: int = 30) -> dict[str, str]:
-    """Verify uncertain URLs in a single Gemini call.
-
-    to_verify: list of {"municipio": str, "bucket": str, "url": str,
-                        "title": str, "preview": str}
-    Returns {f"{municipio}|{bucket}": "confirmado" or "revisar"}
-    """
-    if not to_verify or not gemini_api_key():
-        return {}
-
-    # Process ALL uncertain URLs in chunks of 30. The previous code verified only
-    # to_verify[:30], so with >30 probables the rest were never checked and stayed
-    # stuck at "probable" forever (even rich, valid indexes). Chunk + aggregate.
-    if len(to_verify) > 30:
-        merged: dict[str, str] = {}
-        for start in range(0, len(to_verify), 30):
-            merged.update(batch_gemini_verify(
-                session, model, to_verify[start:start + 30], timeout))
-        return merged
-
-    items_text = ""
-    for i, item in enumerate(to_verify):
-        items_text += (
-            f"[{i}] Municipio: {item['municipio']}, Bucket: {item['bucket']}\n"
-            f"    Site oficial: {item.get('site_base', '')}\n"
-            f"    URL: {item['url']}\n"
-            f"    Titulo: {item['title'][:120]}\n"
-            f"    Preview: {item['preview'][:250]}\n\n"
-        )
-
-    prompt = (
-        "Voce e um verificador de paginas de concursos publicos municipais.\n"
-        "Para cada item abaixo, responda se a URL e uma pagina INDICE/LISTAGEM "
-        "valida para o bucket indicado (concursos ou processos seletivos).\n\n"
-        "Criterios para CONFIRMAR:\n"
-        "- Ha estrutura inequivoca e estavel de listagem (filtros, tabela/cards, "
-        "paginacao, categoria ou endpoint), mesmo com 0 ou 1 resultado visivel\n"
-        "- O conteudo corresponde ao bucket (concursos OU processos seletivos)\n"
-        "- E uma pagina de listagem, nao um edital individual ou PDF\n"
-        "- Paginas combinadas (ambos tipos) sao validas para ambos buckets\n"
-        "- A autoridade/identidade vem da evidencia fornecida pelo codigo; NAO a "
-        "invente nem a confirme por slug, dominio ou caminho da URL\n\n"
-        "Criterios para REVISAR:\n"
-        "- Pagina de um unico edital com anexos, sem estrutura de listagem\n"
-        "- Conteudo nao corresponde ao bucket\n"
-        "- Pagina generica sem editais visiveis\n"
-        "- Licitacoes ou concursos culturais\n"
-        "- Portal externo sem cadeia oficial comprovada nos dados de procedencia\n\n"
-        f"Items a verificar:\n{items_text}\n"
-        "Responda JSON array. Cada elemento: "
-        "{\"id\": N, \"veredicto\": \"confirmado\" ou \"revisar\", "
-        "\"motivo\": \"frase curta\"}\n"
-    )
-
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.0, "maxOutputTokens": 4096,
-            "responseMimeType": "application/json",
-        },
-    }
-    try:
-        data = gemini_post(session, model, payload, timeout=60)
-        text = "\n".join(
-            p.get("text", "") for p in data["candidates"][0]["content"]["parts"]
-        )
-        verdicts = json.loads(text)
-        if isinstance(verdicts, dict) and "items" in verdicts:
-            verdicts = verdicts["items"]
-        if not isinstance(verdicts, list):
-            verdicts = [verdicts]
-
-        result = {}
-        for v in verdicts:
-            idx = v.get("id", -1)
-            if 0 <= idx < len(to_verify):
-                item = to_verify[idx]
-                key = f"{item['municipio']}|{item['bucket']}"
-                raw_veredicto = v.get("veredicto", "revisar").lower().strip()
-                veredicto = "confirmado" if raw_veredicto.startswith("confirm") else "revisar"
-                motivo = v.get("motivo", "")
-                result[key] = (veredicto, motivo)
-                print(f"    verify [{idx}] {item['municipio']}/{item['bucket']}: "
-                      f"{veredicto} — {motivo}", flush=True)
-        return result
-    except Exception as e:
-        print(f"    batch verify error: {e}", flush=True)
-        return {}
-
-
-def _usable_evidence_snapshot(snapshot: EvidenceSnapshot,
-                              selected_url: str) -> bool:
-    """Single content gate for static or rendered evidence used by batch closure."""
-    if not (snapshot.requested_url or "").strip():
-        return False
-    if not (snapshot.final_url or "").strip():
-        return False
-    if not (snapshot.html or "").strip() or not (snapshot.text or "").strip():
-        return False
-    if snapshot.evidence_state not in {"renderizada", "completa"}:
-        return False
-    if snapshot.status is not None and not 200 <= snapshot.status < 400:
-        return False
-    if (_normalized_candidate_url(snapshot.final_url)
-            != _normalized_candidate_url(selected_url)):
-        return False
-    page = _page_from_html(
-        snapshot.final_url, snapshot.status, "text/html; charset=UTF-8",
-        snapshot.html, requested_url=snapshot.requested_url,
-    )
-    page.title = snapshot.title or page.title
-    page.text = snapshot.text or page.text
-    login_blob = norm(f"{page.title}\n{page.text[:2000]}")
-    login_or_checkpoint = bool(
-        re.search(r"\b(?:login|usuario|senha|acesso restrito)\b", login_blob)
-        and not re.search(r"\b(?:concurso publico|processo seletivo)\b", login_blob)
-    )
-    complete_document = bool(re.search(
-        r"</(?:body|html)\s*>", snapshot.html, re.I,
-    ))
+                          all_candidates: list[Candidate | CandidateRecord]) -> bool:
+    """Compatibility query over the existing immutable adjudication."""
+    record = next((
+        record for candidate in all_candidates
+        if (record := _record_from_candidate(candidate)) is not None
+        and _normalized_candidate_url(record.final_url)
+        == _normalized_candidate_url(url)
+    ), None)
     return bool(
-        page.ok
-        and not is_antibot_challenge(page)
-        and not is_soft_404(page)
-        and not is_dead_site(page)
-        and not login_or_checkpoint
-        and (verdict.content_complete(page.text, page.title) or complete_document)
+        record and record.eligible and _record_supports_bucket(record, bucket)
+    )
+
+
+def batch_gemini_verify(*_args, **_kwargs):
+    """Removed compatibility symbol; batch has no independent adjudicator."""
+    raise RuntimeError(
+        "batch_gemini_verify eliminado: use build_candidate_record + "
+        "derive_final_decision"
     )
 
 
@@ -2491,7 +2545,14 @@ def _batch_verify_uncertain_results(
         session: requests.Session, model: str, results: list[MunicipioResult],
         *, timeout: int = 15, use_playwright: bool = True,
         ) -> tuple[list[dict], dict[str, MunicipioResult], dict[str, tuple[str, str]]]:
-    """Close probable results, preferring their preserved rendered evidence."""
+    """Apply the common closure to selected or legacy probable results.
+
+    Selected resources are finalized from their exact immutable record. Legacy
+    URL-only rows may perform one compatibility fetch to obtain evidence, but
+    that evidence is immediately converted by ``build_candidate_record`` and
+    finalized by the same ``derive_final_decision`` path. There is no batch AI
+    verdict and no refetch of a selected CandidateRecord.
+    """
     to_verify: list[dict] = []
     verify_index: dict[str, MunicipioResult] = {}
     for result in results:
@@ -2511,165 +2572,77 @@ def _batch_verify_uncertain_results(
             verify_index[f"{result.municipio}|{bucket}"] = result
 
     verdicts: dict[str, tuple[str, str]] = {}
-    legacy_items: list[dict] = []
-    unusable_snapshot_items: list[dict] = []
     for item in to_verify:
         key = f"{item['municipio']}|{item['bucket']}"
         result = verify_index[key]
-        association = result.selected_evidence.get(item["bucket"])
-        if association is None:
-            legacy_items.append(item)
-            continue
-        snapshot = association.snapshot
-        if not _usable_evidence_snapshot(snapshot, item["url"]):
-            unusable_snapshot_items.append(item)
-            verdicts[key] = (
-                "revisar",
-                "snapshot preservado no utilizable: checkpoint/soft404/login/error/truncado",
-            )
-            continue
-
-        candidate = hydrate_candidate(
-            replace(
-                association.candidate,
-                provenance=[dict(value) for value in association.candidate.provenance],
-            ),
-            item["municipio"], evidence=snapshot,
-        )
-        item["title"] = candidate.page.title[:150] if candidate.page else ""
-        item["preview"] = candidate.page.text[:400] if candidate.page else ""
-        confirmed = _deterministic_verify(
-            candidate.url, item["bucket"], [candidate],
-        )
-        verdicts[key] = (
-            "confirmado" if confirmed else "revisar",
-            f"snapshot renderizado: {candidate.note}",
-        )
-
-    # Legacy path: preserve the existing HTTP fetch, optional light rendering,
-    # and Gemini batch verification exactly when no usable snapshot survived.
-    for item in legacy_items + unusable_snapshot_items:
-        try:
+        canonical = _canonical_bucket(item["bucket"])
+        selected = result.selected_resources.get(item["bucket"])
+        if selected is None:
+            association = result.selected_evidence.get(item["bucket"])
+            if association is not None:
+                association_record = _record_from_candidate(association.candidate)
+                if association_record is None:
+                    legacy_candidate = association.candidate
+                    association_record = build_candidate_record(
+                        requested_url=association.snapshot.requested_url or item["url"],
+                        source=getattr(legacy_candidate, "source", "legacy_snapshot"),
+                        tier=getattr(legacy_candidate, "source_tier", "legacy"),
+                        municipio=item["municipio"],
+                        bucket_hint=getattr(
+                            legacy_candidate, "bucket_hint", item["bucket"],
+                        ),
+                        evidence=association.snapshot,
+                        menu_text=getattr(legacy_candidate, "menu_text", ""),
+                        provenance=getattr(legacy_candidate, "provenance", ()),
+                    )
+                if association_record is not None:
+                    selected = SelectedResource(
+                        canonical, association_record,
+                        "adaptador selected_evidence con instancia exacta",
+                    )
+        if selected is None:
             page = fetch_page(session, item["url"], timeout=timeout)
-            item["title"] = page.title[:150] if page else ""
-            item["preview"] = page.text[:400] if page else ""
-            if (page and use_playwright
-                    and (page.is_spa or len((page.text or "").strip()) < 500)):
-                rendered_text = _render_text(item["url"], timeout)
-                if len(rendered_text) > len(page.text or ""):
-                    item["preview"] = rendered_text[:400]
-                    if not item["title"]:
-                        item["title"] = item["url"]
-        except Exception:
-            pass
-
-    if legacy_items:
-        verdicts.update(batch_gemini_verify(session, model, legacy_items))
-    for key, (batch_verdict, reason) in verdicts.items():
-        result = verify_index.get(key)
-        if not result:
-            continue
-        _, bucket = key.split("|", 1)
-        bucket_url = (
-            result.url_concursos if bucket == "concursos"
-            else result.url_processos_seletivos
-        )
-        if batch_verdict == "confirmado" and is_detail_url(bucket_url):
-            batch_verdict = "probable"
-            reason = ((reason + "; ") if reason else "") + (
-                "url de detalle: queda probable hasta verificacion renderizada"
+            snapshot = _snapshot_from_page(item["url"], page)
+            legacy_record = build_candidate_record(
+                requested_url=item["url"],
+                source="legacy",
+                tier="legacy",
+                municipio=item["municipio"],
+                bucket_hint=item["bucket"],
+                evidence=snapshot,
             )
-        if bucket == "concursos":
-            result.confianza_concursos = batch_verdict
-            if reason:
-                result.notes += f"; verify_c: {reason}"
+            selected = SelectedResource(
+                canonical, legacy_record,
+                "adaptador legacy: evidencia obtenida una vez y adjudicada centralmente",
+            )
+            result.selected_resources[item["bucket"]] = selected
+            result.selected_evidence[item["bucket"]] = BucketCandidateEvidence(
+                item["bucket"], legacy_record, snapshot,
+            )
+
+        final = derive_final_decision(selected)
+        result.final_decisions[item["bucket"]] = final
+        item["title"] = selected.candidate.evidence_snapshot.title[:150]
+        item["preview"] = selected.candidate.evidence_snapshot.text[:400]
+        verdicts[key] = (final.status, final.reason)
+        if item["bucket"] == "concursos":
+            result.confianza_concursos = final.status
+            result.url_concursos = final.url
+            result.notes = (result.notes + f"; verify_c: {final.reason}").strip("; ")
         else:
-            result.confianza_processos = batch_verdict
-            if reason:
-                result.notes += f"; verify_p: {reason}"
+            result.confianza_processos = final.status
+            result.url_processos_seletivos = final.url
+            result.notes = (result.notes + f"; verify_p: {final.reason}").strip("; ")
 
     return to_verify, verify_index, verdicts
 
 
-def grounded_verify_one(session: requests.Session, model: str,
-                        municipio: str, bucket: str, url: str,
-                        timeout: int = 90) -> tuple[str, str]:
-    """Grounded (Google Search) verification fallback for a URL whose static/rendered
-    preview was empty (Cloudflare challenge, JS shell). Gemini reads Google's INDEX of
-    the page instead of fetching it directly — Google's crawler passes the antibot that
-    headless Playwright cannot.
-
-    Guardrail against hallucination: only CONFIRM when the verdict is backed by REAL
-    grounding evidence (>=1 grounding chunk AND a non-trivial 'evidencia'). A
-    'confirmado' with zero chunks is pure URL-shape inference (observed on Arroio dos
-    Ratos: it confirmed a /category/ URL with no search results) and is downgraded to
-    'revisar'. This keeps precision-over-coverage.
-
-    Returns (veredicto, motivo) where veredicto is 'confirmado' or 'revisar'.
-    """
-    bucket_label = "concursos publicos" if bucket == "concursos" else "processos seletivos"
-    prompt = (
-        f"Verifique se esta URL e a pagina INDICE/LISTAGEM de {bucket_label} da "
-        f"Prefeitura de {municipio} ({UF_NOME}, {UF_SIGLA}, Brasil).\n"
-        f"URL: {url}\n\n"
-        "Use a busca do Google para ver o conteudo real indexado desta pagina "
-        "(ela pode ter protecao anti-bot que impede leitura direta pelo crawler).\n"
-        "A pagina mostra ESTRUTURA inequivoca e estavel de listagem (filtros, "
-        "tabela/cards, paginacao, categoria ou endpoint), mesmo com 0 ou 1 resultado? "
-        "Nao confirme autoridade por slug/dominio e nao exija multiplos resultados.\n"
-        "Responda APENAS em JSON: {\"veredicto\": \"confirmado\" ou \"revisar\", "
-        "\"motivo\": \"frase curta\", "
-        "\"evidencia\": \"itens concretos que a busca mostrou\"}"
+def grounded_verify_one(*_args, **_kwargs):
+    """Removed compatibility symbol; grounding discovers but never adjudicates."""
+    raise RuntimeError(
+        "grounded_verify_one eliminado como autoridad de decision; "
+        "use build_candidate_record + derive_final_decision"
     )
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        # Grounding spends output tokens on a prose preamble before the JSON, so 1024
-        # truncated the JSON tail on many cases ('sin json'). 2048 leaves room.
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 2048},
-    }
-    try:
-        data = gemini_post(session, model, payload, timeout=timeout)
-    except Exception as e:
-        return ("revisar", f"grounded error: {e}")
-
-    cand = (data.get("candidates") or [{}])[0]
-    text = "\n".join(
-        p.get("text", "") for p in (cand.get("content", {}) or {}).get("parts", [])
-        if isinstance(p, dict)
-    )
-    chunks = (cand.get("groundingMetadata", {}) or {}).get("groundingChunks", []) or []
-
-    # Robust parse. Grounded answers often wrap the JSON in prose or markdown fences,
-    # and the tail can be truncated (grounding spends tokens on a preamble before the
-    # JSON), so a naive {.*} + json.loads failed a lot ('sin json'). Try full JSON
-    # first, then fall back to pulling each field by regex from the raw text.
-    raw = re.sub(r"```(?:json)?", "", text).strip()
-    veredicto = motivo = evidencia = ""
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if m:
-        try:
-            obj = json.loads(m.group(0))
-            veredicto = str(obj.get("veredicto", "")).lower().strip()
-            motivo = str(obj.get("motivo", ""))[:100]
-            evidencia = str(obj.get("evidencia", "")).strip()
-        except Exception:
-            pass
-    if not veredicto:  # truncated / loose JSON: pull fields individually
-        vm = re.search(r'veredicto"?\s*:\s*"?(confirmado|revisar)', raw, re.I)
-        veredicto = vm.group(1).lower() if vm else ""
-        em = re.search(r'evidencia"?\s*:\s*"([^"]{0,400})', raw, re.I)
-        evidencia = em.group(1).strip() if em else ""
-        mm = re.search(r'motivo"?\s*:\s*"([^"]{0,150})', raw, re.I)
-        motivo = mm.group(1).strip() if mm else ""
-    if not veredicto:
-        return ("revisar", f"grounded: no parseable ({len(text)}c)")
-
-    # GUARDRAIL: confirm only with real grounding evidence (>=1 chunk + evidencia).
-    if veredicto.startswith("confirm") and len(chunks) >= 1 and len(evidencia) >= 15:
-        return ("confirmado", f"grounded({len(chunks)}ch): {motivo}")
-    return ("revisar",
-            f"grounded({len(chunks)}ch, sin evidencia suficiente): {motivo}")
 
 
 @dataclass
@@ -2688,6 +2661,12 @@ class MunicipioResult:
     urls_extras_concursos: str = ""
     urls_extras_processos: str = ""
     selected_evidence: dict[str, BucketCandidateEvidence] = field(
+        default_factory=dict, repr=False,
+    )
+    selected_resources: dict[str, SelectedResource] = field(
+        default_factory=dict, repr=False,
+    )
+    final_decisions: dict[str, FinalDecision] = field(
         default_factory=dict, repr=False,
     )
 
@@ -2753,6 +2732,7 @@ def process_municipio(session: requests.Session, municipio: str,
         "url_concursos": "nao_encontrado",
         "url_processos_seletivos": "nao_encontrado",
     }
+    bucket_selected: dict[str, SelectedResource] = {}
     razones: list[str] = []
 
     def _record(picked: dict, tier_label: str) -> None:
@@ -2770,6 +2750,12 @@ def process_municipio(session: requests.Session, municipio: str,
             selected = picked.get(key, "")
             chosen[key] = selected
             bucket_decision[key] = picked.get(decision_key, "nao_encontrado")
+            short_bucket = "concursos" if key == "url_concursos" else "processos"
+            picked_resource = (picked.get("selected_resources") or {}).get(short_bucket)
+            if isinstance(picked_resource, SelectedResource):
+                bucket_selected[short_bucket] = picked_resource
+            elif not selected:
+                bucket_selected.pop(short_bucket, None)
             if selected and selected != previous:
                 bucket_tier[key] = tier_label
             elif not selected:
@@ -2778,7 +2764,7 @@ def process_municipio(session: requests.Session, municipio: str,
             razones.append(f"[{tier_label}] {picked['razao']}")
 
     if fetchable_t1 and gemini_api_key():
-        print(f"    Tier 3: classifying {len(fetchable_t1)} Tier 1 candidates...", flush=True)
+        print(f"    Tier 3: selecting among {len(fetchable_t1)} Tier 1 records...", flush=True)
         picked = tier3_classify_and_pick(session, model, municipio, fetchable_t1, timeout)
         _record(picked, "t1")
         tiers_used.append("t3")
@@ -2827,7 +2813,7 @@ def process_municipio(session: requests.Session, municipio: str,
             # Run Tier 3 on new candidates (plus any unfilled from before)
             fetchable_new = [c for c in new_t2 if c.fetchable]
             if fetchable_new:
-                print(f"    Tier 3: classifying {len(fetchable_new)} grounded candidates...", flush=True)
+                print(f"    Tier 3: selecting among {len(fetchable_new)} grounded records...", flush=True)
                 picked = tier3_classify_and_pick(
                     session, model, municipio,
                     [c for c in all_candidates if c.fetchable], timeout,
@@ -2887,7 +2873,7 @@ def process_municipio(session: requests.Session, municipio: str,
 
             fetchable_t4 = [c for c in new_t4 if c.fetchable]
             if fetchable_t4 and gemini_api_key():
-                print(f"    Tier 3: classifying {len(fetchable_t4)} playwright candidates...", flush=True)
+                print(f"    Tier 3: selecting among {len(fetchable_t4)} playwright records...", flush=True)
                 picked = tier3_classify_and_pick(
                     session, model, municipio,
                     [c for c in all_candidates if c.fetchable], timeout,
@@ -2904,37 +2890,45 @@ def process_municipio(session: requests.Session, municipio: str,
     result.tier_processos = bucket_tier["url_processos_seletivos"]
     result.razao = " | ".join(razones)
 
-    # --- Confidence assignment ---
-    result.confianza_concursos = _assign_confidence(result.tier_concursos)
-    result.confianza_processos = _assign_confidence(result.tier_processos)
-
-    # Rejected/uncertain candidates remain explicit review outcomes when no
-    # later tier finds a valid index. A moved candidate leaves its origin as
-    # nao_encontrado unless some other candidate made that origin uncertain.
-    if not result.url_concursos and bucket_decision["url_concursos"] != "nao_encontrado":
-        result.confianza_concursos = "revisar"
-    if (not result.url_processos_seletivos
-            and bucket_decision["url_processos_seletivos"] != "nao_encontrado"):
-        result.confianza_processos = "revisar"
-
-    # Deterministic upgrade: probable→confirmado if content clearly matches
-    if result.confianza_concursos == "probable" and result.url_concursos:
-        if _deterministic_verify(result.url_concursos, "concursos", all_candidates):
-            result.confianza_concursos = "confirmado"
-    if result.confianza_processos == "probable" and result.url_processos_seletivos:
-        if _deterministic_verify(result.url_processos_seletivos, "processos", all_candidates):
-            result.confianza_processos = "confirmado"
-
-    # Confidence honesty: never let a single-item/detail URL stand as `confirmado`.
-    # The cascade proposes it as `probable`; the closing pass (rendered AI verdict)
-    # is the only thing allowed to promote it. This is what keeps `confirmado`
-    # trustworthy enough that a human never has to re-check it.
-    if result.confianza_concursos == "confirmado" and is_detail_url(result.url_concursos):
-        result.confianza_concursos = "probable"
-        razones.append("[honesty] url de detalle, baja a probable hasta verificar")
-    if result.confianza_processos == "confirmado" and is_detail_url(result.url_processos_seletivos):
-        result.confianza_processos = "probable"
-        razones.append("[honesty] url de detalle, baja a probable hasta verificar")
+    # --- One closure: SelectedResource -> FinalDecision (no fetch/re-adjudication) ---
+    for short_bucket, canonical, url_attr, confidence_attr, decision_key in (
+        ("concursos", "concurso_publico", "url_concursos",
+         "confianza_concursos", "url_concursos"),
+        ("processos", "processo_seletivo", "url_processos_seletivos",
+         "confianza_processos", "url_processos_seletivos"),
+    ):
+        selected = bucket_selected.get(short_bucket)
+        selected_url = getattr(result, url_attr)
+        if selected is None and selected_url:
+            exact_record = next((
+                record for candidate in all_candidates
+                if (record := _record_from_candidate(candidate)) is not None
+                and _normalized_candidate_url(record.final_url)
+                == _normalized_candidate_url(selected_url)
+            ), None)
+            if exact_record is not None:
+                selected = SelectedResource(
+                    canonical, exact_record,
+                    "seleccion legacy de Tier3 enlazada a la instancia exacta por URL",
+                )
+        if selected is not None:
+            final = derive_final_decision(selected)
+            result.selected_resources[short_bucket] = selected
+            result.final_decisions[short_bucket] = final
+            setattr(result, url_attr, final.url)
+            setattr(result, confidence_attr, final.status)
+            razones.append(f"[final:{short_bucket}] {final.reason}")
+        else:
+            decision = bucket_decision[decision_key]
+            reason = (
+                f"sin recurso seleccionado; decision={decision}; tiers agotados"
+            )
+            final = _review_final(canonical, reason, decision=decision)
+            result.final_decisions[short_bucket] = final
+            setattr(result, confidence_attr, (
+                "revisar" if decision != "nao_encontrado" else ""
+            ))
+            razones.append(f"[final:{short_bucket}] {final.reason}")
     result.razao = " | ".join(razones)
 
     # Downgrade to "revisar" when site not found or all tiers exhausted
@@ -2987,31 +2981,10 @@ def process_municipio(session: requests.Session, municipio: str,
         notes_parts.append("bloqueo_antibot: site responde challenge JS (indice no accesible)")
     result.notes = "; ".join(notes_parts)
 
-    for bucket, selected_url in (
-        ("concursos", result.url_concursos),
-        ("processos", result.url_processos_seletivos),
-    ):
-        selected = next((
-            candidate for candidate in all_candidates
-            if candidate.evidence_snapshot is not None
-            and _normalized_candidate_url(candidate.url)
-            == _normalized_candidate_url(selected_url)
-        ), None)
-        if selected is None or selected.evidence_snapshot is None:
-            continue
-        independent_candidate = hydrate_candidate(
-            Candidate(
-                url=selected.evidence_snapshot.requested_url or selected.url,
-                source=selected.source, menu_text=selected.menu_text,
-                source_tier=selected.source_tier,
-                provenance=[dict(value) for value in selected.provenance],
-                bucket_hint=selected.bucket_hint,
-            ),
-            result.municipio, evidence=selected.evidence_snapshot,
-        )
+    for bucket, selected in result.selected_resources.items():
         result.selected_evidence[bucket] = BucketCandidateEvidence(
-            bucket=bucket, candidate=independent_candidate,
-            snapshot=selected.evidence_snapshot,
+            bucket=bucket, candidate=selected.candidate,
+            snapshot=selected.candidate.evidence_snapshot,
         )
 
     return result
@@ -3264,11 +3237,9 @@ def main() -> int:
                              "If only one bucket is confirmed, retry the municipality "
                              "and preserve that confirmed bucket. Combine with --append.")
     parser.add_argument("--grounded-verify", action="store_true",
-                        help="Second verification pass for 'probable' URLs whose "
-                             "static/rendered preview was empty (Cloudflare challenge, "
-                             "JS shell): ask Gemini with Google Search grounding, which "
-                             "reads Google's index of the page. Only ascends with real "
-                             "grounding evidence (guardrail against URL-shape inference).")
+                        help="Compatibility flag retained; final decisions now use the "
+                             "single CandidateRecord adjudicator and never a second "
+                             "grounded verification authority")
     args = parser.parse_args()
 
     if args.gemini_free_first:
@@ -3356,7 +3327,7 @@ def main() -> int:
         except Exception as e:
             print(f"  checkpoint write failed: {e}", flush=True)
 
-    # --- Batch Gemini verification for uncertain results ---
+    # --- Compatibility closure for uncertain legacy results ---
     to_verify: list[dict] = []
     verify_index: dict[str, MunicipioResult] = {}
     for r in results:
@@ -3372,7 +3343,7 @@ def main() -> int:
                 })
                 verify_index[f"{r.municipio}|{bucket}"] = r
 
-    if to_verify and gemini_api_key():
+    if to_verify:
         print(f"\n{'='*60}", flush=True)
         print(f"Batch verification: {len(to_verify)} uncertain URLs", flush=True)
         to_verify, verify_index, verdicts = _batch_verify_uncertain_results(
@@ -3381,44 +3352,22 @@ def main() -> int:
         )
 
         confirmed = sum(1 for _, (v, _) in verdicts.items() if v == "confirmado")
+        for key, (status, reason) in sorted(verdicts.items()):
+            LOGGER.info("batch_bucket %s", json.dumps({
+                "key": key, "status": status, "reason": reason,
+            }, ensure_ascii=False, sort_keys=True))
         print(f"  Verified: {confirmed}/{len(verdicts)} upgraded to confirmado",
               flush=True)
 
-    # --- Grounded verification fallback (--grounded-verify) ---
-    # The passive batch verify judges only the static/rendered preview. When that
-    # preview is empty (Cloudflare challenge, JS shell), valid indexes get stuck at
-    # 'revisar' because Gemini sees nothing. Fall back to Gemini grounded, which reads
-    # GOOGLE'S INDEX of the page (Google's crawler passes the antibot). Only the items
-    # whose preview was empty AND are still not confirmed are retried, and the guardrail
-    # in grounded_verify_one ascends only with real evidence.
-    if args.grounded_verify and gemini_api_key() and to_verify:
-        retry = []
-        for it in to_verify:
-            r = verify_index.get(f"{it['municipio']}|{it['bucket']}")
-            if not r:
-                continue
-            conf = (r.confianza_concursos if it['bucket'] == "concursos"
-                    else r.confianza_processos)
-            if conf != "confirmado" and len((it.get("preview") or "").strip()) < 200:
-                retry.append((it, r))
-        if retry:
-            print(f"\n{'='*60}", flush=True)
-            print(f"Grounded fallback: {len(retry)} URLs with empty preview",
-                  flush=True)
-            asc = 0
-            for it, r in retry:
-                veredicto, motivo = grounded_verify_one(
-                    session, args.model, it['municipio'], it['bucket'], it['url'])
-                print(f"    grounded {it['municipio']}/{it['bucket']}: "
-                      f"{veredicto} — {motivo}", flush=True)
-                if veredicto == "confirmado":
-                    asc += 1
-                    if it['bucket'] == "concursos":
-                        r.confianza_concursos = "confirmado"
-                    else:
-                        r.confianza_processos = "confirmado"
-                    r.notes += f"; {motivo}"
-            print(f"  Grounded: {asc}/{len(retry)} upgraded to confirmado", flush=True)
+    if args.grounded_verify:
+        LOGGER.info(
+            "compatibility_flag %s",
+            json.dumps({
+                "flag": "grounded-verify",
+                "action": "no-op",
+                "reason": "FinalDecision usa adjudicador central unico",
+            }, ensure_ascii=False, sort_keys=True),
+        )
 
     # --skip-existing implies append: the skipped rows must be preserved.
     write_results(results, args.output, append=args.append or args.skip_existing)

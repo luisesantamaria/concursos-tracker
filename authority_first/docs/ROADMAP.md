@@ -29,7 +29,7 @@ Objetivo: descubrir la **pagina indice/listado estable** de concursos y processo
 Tier 0: Site oficial (dominio base)
 Tier 1: Links gratuitos (menus HTML, anchors, transparencia)
 Tier 2: Grounded search (Gemini + Google, solo si falta)
-Tier 3: Gemini verificador/selector (ai_pick_best entre candidatas)
+Tier 3: Gemini selector (ai_pick_best devuelve candidate_id entre records elegibles)
 Tier 4: Agente de navegacion Playwright (ultimo recurso, dirigido)
 ```
 
@@ -121,12 +121,27 @@ rechaza por sí solo.
 elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
 permanece con `decision+note`. Toda candidata de Tier 1, grounded, directed o
 Playwright atraviesa la misma hidratación y conserva un `EvidenceSnapshot`
-estático o renderizado. El transporte hasta batch se indexa por bucket; una
-evidencia utilizable se reevalúa con el contrato sin segundo GET ni Gemini.
+estático o renderizado.
+
+La cadena única en memoria es `CandidateRecord -> SelectedResource ->
+FinalDecision`. Record y snapshot son profundamente inmutables; autoridad,
+identidad, rol, evidencia, bucket, decisión y razón se calculan una vez antes de
+Tier 3. Tier 3 solo devuelve un `candidate_id` existente/elegible. La selección
+retiene la instancia exacta y el cierre deriva el estado sin refetch ni segunda
+adjudicación; legacy URL-only captura una evidencia y usa el mismo adjudicador,
+siempre con razón.
+
+`candidate_id` v1 es `v1:` + SHA-1 de URL final normalizada (host minúsculo sin
+`www`, sin fragmento/slash final, query ordenada), source, tier, municipio,
+bucket y huella del snapshot. No reconstruye records. Redirect/canonical guarda
+requested/final y valida URL/contenido final. El CSV conserva su esquema:
+provenance mínima y razón se registran en `razao`/`notes`. Telemetría JSON estable
+por candidato/bucket usa `fase2.cascade` en stderr (`FASE2_LOG_LEVEL`).
 
 `pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
 veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;
 el replay de 618 fixtures no mostró ningún flip atribuible a ese nombre.
 
-Estado: matriz contractual 10/10 y suite offline pertinentes verdes. Listo para
-el canario aislado del Paso 6; no reanudar chunks 5/6 como parte de este cambio.
+Estado: cadena única y canario Barros Cassal verdes offline, matriz contractual
+10/10, suite completa verde y replay run497 sin flips frente a 2b0dc11. Los
+chunks reales 5/6 siguen fuera de alcance de este cambio.

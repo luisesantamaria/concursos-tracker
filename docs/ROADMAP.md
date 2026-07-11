@@ -34,15 +34,16 @@ Tier 2 - Busca grounded (Gemini + Google)
   So se Tier 1 nao completou ambos buckets.
   Uma chamada por municipio com google_search.
 
-Tier 3 - Gemini verificador/seletor
-  Recebe candidatas e faz decisoes discretas:
+Tier 3 - Gemini seletor
+  Recebe CandidateRecords ya adjudicados deterministicamente:
   - indice_oficial / indice_oficial_combinado
   - portal_externo_oficial
   - detalle_individual_rechazado
   - licitacao_rechazada / concurso_cultural_rechazado
   - nao_encontrado / revisar
-  Quando ha multiplas candidatas validas: ai_pick_best escolhe
-  por compreensao de conteudo, nao por pontuacao numerica.
+  Quando ha multiplas candidatas validas: ai_pick_best devuelve candidate_id
+  por compreensao de conteudo, sem classificar/confirmar dimensoes e sem
+  pontuacao numerica.
 
 Tier 4 - Agente de navegacao (Playwright)
   Ultimo recurso. Abre o site em Chromium headless e navega
@@ -163,9 +164,24 @@ elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
 permanece con `decision+note`. Un `EvidenceSnapshot` de Playwright conserva
 `renderizada` y no provoca un segundo GET.
 
+La cadena única en memoria es `CandidateRecord -> SelectedResource ->
+FinalDecision`. Record y snapshot son profundamente inmutables; todas las
+dimensiones y la razón se adjudican una vez antes de Tier 3. La selección guarda
+la instancia exacta, y cierre/batch deriva la decisión sin refetch ni
+re-adjudicación. Legacy URL-only captura evidencia una vez y llama al mismo
+adjudicador central; toda salida, incluso no-upgrade, tiene razón.
+
+`candidate_id` v1 es `v1:` + SHA-1 de URL final normalizada (host minúsculo sin
+`www`, sin fragmento/slash final, query ordenada), source, tier, municipio,
+bucket y huella del snapshot. Es trazabilidad, no reconstrucción. Redirects
+conservan requested/final y se evalúan por URL/contenido final. El CSV mantiene
+su esquema; provenance mínima y razón van en `razao`/`notes`. Telemetría JSON por
+candidato/bucket usa `fase2.cascade` a stderr y `FASE2_LOG_LEVEL`.
+
 `pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
 veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;
 el replay de 618 fixtures no mostró ningún flip atribuible a ese nombre.
 
-Estado: matriz contractual 10/10 y suite offline pertinentes verdes. Listo para
-el canario aislado del Paso 6; no reanudar chunks 5/6 como parte de este cambio.
+Estado: cadena única y canario Barros Cassal verdes offline, matriz contractual
+10/10, suite completa verde y replay run497 sin flips frente a 2b0dc11. Los
+chunks reales 5/6 siguen fuera de alcance de este cambio.
