@@ -85,3 +85,16 @@ PROSECUTOR_OUTPUT_SCHEMA = {
         "failure_mode_proposal": {"type": ["object", "null"]},
     },
 }
+
+JUDGE_OUTPUT_SCHEMA_NAME = "Fase2ConflictJudgeClosedOutputV2"
+JUDGE_OUTPUT_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": JUDGE_OUTPUT_SCHEMA_NAME,
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "reason"],
+    "properties": {
+        "decision": {"enum": ["aceptar_A", "aceptar_B", "revisar"]},
+        "reason": {"type": "string", "minLength": 1},
+    },
+}

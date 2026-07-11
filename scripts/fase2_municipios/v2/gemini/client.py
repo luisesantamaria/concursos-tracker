@@ -412,3 +412,23 @@ def build_certifier_client(
         response_schema=resources.references["schema.json"],
         max_attempts=max_attempts,
     )
+
+
+def build_judge_client(
+    *,
+    transport: Transport,
+    limiter: RateLimiterLike,
+    models: RoleModels | None = None,
+    max_attempts: int = 3,
+) -> StructuredGeminiClient:
+    """Build the closed-output judge client from the shared free role config."""
+    from scripts.fase2_municipios.v2.agents.schemas import JUDGE_OUTPUT_SCHEMA
+
+    role_models = models or RoleModels()
+    return StructuredGeminiClient(
+        transport=transport,
+        limiter=limiter,
+        model=role_models.judge_model,
+        response_schema=JUDGE_OUTPUT_SCHEMA,
+        max_attempts=max_attempts,
+    )

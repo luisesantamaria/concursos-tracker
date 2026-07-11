@@ -129,9 +129,9 @@ env -u GEMINI_API_KEY -u GEMINI_API_KEY_FREE -u GEMINI_API_KEY_PAID \
 declara Python 3.12 como versión objetivo. Esta divergencia se reporta, no se
 corrige en este paso.
 
-## Layout V2 propuesto
+## Layout V2 implementado
 
-En disco, las rondas 1 a 5 crean solamente:
+En disco, las rondas 1 a 6 crean:
 
 ```text
 scripts/fase2_municipios/v2/
@@ -147,11 +147,14 @@ scripts/fase2_municipios/v2/
 │   ├── __init__.py
 │   ├── base.py
 │   ├── certifier.py
+│   ├── judge.py
+│   ├── orchestration.py
 │   ├── prosecutor.py
 │   ├── schemas.py
 │   ├── tools.py
 │   └── tests/
-│       └── test_agents.py
+│       ├── test_agents.py
+│       └── test_orchestration.py
 ├── ratelimit/
 │   ├── __init__.py
 │   ├── limiter.py
@@ -167,12 +170,10 @@ scripts/fase2_municipios/v2/
 ```
 
 El rate limiter se implementó en ronda 2, el cliente Gemini free-only en ronda 3,
-el snapshot en ronda 4 y el framework/certificador/fiscal en ronda 5. Submódulos
-futuros, documentados pero **no creados todavía**:
+el snapshot en ronda 4, el framework/certificador/fiscal en ronda 5 y el juez
+cerrado con orquestación A/B/C en ronda 6. Permanece futuro:
 
 ```text
-v2/agents/judge.py
-v2/orchestration.py
 v2/memory/{store,promotion}.py
 ```
 
@@ -475,9 +476,43 @@ contents, observaciones, llamadas a tools, tarea privada ni mensajes del
 certificador. Logging registra rol, número de paso, acción, nombre de tool,
 contador y decisión, sin prompts, contents ni citas completas.
 
-El juez de conflictos y la orquestación certificador→fiscal→juez quedan
-deliberadamente para la ronda siguiente; `AgentRunner` ya es role-genérico para
-soportarlos sin cambiar el protocolo.
+## Juez cerrado y orquestación A/B/C (ronda 6)
+
+`ABCOrchestrator.run()` ejecuta A (certificador), entrega su output validado a B
+(fiscal) y adapta ambos a `DecisionProposal`. B `sustain` conserva la propuesta
+de A; cualquier objeción no resuelta se adapta conservadoramente a `revisar`.
+`resolve()` también expone el seam de propuestas ya validadas para pruebas y
+futuras fuentes A/B sin cambiar el cierre determinista.
+
+El desacuerdo es exactamente la tupla `(decision, bucket, resource_identity)`.
+`resource_identity` reutiliza `_normalized_candidate_url()` de la cadena
+existente: host sin `www`, fragmento y slash terminal eliminados, y query
+ordenada. Motivos distintos no crean desacuerdo. Dos `revisar` siempre son
+acuerdo conservador; el juez no se llama. La misma decisión sobre recursos
+materialmente distintos sí lo llama.
+
+`ConflictJudge` recibe exclusivamente un `StructuredGeminiClient` inyectado. Su
+schema permite solo `{decision, reason}`, donde decision pertenece a
+`aceptar_A|aceptar_B|revisar`; `additionalProperties=false` impide citas o una
+decisión nueva. `build_judge_client()` selecciona el modelo mediante
+`RoleModels.judge_model` (`gemini-3.5-flash`) y no resuelve credenciales. Snapshot,
+candidatos y outputs A/B se serializan entre delimitadores `UNTRUSTED_DATA` con
+la instrucción explícita de que son datos, nunca instrucciones.
+
+C solo se invoca cuando las tuplas difieren. Si elige A/B, el orquestador
+reconstruye desde esa propuesta; si devuelve `revisar`, no inventa un final. En
+todos los casos de consenso se ejecuta igualmente `_final_gate()`: las citas se
+validan otra vez con `anchor_citation(..., require_offsets=True)` y `verify_all`,
+y el recurso pasa por `resolve_selector_pick()` y `derive_final_decision()` de la
+cadena existente. No se reproducen sus comprobaciones de autoridad, identidad,
+evidencia, bucket o elegibilidad dentro del juez.
+
+Códigos discretos de revisión: `input_invalid`, `proposal_invalid`,
+`agreement_review`, `consensus_failed_final_gate`, `judge_error`,
+`judge_ambiguous`, `judge_invalid_citation` y `judge_failed_final_gate`.
+Timeout, cancelación, cuota y errores tipados del cliente, además de respuesta
+vacía/malformada o serialización inválida, se convierten en `judge_error` en el
+adaptador. No existe un `except` general que oculte errores internos.
 
 ## Invariantes de seguridad
 
@@ -485,10 +520,14 @@ soportarlos sin cambiar el protocolo.
   leer o usar `GEMINI_API_KEY_PAID`, usar `GEMINI_API_KEY` como fallback o llamar
   cualquier ruta/modelo pago. Ante cuota o error, espera/falla de forma tipada;
   nunca degrada a pago.
+- El juez no consulta `os.environ`, ADC ni nombres de credenciales: recibe el
+  cliente free estructurado ya construido e inyectado.
 - Grounding siempre off: ningún payload incorpora Google Search ni herramientas
   externas. Las tools permitidas operan contra evidencia local/congelada.
 - Structured output obligatorio, seguido de validación estricta contra el schema
   de salida correspondiente; JSON inválido no se reinterpreta heurísticamente.
+- Snapshot, candidatas y outputs de agentes son datos no confiables; su contenido
+  delimitado no puede introducir instrucciones ni ampliar el dominio del juez.
 - Toda cita debe localizarse literalmente en el `EvidenceSnapshot` por campo y
   hash. Una cita no verificable impide confirmar.
 - Tool loop acotado por número de rondas, llamadas, bytes y tiempo; allowlist de

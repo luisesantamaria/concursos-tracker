@@ -17,6 +17,7 @@ from .client import (
     Transport,
     UsageInconsistencyError,
     build_certifier_client,
+    build_judge_client,
     resolve_free_api_key,
 )
 from .schema_validation import validate_json_schema
@@ -38,6 +39,7 @@ __all__ = [
     "Transport",
     "UsageInconsistencyError",
     "build_certifier_client",
+    "build_judge_client",
     "resolve_free_api_key",
     "validate_json_schema",
 ]
