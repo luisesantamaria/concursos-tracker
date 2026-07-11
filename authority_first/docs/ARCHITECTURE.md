@@ -86,10 +86,14 @@ Tier 4 — Agente de navegacion (Playwright)
   paginas renderizadas por JS, portales embebidos.
   Costo: ~3-5s/pagina, ~300-500MB RAM.
   Reusa UNA instancia de browser para toda la corrida.
-  Cada candidata conserva un snapshot inmutable (HTML, URL final, titulo,
-  status y fuente) y lo pasa por los mismos gates del Candidate. Un snapshot
-  utilizable evita un segundo GET con requests; status ausente es neutral,
-  mientras un 4xx/5xx capturado se rechaza.
+  Tier 1, grounded, directed y Tier 4 pasan cada candidata por la misma
+  hidratacion. Cada una conserva un snapshot inmutable (HTML, URL solicitada,
+  URL final, titulo, status, fuente y estado de evidencia) y lo pasa por los
+  mismos gates del Candidate. La procedencia del tier vive fuera del snapshot.
+  La seleccion transporta una asociacion independiente por bucket. Un snapshot
+  utilizable evita un segundo GET y Gemini en el cierre; status ausente es
+  neutral, mientras checkpoint, soft404, login, identidad ajena o 4xx/5xx no
+  confirman. Redirects se adjudican por URL final y contenido.
 ```
 
 ### Principios de la cascata

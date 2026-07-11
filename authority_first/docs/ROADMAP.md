@@ -119,8 +119,10 @@ rechaza por sí solo.
 
 `Candidate.fetchable` queda como alias operacional de `accessible`; la
 elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
-permanece con `decision+note`. Un `EvidenceSnapshot` de Playwright conserva
-`renderizada` y no provoca un segundo GET.
+permanece con `decision+note`. Toda candidata de Tier 1, grounded, directed o
+Playwright atraviesa la misma hidratación y conserva un `EvidenceSnapshot`
+estático o renderizado. El transporte hasta batch se indexa por bucket; una
+evidencia utilizable se reevalúa con el contrato sin segundo GET ni Gemini.
 
 `pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
 veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;

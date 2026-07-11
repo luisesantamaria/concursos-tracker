@@ -42,7 +42,7 @@ import sys
 import time
 import traceback
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urljoin, urlparse, unquote
@@ -147,10 +147,10 @@ class EvidenceSnapshot:
     text: str
     title: str
     final_url: str
+    requested_url: str = ""
     status: int | None = None
     source: str = "playwright"
     evidence_state: str = "renderizada"
-    provenance: tuple[dict, ...] = field(default_factory=tuple)
 
 
 # Compatibility name for the existing Tier 0/Tier 2 browser fallback API.
@@ -424,6 +424,7 @@ class Candidate:
     bucket: str = "combinado"
     content_preview: str = ""
     evidence_snapshot: EvidenceSnapshot | None = field(default=None, repr=False)
+    source_tier: str = ""
     # Discovery hint only. It records which bucket led us to the candidate so
     # an uncertain classification can be returned to that bucket for review.
     # It never decides the final bucket; forma/tipo from page content do that.
@@ -449,6 +450,15 @@ class Candidate:
         return self.decision in {
             "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial",
         }
+
+
+@dataclass(frozen=True)
+class BucketCandidateEvidence:
+    """Independent bucket association for one selected candidate and evidence."""
+
+    bucket: str
+    candidate: Candidate
+    snapshot: EvidenceSnapshot
 
 
 def _discovery_bucket_hint(menu_text: str, url: str) -> str:
@@ -624,18 +634,18 @@ def candidate_from_evidence(
     second requests GET, while traversing the same deterministic content gates.
     """
     if isinstance(evidence, EvidenceSnapshot):
+        snapshot_requested_url = evidence.requested_url or requested_url
         page = _page_from_html(
             evidence.final_url, evidence.status, "text/html; charset=UTF-8",
-            evidence.html, requested_url=requested_url,
+            evidence.html, requested_url=snapshot_requested_url,
         )
         page.title = evidence.title or page.title
         page.text = evidence.text or page.text
-        candidate_source = evidence.source
+        candidate_source = source
         evidence_state = (
             "error_fetch" if evidence.status is not None and evidence.status >= 400
             else evidence.evidence_state
         )
-        provenance = evidence.provenance or tuple(provenance)
     else:
         page = evidence
         candidate_source = source
@@ -681,17 +691,81 @@ def candidate_from_evidence(
     return candidate
 
 
+def _snapshot_from_page(requested_url: str, page: Page) -> EvidenceSnapshot:
+    """Detach a complete immutable snapshot from a static HTTP response."""
+    evidence_state = (
+        "error_fetch" if page.error or (
+            page.status is not None and page.status >= 400
+        ) else
+        "incompleta_antibot" if is_antibot_challenge(page) else
+        "completa"
+    )
+    return EvidenceSnapshot(
+        html=page.html or "", text=page.text or "", title=page.title or "",
+        requested_url=page.requested_url or requested_url,
+        final_url=page.url or requested_url, status=page.status,
+        source="requests", evidence_state=evidence_state,
+    )
+
+
+def _snapshot_with_requested_url(snapshot: EvidenceSnapshot,
+                                 requested_url: str) -> EvidenceSnapshot:
+    """Defensively complete legacy snapshots without mutating shared evidence."""
+    if snapshot.requested_url:
+        return snapshot
+    return EvidenceSnapshot(
+        html=snapshot.html, text=snapshot.text, title=snapshot.title,
+        requested_url=requested_url, final_url=snapshot.final_url,
+        status=snapshot.status, source=snapshot.source,
+        evidence_state=snapshot.evidence_state,
+    )
+
+
+def hydrate_candidate(
+        candidate: Candidate, municipio: str, *, session=None, timeout: int = 15,
+        evidence: Page | EvidenceSnapshot | None = None,
+        official_url: str = "", render_page=_DEFAULT_RENDERER) -> Candidate:
+    """Canonical hydration path for every discovery producer.
+
+    Discovery metadata never stands in for content. The function obtains or
+    accepts real evidence, detaches it into one immutable snapshot, and then
+    traverses the existing deterministic candidate contract.
+    """
+    requested_url = candidate.evidence_snapshot.requested_url if (
+        candidate.evidence_snapshot and candidate.evidence_snapshot.requested_url
+    ) else candidate.url
+    if evidence is None:
+        if session is None:
+            raise ValueError("session is required when evidence is not supplied")
+        if official_url:
+            evidence = fetch_page_with_official_fallback(
+                session, requested_url, municipio, official_url, timeout,
+                render_page, preserve_snapshot=True,
+            )
+        else:
+            evidence = fetch_page(session, requested_url, timeout)
+    snapshot = (
+        _snapshot_with_requested_url(evidence, requested_url)
+        if isinstance(evidence, EvidenceSnapshot)
+        else _snapshot_from_page(requested_url, evidence)
+    )
+    evaluated = candidate_from_evidence(
+        requested_url, candidate.source, candidate.menu_text, municipio, snapshot,
+        provenance=tuple(dict(item) for item in candidate.provenance),
+    )
+    evaluated.source_tier = candidate.source_tier
+    evaluated.bucket_hint = candidate.bucket_hint
+    return evaluated
+
+
 def _apply_candidate_evidence(candidate: Candidate, evidence: Page | EvidenceSnapshot,
                               municipio: str) -> Candidate:
     """Mutate an existing discovery candidate from already captured evidence."""
-    evaluated = candidate_from_evidence(
-        candidate.url, candidate.source, candidate.menu_text, municipio, evidence,
-        provenance=candidate.provenance,
-    )
+    evaluated = hydrate_candidate(candidate, municipio, evidence=evidence)
     for name in (
         "url", "source", "page", "accessible", "evidence_state", "source_kind",
         "authority", "identity", "page_role", "decision", "note", "provenance",
-        "bucket", "content_preview", "evidence_snapshot",
+        "bucket", "content_preview", "evidence_snapshot", "source_tier",
     ):
         setattr(candidate, name, getattr(evaluated, name))
     return candidate
@@ -700,7 +774,8 @@ def _apply_candidate_evidence(candidate: Candidate, evidence: Page | EvidenceSna
 def fetch_page_with_official_fallback(
         session: requests.Session, url: str, municipio: str,
         official_url: str, timeout: int = 15,
-        render_page=_DEFAULT_RENDERER) -> Page:
+        render_page=_DEFAULT_RENDERER,
+        preserve_snapshot: bool = False) -> Page | EvidenceSnapshot:
     """Fetch an unequivocal municipal official URL, rendering only a bad shell.
 
     The normal fetch remains the source of the fallback decision. Playwright is
@@ -761,6 +836,8 @@ def fetch_page_with_official_fallback(
 
     # fetch_page has no page cache: only WAF host-state is cached. Therefore no
     # checkpoint is promoted and no rendered DOM needs a cache replacement.
+    if preserve_snapshot:
+        return _snapshot_with_requested_url(rendered, requested_url)
     return recovered
 
 
@@ -896,8 +973,9 @@ def _probe_known_index_paths(session: requests.Session, home: Page,
         seen_urls.add(url)
         candidate = Candidate(
             url=url, source="probe", menu_text="(probe: known index path)",
+            source_tier="tier1",
         )
-        probes.append(_apply_candidate_evidence(candidate, page, municipio))
+        probes.append(hydrate_candidate(candidate, municipio, evidence=page))
     return probes
 
 
@@ -915,7 +993,8 @@ def _official_navigation_provenance(home: Page, municipio: str,
 
 
 def tier1_collect_candidates(session: requests.Session, home: Page,
-                             municipio: str, timeout: int = 15) -> list[Candidate]:
+                             municipio: str, timeout: int = 15,
+                             render_page=_DEFAULT_RENDERER) -> list[Candidate]:
     """Scan home page links and one level of container pages for relevant URLs."""
     candidates = []
     seen_urls: set[str] = set()
@@ -937,6 +1016,7 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                 seen_urls.add(href)
                 candidates.append(Candidate(
                     url=href, source="menu_link", menu_text=link_text,
+                    source_tier="tier1",
                     provenance=_official_navigation_provenance(home, municipio, link_text),
                 ))
 
@@ -971,6 +1051,7 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                     seen_urls.add(href)
                     candidates.append(Candidate(
                         url=href, source="container_link",
+                        source_tier="tier1",
                         menu_text=f"{container_text} > {link_text}",
                         provenance=_official_navigation_provenance(
                             home, municipio, f"{container_text} > {link_text}",
@@ -978,9 +1059,13 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                     ))
 
     # Fetch each candidate page to get content for Tier 3
-    for c in candidates:
-        page = fetch_page(session, c.url, min(timeout, 10))
-        _apply_candidate_evidence(c, page, municipio)
+    candidates = [
+        hydrate_candidate(
+            c, municipio, session=session, timeout=min(timeout, 10),
+            official_url=home.url, render_page=render_page,
+        )
+        for c in candidates
+    ]
 
     # Drill-down: a bucket parent page (e.g. /concurso) often links to more
     # specific sub-indexes (e.g. /concurso/categoria/25/concurso). Also follows
@@ -1013,12 +1098,17 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                 seen_urls.add(href)
                 drill.append(Candidate(
                     url=href, source="drilldown",
+                    source_tier="tier1",
                     menu_text=f"{c.menu_text} > {link_text}",
                     provenance=list(c.provenance),
                 ))
-    for c in drill:
-        page = fetch_page(session, c.url, min(timeout, 10))
-        _apply_candidate_evidence(c, page, municipio)
+    drill = [
+        hydrate_candidate(
+            c, municipio, session=session, timeout=min(timeout, 10),
+            official_url=home.url, render_page=render_page,
+        )
+        for c in drill
+    ]
     candidates.extend(drill)
 
     # Parameter normalization: if a candidate has ano=YYYY, add ano=0 variant
@@ -1031,12 +1121,17 @@ def tier1_collect_candidates(session: requests.Session, home: Page,
                 seen_urls.add(variant_url)
                 param_variants.append(Candidate(
                     url=variant_url, source="param_variant",
+                    source_tier="tier1",
                     menu_text=f"{c.menu_text} (all years)",
                     provenance=list(c.provenance),
                 ))
-    for c in param_variants:
-        page = fetch_page(session, c.url, min(timeout, 10))
-        _apply_candidate_evidence(c, page, municipio)
+    param_variants = [
+        hydrate_candidate(
+            c, municipio, session=session, timeout=min(timeout, 10),
+            official_url=home.url, render_page=render_page,
+        )
+        for c in param_variants
+    ]
     candidates.extend(param_variants)
 
     return candidates
@@ -1296,7 +1391,9 @@ def tier2_grounded_search(session: requests.Session, model: str,
             host = urlparse(real).netloc.lower()
             if _t2_host_ok(host) and not any(bad in host for bad in BAD_HOSTS) and not is_pdf_or_file(real):
                 seen.add(real)
-                candidates.append(Candidate(url=real, source="grounding"))
+                candidates.append(Candidate(
+                    url=real, source="grounding", source_tier="tier2_grounded",
+                ))
 
     # URLs mentioned in text response
     for raw in re.findall(r"https?://[^\s\]\)\"'<>]+", text_response or ""):
@@ -1305,21 +1402,25 @@ def tier2_grounded_search(session: requests.Session, model: str,
             host = urlparse(url).netloc.lower()
             if _t2_host_ok(host) and not any(bad in host for bad in BAD_HOSTS) and not is_pdf_or_file(url):
                 seen.add(url)
-                candidates.append(Candidate(url=url, source="grounding"))
+                candidates.append(Candidate(
+                    url=url, source="grounding", source_tier="tier2_grounded",
+                ))
 
     print(f"      grounding: {len(chunks)} chunks, {len(candidates)} candidate URLs", flush=True)
 
     # Fetch each to get content for Tier 3
+    hydrated_candidates: list[Candidate] = []
     for c in candidates:
         if is_broad_landing(c.url):
             c.fetchable = False
+            hydrated_candidates.append(c)
             continue
-        page = fetch_page_with_official_fallback(
-            session, c.url, municipio, site_hint, timeout, render_page,
-        )
-        _apply_candidate_evidence(c, page, municipio)
+        hydrated_candidates.append(hydrate_candidate(
+            c, municipio, session=session, timeout=timeout,
+            official_url=site_hint, render_page=render_page,
+        ))
 
-    return candidates
+    return hydrated_candidates
 
 
 def tier2_find_site_grounded(session: requests.Session, model: str,
@@ -1403,7 +1504,8 @@ def tier2_find_site_grounded(session: requests.Session, model: str,
 def tier2_directed_bucket_search(session: requests.Session, model: str,
                                  municipio: str, host: str,
                                  bucket_name: str,
-                                 timeout: int = 15) -> list[Candidate]:
+                                 timeout: int = 15,
+                                 render_page=_DEFAULT_RENDERER) -> list[Candidate]:
     """Targeted grounding search for a specific missing bucket on a known host."""
     prompt = (
         f"Encontre a pagina INDICE/LISTAGEM de {bucket_name} da Prefeitura de "
@@ -1454,6 +1556,7 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
                 seen.add(real)
                 candidates.append(Candidate(
                     url=real, source="directed_grounding",
+                    source_tier="tier2_directed",
                     bucket_hint=("concursos" if "concurso" in norm(bucket_name)
                                  else "processos"),
                 ))
@@ -1466,20 +1569,25 @@ def tier2_directed_bucket_search(session: requests.Session, model: str,
                 seen.add(url)
                 candidates.append(Candidate(
                     url=url, source="directed_grounding",
+                    source_tier="tier2_directed",
                     bucket_hint=("concursos" if "concurso" in norm(bucket_name)
                                  else "processos"),
                 ))
 
     print(f"      directed: {len(candidates)} candidates for {bucket_name}", flush=True)
 
+    hydrated_candidates: list[Candidate] = []
     for c in candidates:
         if is_broad_landing(c.url):
             c.fetchable = False
+            hydrated_candidates.append(c)
             continue
-        page = fetch_page(session, c.url, timeout)
-        _apply_candidate_evidence(c, page, municipio)
+        hydrated_candidates.append(hydrate_candidate(
+            c, municipio, session=session, timeout=timeout,
+            official_url=f"https://{host}/", render_page=render_page,
+        ))
 
-    return candidates
+    return hydrated_candidates
 
 
 # ---------------------------------------------------------------------------
@@ -2024,8 +2132,12 @@ def _tier4_candidates_from_links(
             continue
         if not snapshot:
             continue
-        candidates.append(candidate_from_evidence(
-            href, "playwright", menu_text, municipio, snapshot,
+        candidates.append(hydrate_candidate(
+            Candidate(
+                url=href, source="playwright", menu_text=menu_text,
+                source_tier="tier4",
+            ),
+            municipio, evidence=snapshot,
         ))
     return candidates
 
@@ -2123,6 +2235,7 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
                     html=candidate_page.content(),
                     text=candidate_page.locator("body").inner_text(),
                     title=candidate_page.title(),
+                    requested_url=href,
                     final_url=candidate_page.url,
                     status=response.status if response is not None else None,
                     source="playwright",
@@ -2335,8 +2448,12 @@ def batch_gemini_verify(session: requests.Session, model: str,
 
 
 def _usable_evidence_snapshot(snapshot: EvidenceSnapshot,
-                              requested_url: str) -> bool:
-    """Return whether preserved rendered evidence can replace the batch GET."""
+                              selected_url: str) -> bool:
+    """Single content gate for static or rendered evidence used by batch closure."""
+    if not (snapshot.requested_url or "").strip():
+        return False
+    if not (snapshot.final_url or "").strip():
+        return False
     if not (snapshot.html or "").strip() or not (snapshot.text or "").strip():
         return False
     if snapshot.evidence_state not in {"renderizada", "completa"}:
@@ -2344,19 +2461,29 @@ def _usable_evidence_snapshot(snapshot: EvidenceSnapshot,
     if snapshot.status is not None and not 200 <= snapshot.status < 400:
         return False
     if (_normalized_candidate_url(snapshot.final_url)
-            != _normalized_candidate_url(requested_url)):
+            != _normalized_candidate_url(selected_url)):
         return False
     page = _page_from_html(
         snapshot.final_url, snapshot.status, "text/html; charset=UTF-8",
-        snapshot.html, requested_url=requested_url,
+        snapshot.html, requested_url=snapshot.requested_url,
     )
     page.title = snapshot.title or page.title
     page.text = snapshot.text or page.text
+    login_blob = norm(f"{page.title}\n{page.text[:2000]}")
+    login_or_checkpoint = bool(
+        re.search(r"\b(?:login|usuario|senha|acesso restrito)\b", login_blob)
+        and not re.search(r"\b(?:concurso publico|processo seletivo)\b", login_blob)
+    )
+    complete_document = bool(re.search(
+        r"</(?:body|html)\s*>", snapshot.html, re.I,
+    ))
     return bool(
         page.ok
         and not is_antibot_challenge(page)
         and not is_soft_404(page)
         and not is_dead_site(page)
+        and not login_or_checkpoint
+        and (verdict.content_complete(page.text, page.title) or complete_document)
     )
 
 
@@ -2385,19 +2512,29 @@ def _batch_verify_uncertain_results(
 
     verdicts: dict[str, tuple[str, str]] = {}
     legacy_items: list[dict] = []
+    unusable_snapshot_items: list[dict] = []
     for item in to_verify:
         key = f"{item['municipio']}|{item['bucket']}"
         result = verify_index[key]
-        snapshot = result.evidence_snapshots.get(
-            _normalized_candidate_url(item["url"]),
-        )
-        if snapshot is None or not _usable_evidence_snapshot(
-                snapshot, item["url"]):
+        association = result.selected_evidence.get(item["bucket"])
+        if association is None:
             legacy_items.append(item)
             continue
+        snapshot = association.snapshot
+        if not _usable_evidence_snapshot(snapshot, item["url"]):
+            unusable_snapshot_items.append(item)
+            verdicts[key] = (
+                "revisar",
+                "snapshot preservado no utilizable: checkpoint/soft404/login/error/truncado",
+            )
+            continue
 
-        candidate = candidate_from_evidence(
-            item["url"], snapshot.source, "", item["municipio"], snapshot,
+        candidate = hydrate_candidate(
+            replace(
+                association.candidate,
+                provenance=[dict(value) for value in association.candidate.provenance],
+            ),
+            item["municipio"], evidence=snapshot,
         )
         item["title"] = candidate.page.title[:150] if candidate.page else ""
         item["preview"] = candidate.page.text[:400] if candidate.page else ""
@@ -2411,7 +2548,7 @@ def _batch_verify_uncertain_results(
 
     # Legacy path: preserve the existing HTTP fetch, optional light rendering,
     # and Gemini batch verification exactly when no usable snapshot survived.
-    for item in legacy_items:
+    for item in legacy_items + unusable_snapshot_items:
         try:
             page = fetch_page(session, item["url"], timeout=timeout)
             item["title"] = page.title[:150] if page else ""
@@ -2550,7 +2687,7 @@ class MunicipioResult:
     confianza_processos: str = ""
     urls_extras_concursos: str = ""
     urls_extras_processos: str = ""
-    evidence_snapshots: dict[str, EvidenceSnapshot] = field(
+    selected_evidence: dict[str, BucketCandidateEvidence] = field(
         default_factory=dict, repr=False,
     )
 
@@ -2601,7 +2738,9 @@ def process_municipio(session: requests.Session, municipio: str,
             home.links.extend((h, t) for h, t in rendered if h not in existing)
             print(f"    Tier 1: rendered {len(rendered)} links from SPA menu", flush=True)
             tiers_used.append("t1spa")
-    t1_candidates = tier1_collect_candidates(session, home, municipio, timeout)
+    t1_candidates = tier1_collect_candidates(
+        session, home, municipio, timeout, render_page=challenge_renderer,
+    )
     all_candidates.extend(t1_candidates)
     fetchable_t1 = [c for c in t1_candidates if c.fetchable]
     print(f"    Tier 1: {len(fetchable_t1)} fetchable candidates from {len(t1_candidates)} found", flush=True)
@@ -2714,6 +2853,7 @@ def process_municipio(session: requests.Session, municipio: str,
             try:
                 t2d = tier2_directed_bucket_search(
                     session, model, municipio, host, bucket_name, timeout,
+                    render_page=challenge_renderer,
                 )
                 existing_urls = {c.url for c in all_candidates}
                 new_d = [c for c in t2d if c.url not in existing_urls]
@@ -2847,17 +2987,32 @@ def process_municipio(session: requests.Session, municipio: str,
         notes_parts.append("bloqueo_antibot: site responde challenge JS (indice no accesible)")
     result.notes = "; ".join(notes_parts)
 
-    selected_keys = {
-        _normalized_candidate_url(url)
-        for url in (result.url_concursos, result.url_processos_seletivos)
-        if url
-    }
-    result.evidence_snapshots = {
-        _normalized_candidate_url(candidate.url): candidate.evidence_snapshot
-        for candidate in all_candidates
-        if candidate.evidence_snapshot is not None
-        and _normalized_candidate_url(candidate.url) in selected_keys
-    }
+    for bucket, selected_url in (
+        ("concursos", result.url_concursos),
+        ("processos", result.url_processos_seletivos),
+    ):
+        selected = next((
+            candidate for candidate in all_candidates
+            if candidate.evidence_snapshot is not None
+            and _normalized_candidate_url(candidate.url)
+            == _normalized_candidate_url(selected_url)
+        ), None)
+        if selected is None or selected.evidence_snapshot is None:
+            continue
+        independent_candidate = hydrate_candidate(
+            Candidate(
+                url=selected.evidence_snapshot.requested_url or selected.url,
+                source=selected.source, menu_text=selected.menu_text,
+                source_tier=selected.source_tier,
+                provenance=[dict(value) for value in selected.provenance],
+                bucket_hint=selected.bucket_hint,
+            ),
+            result.municipio, evidence=selected.evidence_snapshot,
+        )
+        result.selected_evidence[bucket] = BucketCandidateEvidence(
+            bucket=bucket, candidate=independent_candidate,
+            snapshot=selected.evidence_snapshot,
+        )
 
     return result
 
