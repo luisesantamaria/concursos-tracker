@@ -1004,6 +1004,16 @@ _INCOMPLETE_CONTENT = re.compile(
     r"runtime\s+error|service\s+unavailable|bad\s+gateway|gateway\s+timeout)\b",
     re.I,
 )
+_RESULT_COUNT = re.compile(
+    r"\b\d+\s+resultad[oa]s?\s+encontrad[oa]s?\b",
+    re.I,
+)
+_LISTING_CONTROL = re.compile(
+    r"\b(?:formularios?\s+(?:de\s+)?(?:filtro|busca|pesquisa)|"
+    r"filtr(?:ar|o|os|agem)|busc(?:ar|a)|pesquis(?:ar|a)|"
+    r"pagin(?:a|acao)|proxim[oa]|anterior|export(?:ar|acao)|imprimir)\b",
+    re.I,
+)
 _DEFINITION_SENTENCE = re.compile(
     r"^(?:concursos?\s+p[uú]blic\w*|processos?\s+seletiv\w*)\s+"
     r"(?:[eé]\s+um|consiste|significa|permite|tem\s+por\s+objetivo)\b",
@@ -1272,6 +1282,22 @@ def content_complete(text: str, title: str = "") -> bool:
     return not _INCOMPLETE_CONTENT.search(qn(f"{title}\n{text}"))
 
 
+def _has_structural_index_signals(text: str, *, has_listing: bool,
+                                  anchors: list | None = None) -> bool:
+    """Recognise an index shell even when it currently contains only one row."""
+    if not has_listing:
+        return False
+    q = qn(text or "")
+    if not _RESULT_COUNT.search(q):
+        return False
+    if _LISTING_CONTROL.search(q):
+        return True
+    return any(
+        re.search(r"[?&](?:page|pagina)=", str(anchor.get("href", "")), re.I)
+        for anchor in (anchors or []) if isinstance(anchor, dict)
+    )
+
+
 def candidate_content_state(text: str, bucket: str, *, title: str = "",
                             anchors: list | None = None,
                             items: list | None = None,
@@ -1284,13 +1310,20 @@ def candidate_content_state(text: str, bucket: str, *, title: str = "",
     detail = is_single_event_document_detail(
         text, bucket, title=title, anchors=anchors)
     complete = content_complete(text, title)
+    structural_index = _has_structural_index_signals(
+        text, has_listing=listing, anchors=anchors)
     predicates = {
         "has_event_listing": listing,
         "is_single_article": article,
         "is_single_event_document_detail": detail,
         "content_complete": complete,
+        "has_structural_index_signals": structural_index,
     }
-    if article or detail:
+    if article:
+        return "detalle_individual_rechazado", predicates
+    if structural_index:
+        return "indice_oficial", predicates
+    if detail:
         return "detalle_individual_rechazado", predicates
     if listing and not article and not detail:
         return "indice_oficial", predicates

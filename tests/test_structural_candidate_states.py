@@ -6,22 +6,45 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "eval"))
+sys.path.insert(0, str(ROOT / "scripts" / "fase2_municipios"))
+sys.path.insert(0, str(ROOT / "scripts" / "shared"))
 
+import cascade_municipios as C  # noqa: E402
 import verdict_extract as V  # noqa: E402
 
 
-def test_single_event_is_enough_for_an_index():
+def test_single_result_structural_index_overrides_document_detail():
     text = "\n".join([
-        "Prefeitura", "Concursos Públicos", "Lista de eventos",
+        "Prefeitura Municipal de Cidade Exemplo", "Concursos Públicos",
+        "Formulário de busca", "Filtrar por palavra-chave", "Buscar",
+        "1 resultado encontrado", "Exportar resultados", "Página 1",
         "CONCURSO PÚBLICO Nº 01/2026", "Publicado em: 02/04/2026",
+        "DOWNLOADS DE DOCUMENTOS:",
+        "EDITAL DE CONVOCAÇÃO Nº 02/2026", "Baixar agora!",
     ])
+    anchors = [
+        {"href": "https://cidadeexemplo.rs.gov.br/concursos?page=1", "text": "Página 1"},
+        {"href": "https://cidadeexemplo.rs.gov.br/anexo.pdf", "text": "Edital de convocação"},
+    ]
     state, predicates = V.candidate_content_state(
-        text, "concursos", title="Concursos Públicos")
+        text, "concursos", title="Concursos Públicos", anchors=anchors)
     assert state == "indice_oficial"
     assert predicates["has_event_listing"] is True
+    assert predicates["is_single_event_document_detail"] is True
+    assert predicates["has_structural_index_signals"] is True
+
+    page = C.Page(
+        url="https://cidadeexemplo.rs.gov.br/concursos?page=1", status=200,
+        title="Concursos Públicos", text=text,
+        links=[(anchor["href"], anchor["text"]) for anchor in anchors],
+    )
+    candidate = C.candidate_from_evidence(
+        page.url, "fixture", "Concursos Públicos", "Cidade Exemplo", page,
+    )
+    assert candidate.fetchable is True
 
 
-def test_year_navigation_is_not_an_event_listing():
+def test_year_navigation_without_listing_is_rejected():
     text = "\n".join([
         "Prefeitura", "Concursos Públicos", "Escolha o ano",
         "Concursos Públicos 2024", "Concursos Públicos 2025",
@@ -32,7 +55,7 @@ def test_year_navigation_is_not_an_event_listing():
     assert predicates["has_event_listing"] is False
 
 
-def test_dated_editorial_article_is_rejected():
+def test_numeric_news_article_without_listing_is_rejected():
     text = "\n".join([
         "Prefeitura", "Notícias", "Compartilhe:", "CONCURSO PÚBLICO",
         "7 fevereiro 2024 11:25", "A administração anunciou a futura banca.",
@@ -44,7 +67,7 @@ def test_dated_editorial_article_is_rejected():
     assert predicates["is_single_article"] is True
 
 
-def test_single_governing_event_with_document_children_is_detail():
+def test_single_event_document_detail_without_index_signals_is_rejected():
     text = "\n".join([
         "Prefeitura", "Portal", "Concurso Público",
         "CONCURSO PÚBLICO 2025", "DOWNLOADS DE DOCUMENTOS:",
@@ -54,6 +77,28 @@ def test_single_governing_event_with_document_children_is_detail():
         text, "concursos", title="Concurso Público 2025")
     assert state == "detalle_individual_rechazado"
     assert predicates["is_single_event_document_detail"] is True
+    assert predicates["has_structural_index_signals"] is False
+
+    page = C.Page(
+        url="https://cidadeexemplo.rs.gov.br/concurso/2025", status=200,
+        title="Concurso Público 2025", text=text,
+    )
+    candidate = C.candidate_from_evidence(
+        page.url, "fixture", "Concurso Público", "Cidade Exemplo", page,
+    )
+    assert candidate.fetchable is False
+
+
+def test_multiple_event_index_remains_official():
+    text = "\n".join([
+        "Prefeitura", "Concursos Públicos", "Lista de eventos",
+        "CONCURSO PÚBLICO Nº 01/2026", "Publicado em: 02/04/2026",
+        "CONCURSO PÚBLICO Nº 02/2025", "Publicado em: 02/03/2025",
+    ])
+    state, predicates = V.candidate_content_state(
+        text, "concursos", title="Concursos Públicos")
+    assert state == "indice_oficial"
+    assert predicates["has_event_listing"] is True
 
 
 def test_incomplete_content_stays_review():
