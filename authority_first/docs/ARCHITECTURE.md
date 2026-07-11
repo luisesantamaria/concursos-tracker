@@ -86,6 +86,10 @@ Tier 4 — Agente de navegacion (Playwright)
   paginas renderizadas por JS, portales embebidos.
   Costo: ~3-5s/pagina, ~300-500MB RAM.
   Reusa UNA instancia de browser para toda la corrida.
+  Cada candidata conserva un snapshot inmutable (HTML, URL final, titulo,
+  status y fuente) y lo pasa por los mismos gates del Candidate. Un snapshot
+  utilizable evita un segundo GET con requests; status ausente es neutral,
+  mientras un 4xx/5xx capturado se rechaza.
 ```
 
 ### Principios de la cascata

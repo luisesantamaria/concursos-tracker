@@ -56,7 +56,9 @@ if hasattr(sys.stderr, "reconfigure"):
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "shared"))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "eval"))
 import waf_guard  # noqa: E402
+import verdict_extract as verdict  # noqa: E402
 from browser_profile import REQUEST_HEADERS  # noqa: E402
 from playwright_net import new_context as new_browser_context  # noqa: E402
 
@@ -119,7 +121,7 @@ def clean_url(url: str) -> str:
 class Page:
     url: str
     requested_url: str = ""
-    status: int = 0
+    status: int | None = 0
     title: str = ""
     text: str = ""
     html: str = ""
@@ -130,16 +132,27 @@ class Page:
 
     @property
     def ok(self) -> bool:
-        return 200 <= self.status < 400 and not self.error
+        # A browser navigation may not expose a Response (SPA/client routing).
+        # Missing status is therefore neutral; captured 4xx/5xx still fail.
+        return not self.error and (
+            self.status is None or 200 <= self.status < 400
+        )
 
 
 @dataclass(frozen=True)
-class RenderedPage:
+class EvidenceSnapshot:
+    """Immutable evidence detached from the browser context that produced it."""
+
     html: str
     text: str
     title: str
     final_url: str
-    status: int = 200
+    status: int | None = None
+    source: str = "playwright"
+
+
+# Compatibility name for the existing Tier 0/Tier 2 browser fallback API.
+RenderedPage = EvidenceSnapshot
 
 
 _DEFAULT_RENDERER = object()
@@ -161,7 +174,7 @@ _FINGERPRINT_BLOCK_STATUSES = {403, 406, 409}
 _RATE_LIMIT_STATUSES = {429, 503}
 
 
-def _page_from_html(final_url: str, status: int, content_type: str,
+def _page_from_html(final_url: str, status: int | None, content_type: str,
                     html_text: str, requested_url: str = "") -> Page:
     if "text/html" not in content_type and "text/plain" not in content_type:
         return Page(
@@ -494,6 +507,64 @@ def _official_host(url: str, municipio: str) -> str:
     host = (urlparse(clean_url(url)).hostname or "").lower().rstrip(".")
     neutral = Page(url=clean_url(url), status=200)
     return host if is_matching_official_municipality_domain(neutral, municipio) else ""
+
+
+def _candidate_identity_matches(page: Page, municipio: str) -> bool:
+    """Validate municipal identity from the final URL and rendered content.
+
+    Official RS municipality hosts use the existing hostname/slug contract. A
+    delegated external portal must instead identify the target municipality in
+    its rendered title/body; a generic third party is not accepted by URL alone.
+    """
+    host = (urlparse(page.url).hostname or "").lower().rstrip(".")
+    if host.endswith(".rs.gov.br"):
+        return is_matching_official_municipality_domain(page, municipio)
+    municipality = norm(municipio)
+    identity_blob = norm(f"{page.title}\n{page.text[:3000]}")
+    return bool(municipality and municipality in identity_blob)
+
+
+def candidate_from_evidence(
+        requested_url: str, source: str, menu_text: str, municipio: str,
+        evidence: Page | EvidenceSnapshot) -> Candidate:
+    """Build and verify one Candidate from already-obtained evidence.
+
+    This is the canonical evidence seam for HTTP pages and browser snapshots.
+    It never fetches. Browser evidence therefore has strict precedence over a
+    second requests GET, while traversing the same deterministic content gates.
+    """
+    if isinstance(evidence, EvidenceSnapshot):
+        page = _page_from_html(
+            evidence.final_url, evidence.status, "text/html; charset=UTF-8",
+            evidence.html, requested_url=requested_url,
+        )
+        page.title = evidence.title or page.title
+        page.text = evidence.text or page.text
+        candidate_source = evidence.source
+    else:
+        page = evidence
+        candidate_source = source
+
+    final_url = clean_url(page.url or requested_url)
+    candidate = Candidate(
+        url=final_url, source=candidate_source, menu_text=menu_text,
+        page=page, content_preview=(page.text or "")[:1200], fetchable=False,
+    )
+    if (not page.ok or is_antibot_challenge(page) or is_soft_404(page)
+            or is_dead_site(page) or not _candidate_identity_matches(page, municipio)):
+        return candidate
+
+    anchors = [{"href": href, "text": text} for href, text in page.links]
+    states = [
+        verdict.candidate_content_state(
+            page.text, bucket, title=page.title, anchors=anchors,
+        )[0]
+        for bucket in ("concursos", "processos")
+    ]
+    # The final structural adjudicator is authoritative. This also preserves a
+    # valid combined index: either/both bucket states may be indice_oficial.
+    candidate.fetchable = "indice_oficial" in states
+    return candidate
 
 
 def fetch_page_with_official_fallback(
@@ -1706,7 +1777,7 @@ def render_page_sync(url: str) -> RenderedPage | None:
             text=browser_page.locator("body").inner_text(),
             title=browser_page.title(),
             final_url=browser_page.url,
-            status=response.status if response is not None else 0,
+            status=response.status if response is not None else None,
         )
     except Exception as e:
         print(f"      challenge render error: {e}", flush=True)
@@ -1766,6 +1837,27 @@ def _render_page_links(url: str, timeout: int = 20) -> list[tuple[str, str]]:
                 pass
 
 
+def _tier4_candidates_from_links(
+        relevant_links: list[tuple[str, str]], municipio: str,
+        render_page) -> list[Candidate]:
+    """Render and validate every Tier 4 link independently, without refetching."""
+    candidates: list[Candidate] = []
+    for href, menu_text in relevant_links:
+        if is_broad_landing(href) or is_pdf_or_file(href):
+            continue
+        try:
+            snapshot = render_page(href)
+        except Exception as e:
+            print(f"      playwright candidate render error: {e}", flush=True)
+            continue
+        if not snapshot:
+            continue
+        candidates.append(candidate_from_evidence(
+            href, "playwright", menu_text, municipio, snapshot,
+        ))
+    return candidates
+
+
 def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
     """Navigate the site like a human: open menus, follow relevant links."""
     try:
@@ -1779,6 +1871,7 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
     for kws in BUCKET_KEYWORDS.values():
         all_keywords.extend(kws)
 
+    context = None
     try:
         context = new_browser_context(
             browser,
@@ -1847,30 +1940,39 @@ def tier4_playwright_collect(url: str, municipio: str) -> list[Candidate]:
             except Exception:
                 pass
 
-        for href, text in relevant_links:
-            if is_broad_landing(href) or is_pdf_or_file(href):
-                continue
-            candidates.append(Candidate(
-                url=href, source="playwright", menu_text=text,
-            ))
+        def render_in_context(href: str) -> EvidenceSnapshot | None:
+            candidate_page = context.new_page()
+            try:
+                response = candidate_page.goto(
+                    href, wait_until="domcontentloaded", timeout=15000,
+                )
+                candidate_page.wait_for_timeout(1500)
+                return EvidenceSnapshot(
+                    html=candidate_page.content(),
+                    text=candidate_page.locator("body").inner_text(),
+                    title=candidate_page.title(),
+                    final_url=candidate_page.url,
+                    status=response.status if response is not None else None,
+                    source="playwright",
+                )
+            finally:
+                candidate_page.close()
+
+        candidates = _tier4_candidates_from_links(
+            relevant_links, municipio, render_in_context,
+        )
 
         page.close()
-        context.close()
     except Exception as e:
         print(f"      playwright error: {e}", flush=True)
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
 
     print(f"      playwright: {len(candidates)} candidates found", flush=True)
-
-    # Fetch content for Tier 3 classification
-    session = make_session()
-    for c in candidates:
-        pg = fetch_page(session, c.url, timeout=12)
-        if pg.ok and not is_soft_404(pg):
-            c.page = pg
-            c.content_preview = pg.text[:1200]
-            c.fetchable = True
-        else:
-            c.fetchable = False
 
     return candidates
 
