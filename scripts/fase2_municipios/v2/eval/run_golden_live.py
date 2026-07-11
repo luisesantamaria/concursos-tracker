@@ -62,6 +62,10 @@ from scripts.fase2_municipios.v2.eval.live_model_policy import (
     classify_error,
     load_model_credentials,
 )
+from scripts.fase2_municipios.v2.eval.live_observability import (
+    IncompleteRunTracker,
+    StageArtifactWriter,
+)
 from scripts.fase2_municipios.v2.eval.live_runtime import (
     EventLogger,
     LiveRunState,
@@ -458,6 +462,7 @@ def _result_from_outcome(
     start: str,
     end: str,
     duration_s: float,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     layer = outcome.layer
     a = layer.proposal_a.decision if layer is not None and layer.proposal_a else ""
@@ -497,7 +502,7 @@ def _result_from_outcome(
         "start": start,
         "end": end,
         "duration_s": round(duration_s, 6),
-        "attempt": 1,
+        "attempt": attempt,
         "error_class": error_class,
         "error_message": error_message,
         "A": a,
@@ -630,6 +635,14 @@ def run_golden_live(
     lock = RunnerLock(destination / "run_golden_live.lock", resume=resume)
     lock.acquire()
     logger: EventLogger | None = None
+    artifact_redactions = tuple(
+        value for name, value in environ.items()
+        if name in {"GEMINI_API_KEY_FREE", "GEMINI_API_KEY"}
+        and isinstance(value, str)
+    )
+    incomplete_tracker: IncompleteRunTracker | None = IncompleteRunTracker(
+        destination, targets, redactions=artifact_redactions
+    )
     try:
         logger = EventLogger(
             destination / "events.jsonl",
@@ -640,6 +653,10 @@ def run_golden_live(
             ),
         )
         state = LiveRunState(destination, resume=resume)
+        if hasattr(adapter, "set_artifact_writer"):
+            adapter.set_artifact_writer(StageArtifactWriter(
+                destination, redactions=artifact_redactions
+            ))
         current_unit: list[tuple[str, str]] = [("unknown", "unknown")]
 
         def observe(event: Mapping[str, Any]) -> None:
@@ -680,6 +697,9 @@ def run_golden_live(
                     provider="checkpoint", status="skipped",
                 )
             else:
+                attempt = state.next_attempt(municipio, bucket)
+                if hasattr(adapter, "set_attempt"):
+                    adapter.set_attempt(attempt)
                 start_wall = datetime.now(timezone.utc)
                 start_monotonic = time.monotonic()
                 try:
@@ -707,6 +727,7 @@ def run_golden_live(
                     start=start_wall.isoformat(),
                     end=end_wall.isoformat(),
                     duration_s=time.monotonic() - start_monotonic,
+                    attempt=attempt,
                 )
                 state.record_unit(
                     municipio=municipio,
@@ -727,6 +748,15 @@ def run_golden_live(
                     final=outcome.decision,
                 )
             outcomes.append(outcome)
+            incomplete_tracker.record_terminal(
+                (municipio, bucket),
+                status=(
+                    "error"
+                    if outcome.original_exception is not None or outcome.layer is None
+                    else "complete"
+                ),
+                decision=outcome.decision,
+            )
             now = time.monotonic()
             if now - last_heartbeat >= heartbeat_seconds or index == len(targets):
                 logger.heartbeat(
@@ -816,6 +846,8 @@ def run_golden_live(
             telemetry=telemetry,
         )
     finally:
+        if incomplete_tracker is not None:
+            incomplete_tracker.write_from_finally(sys.exception())
         if logger is not None:
             logger.close()
         lock.release()

@@ -39,6 +39,7 @@ from scripts.fase2_municipios.v2.agents import (
     build_conflict_judge,
     build_prosecutor_agent,
 )
+from scripts.fase2_municipios.v2.agents.base import SnapshotInvalidOutput
 from scripts.fase2_municipios.v2.eval.cassette_producer import (
     ABCLayer,
     CandidateLayer,
@@ -55,6 +56,7 @@ from scripts.fase2_municipios.v2.eval.live_model_policy import (
     SemanticModelError,
     classify_error,
 )
+from scripts.fase2_municipios.v2.eval.live_observability import StageArtifactWriter
 from scripts.fase2_municipios.v2.gemini import (
     GeminiClientError,
     RealGeminiTransport,
@@ -422,6 +424,10 @@ class _RecordingJudge:
 
 
 def _role_output(value: Any, role: str) -> Mapping[str, Any]:
+    if isinstance(value, SnapshotInvalidOutput):
+        raise ModelResponseValidationError(
+            f"{role}_invalid_output:{value.code}"
+        ) from value.original_exception
     output = getattr(value, "output", value)
     if not isinstance(output, Mapping) or not output:
         raise ModelResponseValidationError(f"{role}_empty_or_non_object")
@@ -490,6 +496,7 @@ class LiveABCAdapter:
         observer: Callable[[Mapping[str, Any]], None] | None = None,
         stage_transports: Mapping[str, PolicyTransport] | None = None,
         telemetry: ModelPolicyTelemetry | None = None,
+        artifact_writer: StageArtifactWriter | None = None,
     ) -> None:
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
             raise LiveABCConfigurationError("timeout_seconds_must_be_positive")
@@ -502,6 +509,8 @@ class LiveABCAdapter:
         self.observer = observer
         self.stage_transports = dict(stage_transports or {})
         self.telemetry = telemetry
+        self.artifact_writer = artifact_writer
+        self._artifact_attempt = 1
         self._outcomes: dict[tuple[str, str], LiveABCOutcome] = {}
 
     def set_observer(
@@ -510,6 +519,49 @@ class LiveABCAdapter:
         self.observer = observer
         if self.telemetry is not None:
             self.telemetry.set_observer(observer)
+
+    def set_artifact_writer(self, writer: StageArtifactWriter | None) -> None:
+        self.artifact_writer = writer
+
+    def set_attempt(self, attempt: int) -> None:
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+            raise ValueError("attempt must be a positive integer")
+        self._artifact_attempt = attempt
+
+    @staticmethod
+    def _snapshot_mapping(
+        municipio: str, bucket: str, snapshot: EvidenceSnapshot
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "unit": {"municipio": municipio, "bucket": bucket},
+            "sources": [
+                {
+                    "source_id": source.source_id,
+                    "url": source.url,
+                    "retrieved_at": source.retrieved_at.isoformat(),
+                    "content": source.content,
+                }
+                for source in snapshot.sources
+            ],
+        }
+
+    def _record_stage(
+        self, municipio: str, bucket: str, stage: str, state: str, *,
+        snapshot: EvidenceSnapshot | None = None, raw: Any = None,
+        raw_exists: bool = False, error: BaseException | None = None,
+    ) -> None:
+        if self.artifact_writer is None:
+            return
+        kwargs = {
+            "unit": (municipio, bucket), "attempt": self._artifact_attempt,
+            "stage": stage, "state": state, "error": error,
+        }
+        if snapshot is not None:
+            kwargs["snapshot"] = self._snapshot_mapping(municipio, bucket, snapshot)
+        if raw_exists:
+            kwargs["raw"] = raw
+        self.artifact_writer.record_stage(**kwargs)
 
     def _emit(self, **event: Any) -> None:
         if self.observer is not None:
@@ -542,11 +594,13 @@ class LiveABCAdapter:
             transport=transport,
             limiter=shared_limiter,
             models=models,
+            invocation_mode="direct",
         )
         prosecutor = build_prosecutor_agent(
             transport=transport,
             limiter=shared_limiter,
             models=models,
+            invocation_mode="direct",
         )
         judge_client = build_judge_client(
             transport=transport,
@@ -613,10 +667,12 @@ class LiveABCAdapter:
         }
         shared_limiter = limiter or get_shared_limiter()
         certifier = build_certifier_agent(
-            transport=policies["A"], limiter=shared_limiter, models=models
+            transport=policies["A"], limiter=shared_limiter, models=models,
+            invocation_mode="direct",
         )
         prosecutor = build_prosecutor_agent(
-            transport=policies["B"], limiter=shared_limiter, models=models
+            transport=policies["B"], limiter=shared_limiter, models=models,
+            invocation_mode="direct",
         )
         judge_client = build_judge_client(
             transport=policies["juez"], limiter=shared_limiter, models=models
@@ -744,6 +800,7 @@ class LiveABCAdapter:
         try:
             fetched = self.fetcher.fetch(url, timeout_seconds=self.timeout_seconds)
         except (ExternalAccessBlocked, TimeoutError) as exc:
+            self._record_stage(municipio, bucket, "fetch", "request_failed", error=exc)
             classified = classify_error(exc)
             self._emit(
                 stage="fetch", model="", provider="orion_http", status="error",
@@ -761,6 +818,7 @@ class LiveABCAdapter:
             self._outcomes[unit] = outcome
             return outcome
         except Exception as exc:
+            self._record_stage(municipio, bucket, "fetch", "request_failed", error=exc)
             classified = classify_error(exc)
             self._emit(
                 stage="fetch", model="", provider="orion_http", status="error",
@@ -793,7 +851,19 @@ class LiveABCAdapter:
                 != cascade._normalized_candidate_url(source.url)
             ):
                 raise SnapshotError("candidate_url_does_not_match_snapshot_origin")
+            self._record_stage(
+                municipio, bucket, "fetch", "raw_received", snapshot=snapshot,
+                raw={
+                    "requested_url": fetched.requested_url,
+                    "final_url": fetched.final_url,
+                    "status": fetched.status,
+                    "title": fetched.title,
+                }, raw_exists=True,
+            )
         except Exception as exc:
+            self._record_stage(
+                municipio, bucket, "fetch", "validation_failed", error=exc
+            )
             outcome = self._failure(
                 municipio,
                 bucket,
@@ -812,18 +882,15 @@ class LiveABCAdapter:
             provider="gemini_policy", status="start",
         )
         try:
-            certified = _role_output(
-                self.certifier.certify(
-                    snapshot=snapshot,
-                    task=self._task(municipio, bucket, candidate),
-                ),
-                "certifier",
+            certified_result = self.certifier.certify(
+                snapshot=snapshot,
+                task=self._task(municipio, bucket, candidate),
             )
-            proposal_a = ABCOrchestrator._proposal_from_certifier(
-                certified, (candidate,)
+        except ValidationError as exc:
+            self._record_stage(
+                municipio, bucket, "A", "validation_failed",
+                snapshot=snapshot, error=exc,
             )
-            proposal_a_layer = _proposal_layer(proposal_a)
-        except Exception as exc:
             classified = classify_error(exc)
             self._emit(
                 stage="A", model=models.certifier_model,
@@ -833,7 +900,75 @@ class LiveABCAdapter:
             )
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE, code=type(exc).__name__,
-                error=exc, phase="A",
+                error=exc, phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        except Exception as exc:
+            self._record_stage(
+                municipio, bucket, "A", "request_failed",
+                snapshot=snapshot, error=exc,
+            )
+            classified = classify_error(exc)
+            self._emit(
+                stage="A", model=models.certifier_model,
+                provider="gemini_policy", status="error",
+                error_class=classified.category.value,
+                error_message=type(exc).__name__,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="A",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+
+        certified_raw = getattr(certified_result, "raw", None)
+        if isinstance(certified_result, SnapshotInvalidOutput):
+            self._record_stage(
+                municipio, bucket, "A", "validation_failed", snapshot=snapshot,
+                raw=certified_raw, raw_exists=certified_raw is not None,
+                error=certified_result.original_exception,
+            )
+        else:
+            certified_raw = getattr(certified_result, "output", certified_result)
+            self._record_stage(
+                municipio, bucket, "A", "raw_received", snapshot=snapshot,
+                raw=certified_raw, raw_exists=True,
+            )
+        try:
+            certified = _role_output(certified_result, "certifier")
+        except ModelResponseValidationError as exc:
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        try:
+            proposal_a = ABCOrchestrator._proposal_from_certifier(
+                certified, (candidate,)
+            )
+            proposal_a_layer = _proposal_layer(proposal_a)
+        except ProposalValidationError as exc:
+            self._record_stage(
+                municipio, bucket, "A", "validation_failed", snapshot=snapshot,
+                raw=certified_raw, raw_exists=True, error=exc,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        except Exception as exc:
+            self._record_stage(
+                municipio, bucket, "A", "validation_failed", snapshot=snapshot,
+                raw=certified_raw, raw_exists=True, error=exc,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.INTERNAL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="abc_internal",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -848,18 +983,15 @@ class LiveABCAdapter:
             provider="gemini_policy", status="start",
         )
         try:
-            prosecuted = _role_output(
-                self.prosecutor.audit(
-                    snapshot=snapshot,
-                    certifier_output=certified,
-                ),
-                "prosecutor",
+            prosecuted_result = self.prosecutor.audit(
+                snapshot=snapshot,
+                certifier_output=certified,
             )
-            proposal_b = ABCOrchestrator._proposal_from_prosecutor(
-                prosecuted, proposal_a
+        except ValidationError as exc:
+            self._record_stage(
+                municipio, bucket, "B", "validation_failed",
+                snapshot=snapshot, error=exc,
             )
-            proposal_b_layer = _proposal_layer(proposal_b)
-        except Exception as exc:
             classified = classify_error(exc)
             self._emit(
                 stage="B", model=models.prosecutor_model,
@@ -869,7 +1001,75 @@ class LiveABCAdapter:
             )
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE, code=type(exc).__name__,
-                error=exc, phase="B",
+                error=exc, phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        except Exception as exc:
+            self._record_stage(
+                municipio, bucket, "B", "request_failed",
+                snapshot=snapshot, error=exc,
+            )
+            classified = classify_error(exc)
+            self._emit(
+                stage="B", model=models.prosecutor_model,
+                provider="gemini_policy", status="error",
+                error_class=classified.category.value,
+                error_message=type(exc).__name__,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="B",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+
+        prosecuted_raw = getattr(prosecuted_result, "raw", None)
+        if isinstance(prosecuted_result, SnapshotInvalidOutput):
+            self._record_stage(
+                municipio, bucket, "B", "validation_failed", snapshot=snapshot,
+                raw=prosecuted_raw, raw_exists=prosecuted_raw is not None,
+                error=prosecuted_result.original_exception,
+            )
+        else:
+            prosecuted_raw = getattr(prosecuted_result, "output", prosecuted_result)
+            self._record_stage(
+                municipio, bucket, "B", "raw_received", snapshot=snapshot,
+                raw=prosecuted_raw, raw_exists=True,
+            )
+        try:
+            prosecuted = _role_output(prosecuted_result, "prosecutor")
+        except ModelResponseValidationError as exc:
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        try:
+            proposal_b = ABCOrchestrator._proposal_from_prosecutor(
+                prosecuted, proposal_a
+            )
+            proposal_b_layer = _proposal_layer(proposal_b)
+        except ProposalValidationError as exc:
+            self._record_stage(
+                municipio, bucket, "B", "validation_failed", snapshot=snapshot,
+                raw=prosecuted_raw, raw_exists=True, error=exc,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        except Exception as exc:
+            self._record_stage(
+                municipio, bucket, "B", "validation_failed", snapshot=snapshot,
+                raw=prosecuted_raw, raw_exists=True, error=exc,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.INTERNAL_FAILURE,
+                code=type(exc).__name__, error=exc, phase="abc_internal",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -890,6 +1090,10 @@ class LiveABCAdapter:
                 proposal_b=proposal_b,
             )
         except Exception as exc:
+            self._record_stage(
+                municipio, bucket, "C", "request_failed",
+                snapshot=snapshot, error=exc,
+            )
             outcome = self._failure(
                 municipio,
                 bucket,
@@ -910,7 +1114,16 @@ class LiveABCAdapter:
                 "decision": "revisar",
                 "reason": "not_invoked_consensus",
             }
+            self._record_stage(
+                municipio, bucket, "C", "raw_received", snapshot=snapshot,
+                raw=judge_response, raw_exists=True,
+            )
         elif judge_outcome.decision is None:
+            self._record_stage(
+                municipio, bucket, "C", "validation_failed", snapshot=snapshot,
+                raw={"decision": None, "reason": judge_outcome.reason}, raw_exists=True,
+                error=judge_outcome.original_exception,
+            )
             outcome = self._failure(
                 municipio,
                 bucket,
@@ -926,6 +1139,10 @@ class LiveABCAdapter:
                 "decision": judge_outcome.decision,
                 "reason": judge_outcome.reason,
             }
+            self._record_stage(
+                municipio, bucket, "C", "raw_received", snapshot=snapshot,
+                raw=judge_response, raw_exists=True,
+            )
 
         selected_proposal = proposal_a_layer
         if judge_outcome is not None and judge_outcome.decision == "aceptar_B":

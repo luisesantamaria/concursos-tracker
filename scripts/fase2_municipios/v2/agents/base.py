@@ -91,10 +91,44 @@ class AgentRunResult:
     tool_calls: int
 
 
+@dataclass(frozen=True)
+class SnapshotInvalidOutput:
+    """Typed invocation-layer failure; deliberately carries no municipal decision."""
+
+    role: str
+    code: str
+    raw: Any | None = None
+    original_exception: BaseException | None = None
+
+
+def fail_closed_invocation_result(result: AgentRunResult | SnapshotInvalidOutput) -> str:
+    """Gate-level mapping kept separate from structured model invocation."""
+
+    if isinstance(result, SnapshotInvalidOutput):
+        return "revisar"
+    output = result.output
+    return str(output.get("decision", output.get("result", "revisar")))
+
+
 CitationExtractor = Callable[[Mapping[str, Any]], tuple[Citation, ...]]
 CitationRequirement = Callable[[Mapping[str, Any]], bool]
 OutputInvariant = Callable[[Mapping[str, Any]], None]
 OutputPreparer = Callable[[EvidenceSnapshot, Mapping[str, Any]], Mapping[str, Any]]
+
+
+def sanitized_response_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy a JSON Schema for ``response_json_schema`` without dialect markers."""
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): clean(item) for key, item in value.items()
+                if key != "$schema"
+            }
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        return value
+    return clean(schema)
 
 
 def skill_markdown_body(content: str) -> str:
@@ -126,6 +160,7 @@ class AgentRunner:
         max_tool_calls: int = 6,
         estimated_tokens: int = 4_000,
         tool_limits: ToolLimits | None = None,
+        tools: str | None = "local_snapshot",
     ) -> None:
         for name, value in (
             ("max_steps", max_steps),
@@ -146,6 +181,31 @@ class AgentRunner:
         self.max_tool_calls = max_tool_calls
         self.estimated_tokens = estimated_tokens
         self.tool_limits = tool_limits or ToolLimits()
+        if tools not in {None, "local_snapshot"}:
+            raise ValueError("tools must be None or local_snapshot")
+        self.tools = tools
+
+    def _direct_contents(self, snapshot: EvidenceSnapshot, task: str) -> list[dict[str, Any]]:
+        evidence = {
+            "snapshot_sha256": snapshot.snapshot_sha256,
+            "sources": [
+                {
+                    "source_id": source.source_id,
+                    "url": source.url,
+                    "retrieved_at": source.retrieved_at.isoformat(),
+                    "content": source.content,
+                }
+                for source in snapshot.sources
+            ],
+        }
+        return [
+            {"role": "system", "parts": [{"text": self.system_prompt}]},
+            {"role": "user", "parts": [{"text": task}]},
+            {"role": "user", "parts": [{
+                "text": "FROZEN_EVIDENCE_SNAPSHOT="
+                + json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+            }]},
+        ]
 
     def _initial_contents(
         self, snapshot: EvidenceSnapshot, task: str, tools: LocalSnapshotTools
@@ -237,7 +297,30 @@ class AgentRunner:
                 role=self.role, reason=f"citation_verification_failed:{failure_count}"
             ) from exc
 
-    def run(self, *, snapshot: EvidenceSnapshot, task: str) -> AgentRunResult:
+    def _run_direct(
+        self, *, snapshot: EvidenceSnapshot, task: str
+    ) -> AgentRunResult | SnapshotInvalidOutput:
+        raw: Any | None = None
+        try:
+            raw = self.client.generate_structured(
+                self._direct_contents(snapshot, task),
+                estimated_tokens=self.estimated_tokens,
+            )
+            if not isinstance(raw, Mapping):
+                raise AgentOutputRejected(role=self.role, reason="direct_output_not_object")
+            parsed_output = self._validate_final(snapshot, raw)
+            return AgentRunResult(
+                role=self.role, output=parsed_output, steps=1, tool_calls=0
+            )
+        except (SchemaValidationError, AgentOutputRejected) as exc:
+            return SnapshotInvalidOutput(
+                role=self.role,
+                code=type(exc).__name__,
+                raw=raw,
+                original_exception=exc,
+            )
+
+    def _run_tool_loop(self, *, snapshot: EvidenceSnapshot, task: str) -> AgentRunResult:
         tools = LocalSnapshotTools(snapshot, self.tool_limits)
         contents = self._initial_contents(snapshot, task, tools)
         tool_calls = 0
@@ -323,3 +406,10 @@ class AgentRunner:
             steps=self.max_steps,
             tool_calls=tool_calls,
         )
+
+    def run(
+        self, *, snapshot: EvidenceSnapshot, task: str
+    ) -> AgentRunResult | SnapshotInvalidOutput:
+        if self.tools is None:
+            return self._run_direct(snapshot=snapshot, task=task)
+        return self._run_tool_loop(snapshot=snapshot, task=task)

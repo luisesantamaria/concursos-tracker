@@ -10,6 +10,7 @@ from typing import Any
 from scripts.fase2_municipios.v2.agents.base import (
     AgentOutputRejected,
     AgentRunner,
+    sanitized_response_schema,
     skill_markdown_body,
 )
 from scripts.fase2_municipios.v2.agents.schemas import AGENT_STEP_SCHEMA
@@ -99,7 +100,11 @@ def build_certifier_agent(
     max_tool_calls: int = 6,
     estimated_tokens: int = 4_000,
     tool_limits: ToolLimits | None = None,
+    invocation_mode: str = "tool_loop",
 ) -> CertifierAgent:
+    if invocation_mode not in {"tool_loop", "direct"}:
+        raise ValueError("invalid invocation_mode")
+    tools = None if invocation_mode == "direct" else "local_snapshot"
     resources = load_canonical_resources(
         repo_root=repo_root,
         skills_dir=skills_dir,
@@ -110,7 +115,9 @@ def build_certifier_agent(
         transport=transport,
         limiter=limiter,
         model=role_models.certifier_model,
-        response_schema=AGENT_STEP_SCHEMA,
+        response_schema=sanitized_response_schema(
+            resources.references["schema.json"] if tools is None else AGENT_STEP_SCHEMA
+        ),
     )
     runner = AgentRunner(
         role="certifier",
@@ -128,5 +135,6 @@ def build_certifier_agent(
         max_tool_calls=max_tool_calls,
         estimated_tokens=estimated_tokens,
         tool_limits=tool_limits,
+        tools=tools,
     )
     return CertifierAgent(runner)

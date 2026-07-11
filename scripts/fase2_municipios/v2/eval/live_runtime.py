@@ -382,6 +382,16 @@ class LiveRunState:
             and self._valid_snapshot(record)
         )
 
+    def next_attempt(self, municipio: str, bucket: str) -> int:
+        """Return a stable per-unit attempt number across resumptions."""
+
+        record = self._checkpoint["units"].get(unit_storage_key(municipio, bucket), {})
+        result = record.get("result", {}) if isinstance(record, Mapping) else {}
+        previous = result.get("attempt", 0) if isinstance(result, Mapping) else 0
+        if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
+            previous = 0
+        return previous + 1
+
     def load_satisfactory_result(self, municipio: str, bucket: str) -> Mapping[str, Any]:
         if not self.should_skip(municipio, bucket):
             raise LiveRuntimeError("unit_not_safely_resumable")
