@@ -291,17 +291,18 @@ La implementación vive en `scripts/fase2_municipios/v2/gemini/`. El cliente
 genérico `StructuredGeminiClient` recibe un `Transport`, limiter, modelo y
 `response_schema`; no conoce roles ni loader. `Transport.generate(model,
 contents, config)` no maneja credenciales y devuelve `RawResponse` con texto y
-tokens de prompt/candidatos/total. Solo `RealGeminiTransport(api_key)` recibe la
-key explícita en construcción, importa perezosamente `google.genai` y construye
-el SDK únicamente con `api_key=...`; Vertex, ADC y gcloud no tienen fallback ni
-constructor alternativo.
+tokens de prompt/candidatos/total. `build_gemini_client()` es el único choke
+point V2: recibe un transporte inyectado o resuelve el entorno en cada llamada,
+sin caché al importar. Solo `RealGeminiTransport(api_key)` recibe la key
+explícita, importa perezosamente `google.genai` y construye el SDK con
+`api_key=...` y `vertexai=False`; Vertex, ADC y gcloud no tienen fallback.
 
 `resolve_free_api_key()` usa exclusivamente `GEMINI_API_KEY_FREE`. Antes de leer
-esa variable, inspecciona por membresía/nombre —nunca por valor—
-`GEMINI_API_KEY`, nombres `GEMINI_*`/`GOOGLE_*` que contengan `PAID` o `PAGO`,
-`GOOGLE_API_KEY` y `GOOGLE_APPLICATION_CREDENTIALS`. Cualquier presencia produce
-`PaidKeyForbiddenError`; ausencia o vacío de la key free produce
-`MissingFreeApiKeyError`. No existe default implícito ni fallback pago.
+esa variable, inspecciona por membresía —nunca por valor y en precedencia fija—
+`GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_API_KEY` y `GEMINI_API_KEY`.
+Cualquier presencia, incluso con whitespace, produce
+`UnauthorizedCredentialError`; ausencia o valor vacío/whitespace de la key free
+produce `MissingFreeApiKeyError`. No existe default implícito ni fallback.
 
 Grounding está apagado por construcción: overrides superiores usan allowlist y
 `_guard_grounding()` recorre mappings, listas, dataclasses y objetos tipados para
@@ -347,9 +348,11 @@ caller, contenido renderizado crudo y SHA-256 calculado sobre `content.encode(
 hash es el SHA-256 estándar de `b""`; es evidencia reproducible, aunque no puede
 sostener una cita no vacía.
 
-`build_snapshot()` rechaza IDs vacíos o duplicados, reconstruye defensivamente
-cada fuente, recalcula hashes, ordena por `source_id` y expone únicamente una
-tupla. `snapshot_sha256` es SHA-256 del JSON UTF-8 compacto de pares ordenados
+`build_snapshot()` rechaza IDs vacíos, duplicados o ajenos a la allowlist
+discreta de roles oficiales V2 (`main`, `main_content`, `title`, `chrome`,
+`page`); el mismo tripwire se aplica al entrar citas. Reconstruye defensivamente
+cada fuente, recalcula hashes, ordena por `source_id` y expone una tupla.
+`snapshot_sha256` es SHA-256 del JSON UTF-8 compacto de pares ordenados
 `[source_id, content_sha256]`. `EvidenceSnapshot` vuelve a comprobar orden,
 unicidad y ambos niveles de hash en `__post_init__`; `get_source()` hace lookup
 sin exponer un dict mutable.
@@ -582,14 +585,17 @@ certificador, fiscal, juez, gate u orquestador.
 
 ## Invariantes de seguridad
 
-- Free-only: V2 usa únicamente la credencial gratuita explícita. Está prohibido
-  leer o usar `GEMINI_API_KEY_PAID`, usar `GEMINI_API_KEY` como fallback o llamar
-  cualquier ruta/modelo pago. Ante cuota o error, espera/falla de forma tipada;
-  nunca degrada a pago.
+- Free-only: V2 usa únicamente `GEMINI_API_KEY_FREE` explícita. La presencia de
+  `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_API_KEY` o `GEMINI_API_KEY` es una
+  credencial no autorizada y aborta antes de construir el SDK. Ante cuota o
+  error, espera/falla de forma tipada; nunca degrada a otra credencial.
 - El juez no consulta `os.environ`, ADC ni nombres de credenciales: recibe el
   cliente free estructurado ya construido e inyectado.
 - Grounding siempre off: ningún payload incorpora Google Search ni herramientas
   externas. Las tools permitidas operan contra evidencia local/congelada.
+- La suite V2 instala un guard autouse de sesión que bloquea `connect`,
+  `connect_ex` y `create_connection` fuera de loopback/AF_UNIX y contabiliza cada
+  intento bloqueado para pruebas offline.
 - Structured output obligatorio, seguido de validación estricta contra el schema
   de salida correspondiente; JSON inválido no se reinterpreta heurísticamente.
 - Snapshot, candidatas y outputs de agentes son datos no confiables; su contenido

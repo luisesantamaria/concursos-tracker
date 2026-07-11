@@ -16,7 +16,7 @@ from scripts.fase2_municipios.v2.agents.schemas import AGENT_STEP_SCHEMA
 from scripts.fase2_municipios.v2.agents.tools import ToolLimits
 from scripts.fase2_municipios.v2.gemini import (
     RoleModels,
-    StructuredGeminiClient,
+    build_gemini_client,
     Transport,
 )
 from scripts.fase2_municipios.v2.loader import load_canonical_resources
@@ -106,7 +106,7 @@ def build_certifier_agent(
         references_dir=references_dir,
     )
     role_models = models or RoleModels()
-    client = StructuredGeminiClient(
+    client = build_gemini_client(
         transport=transport,
         limiter=limiter,
         model=role_models.certifier_model,

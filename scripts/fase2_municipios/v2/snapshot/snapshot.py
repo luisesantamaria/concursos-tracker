@@ -19,6 +19,7 @@ from datetime import datetime
 
 
 QUOTE_PREVIEW_LIMIT = 48
+OFFICIAL_SOURCE_IDS = frozenset({"main", "main_content", "title", "chrome", "page"})
 
 
 class SnapshotError(ValueError):
@@ -29,6 +30,17 @@ class DuplicateSourceError(SnapshotError):
     def __init__(self, source_id: str) -> None:
         self.source_id = source_id
         super().__init__(f"duplicate source_id: {source_id}")
+
+
+class SourceNotAllowedError(SnapshotError):
+    def __init__(self, source_id: str) -> None:
+        self.source_id = source_id
+        super().__init__(f"source_id fuera de allowlist oficial V2: {source_id}")
+
+
+def _assert_source_allowed(source_id: str) -> None:
+    if source_id not in OFFICIAL_SOURCE_IDS:
+        raise SourceNotAllowedError(source_id)
 
 
 def _quote_preview(quote: str) -> str:
@@ -84,6 +96,7 @@ class EvidenceSource:
     def __post_init__(self) -> None:
         if not isinstance(self.source_id, str) or not self.source_id.strip():
             raise SnapshotError("source_id must be a non-empty string")
+        _assert_source_allowed(self.source_id)
         if not isinstance(self.url, str) or not self.url.strip():
             raise SnapshotError(f"url must be non-empty for source_id={self.source_id}")
         if not isinstance(self.retrieved_at, datetime):
@@ -188,6 +201,7 @@ class Citation:
             raise CitationVerificationError(
                 source_id=str(self.source_id), reason="invalid_source_id"
             )
+        _assert_source_allowed(self.source_id)
         if not isinstance(self.quote, str) or not self.quote:
             raise CitationVerificationError(
                 source_id=self.source_id, reason="empty_quote"
@@ -236,6 +250,7 @@ def anchor_citation(
         raise CitationVerificationError(
             source_id=str(source_id), reason="invalid_source_id"
         )
+    _assert_source_allowed(source_id)
     if not isinstance(quote, str) or not quote:
         raise CitationVerificationError(source_id=source_id, reason="empty_quote")
     if has_start != has_end:

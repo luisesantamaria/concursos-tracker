@@ -18,7 +18,7 @@ from scripts.fase2_municipios.v2.agents.schemas import (
     PROSECUTOR_OUTPUT_SCHEMA,
 )
 from scripts.fase2_municipios.v2.agents.tools import ToolLimits
-from scripts.fase2_municipios.v2.gemini import RoleModels, StructuredGeminiClient, Transport
+from scripts.fase2_municipios.v2.gemini import RoleModels, Transport, build_gemini_client
 from scripts.fase2_municipios.v2.loader import load_canonical_resources
 from scripts.fase2_municipios.v2.snapshot import (
     Citation,
@@ -155,7 +155,7 @@ def build_prosecutor_agent(
         references_dir=references_dir,
     )
     role_models = models or RoleModels()
-    client = StructuredGeminiClient(
+    client = build_gemini_client(
         transport=transport,
         limiter=limiter,
         model=role_models.prosecutor_model,

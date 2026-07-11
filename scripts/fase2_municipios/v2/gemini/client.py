@@ -25,15 +25,11 @@ from scripts.fase2_municipios.v2.loader import load_canonical_resources
 
 LOGGER = logging.getLogger(__name__)
 FREE_API_KEY_ENV = "GEMINI_API_KEY_FREE"
-FORBIDDEN_ENV_NAMES = frozenset({
-    "GEMINI_API_KEY",
-    "GEMINI_API_KEY_PAID",
-    "GEMINI_API_KEY_PAGO",
-    "GOOGLE_API_KEY",
-    "GOOGLE_API_KEY_PAID",
-    "GOOGLE_API_KEY_PAGO",
+FORBIDDEN_ENV_NAMES = (
     "GOOGLE_APPLICATION_CREDENTIALS",
-})
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+)
 FORBIDDEN_CONFIG_KEYS = frozenset({
     "tools",
     "googlesearch",
@@ -56,16 +52,16 @@ class GeminiClientError(RuntimeError):
     """Base class for secret-free, auditable client failures."""
 
 
-class PaidKeyForbiddenError(GeminiClientError):
+class UnauthorizedCredentialError(GeminiClientError):
     def __init__(self, variable_name: str) -> None:
         self.variable_name = variable_name
-        super().__init__(f"forbidden credential variable is present: {variable_name}")
+        super().__init__(f"credencial no autorizada presente: {variable_name}")
 
 
 class MissingFreeApiKeyError(GeminiClientError):
     def __init__(self, variable_name: str = FREE_API_KEY_ENV) -> None:
         self.variable_name = variable_name
-        super().__init__(f"required free credential variable is absent: {variable_name}")
+        super().__init__(f"credencial libre requerida ausente o vacía: {variable_name}")
 
 
 class GroundingForbiddenError(GeminiClientError):
@@ -151,26 +147,11 @@ class RoleModels:
     judge_model: str = "gemini-3.5-flash"
 
 
-def _is_forbidden_credential_name(name: str) -> bool:
-    upper = name.upper()
-    if upper in FORBIDDEN_ENV_NAMES:
-        return True
-    return (
-        upper.startswith(("GEMINI_", "GOOGLE_"))
-        and ("PAID" in upper or "PAGO" in upper)
-    )
-
-
 def assert_no_forbidden_credentials(environ: Mapping[str, str]) -> None:
-    """Inspect credential-domain names only; never access forbidden values."""
-    domain_names = sorted(
-        name
-        for name in environ.keys()
-        if name.upper().startswith(("GEMINI_", "GOOGLE_"))
-    )
-    for name in domain_names:
-        if _is_forbidden_credential_name(name) and name in environ:
-            raise PaidKeyForbiddenError(name)
+    """Apply fixed policy precedence without reading forbidden values."""
+    for name in FORBIDDEN_ENV_NAMES:
+        if name in environ:
+            raise UnauthorizedCredentialError(name)
 
 
 def resolve_free_api_key(environ: Mapping[str, str] | None = None) -> str:
@@ -180,7 +161,7 @@ def resolve_free_api_key(environ: Mapping[str, str] | None = None) -> str:
     if FREE_API_KEY_ENV not in environment:
         raise MissingFreeApiKeyError()
     free_key = environment[FREE_API_KEY_ENV]
-    if not isinstance(free_key, str) or not free_key:
+    if not isinstance(free_key, str) or not free_key.strip():
         raise MissingFreeApiKeyError()
     return free_key
 
@@ -189,18 +170,19 @@ class RealGeminiTransport:
     """Lazy SDK adapter configured only with an explicit free API key.
 
     Vertex, ADC and gcloud credential discovery have no constructor seam. The
-    adapter rejects forbidden credential variable names before importing the SDK.
+    V2 factory applies credential policy before constructing this adapter.
     """
 
-    def __init__(self, api_key: str) -> None:
-        if not isinstance(api_key, str) or not api_key:
+    def __init__(self, api_key: str, *, client_factory=None) -> None:
+        if not isinstance(api_key, str) or not api_key.strip():
             raise MissingFreeApiKeyError()
-        assert_no_forbidden_credentials(os.environ)
-        try:
-            from google import genai  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise TransportConfigurationError("Gemini SDK is not installed") from exc
-        self._client = genai.Client(api_key=api_key)
+        if client_factory is None:
+            try:
+                from google import genai  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise TransportConfigurationError("Gemini SDK is not installed") from exc
+            client_factory = genai.Client
+        self._client = client_factory(api_key=api_key, vertexai=False)
 
     def generate(self, model: str, contents: Any, config: Mapping[str, Any]) -> RawResponse:
         response = self._client.models.generate_content(
@@ -388,6 +370,32 @@ class StructuredGeminiClient:
         return parsed
 
 
+def build_gemini_client(
+    *,
+    limiter: RateLimiterLike,
+    model: str,
+    response_schema: Mapping[str, Any],
+    transport: Transport | None = None,
+    environ: Mapping[str, str] | None = None,
+    sdk_client_factory=None,
+    max_attempts: int = 3,
+) -> StructuredGeminiClient:
+    """The single V2 client choke point; environment is resolved per call."""
+    selected_transport = transport
+    if selected_transport is None:
+        api_key = resolve_free_api_key(environ)
+        selected_transport = RealGeminiTransport(
+            api_key, client_factory=sdk_client_factory
+        )
+    return StructuredGeminiClient(
+        transport=selected_transport,
+        limiter=limiter,
+        model=model,
+        response_schema=response_schema,
+        max_attempts=max_attempts,
+    )
+
+
 def build_certifier_client(
     *,
     transport: Transport,
@@ -405,7 +413,7 @@ def build_certifier_client(
         references_dir=references_dir,
     )
     role_models = models or RoleModels()
-    return StructuredGeminiClient(
+    return build_gemini_client(
         transport=transport,
         limiter=limiter,
         model=role_models.certifier_model,
@@ -425,7 +433,7 @@ def build_judge_client(
     from scripts.fase2_municipios.v2.agents.schemas import JUDGE_OUTPUT_SCHEMA
 
     role_models = models or RoleModels()
-    return StructuredGeminiClient(
+    return build_gemini_client(
         transport=transport,
         limiter=limiter,
         model=role_models.judge_model,

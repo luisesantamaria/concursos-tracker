@@ -15,7 +15,7 @@ from scripts.fase2_municipios.v2.gemini import (
     FREE_API_KEY_ENV,
     GroundingForbiddenError,
     MissingFreeApiKeyError,
-    PaidKeyForbiddenError,
+    UnauthorizedCredentialError,
     RawResponse,
     RetryExhaustedError,
     SchemaValidationError,
@@ -24,6 +24,7 @@ from scripts.fase2_municipios.v2.gemini import (
     TransientTransportError,
     UsageInconsistencyError,
     build_certifier_client,
+    build_gemini_client,
     resolve_free_api_key,
 )
 from scripts.fase2_municipios.v2.ratelimit import (
@@ -64,7 +65,7 @@ class EnvSpy(Mapping[str, str]):
 
     def __getitem__(self, key: str) -> str:
         self.value_reads.append(key)
-        if "PAID" in key or "PAGO" in key or key == "GOOGLE_APPLICATION_CREDENTIALS":
+        if key in {"GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_API_KEY", "GEMINI_API_KEY"}:
             raise AssertionError(f"forbidden credential value read: {key}")
         return self.values[key]
 
@@ -160,17 +161,19 @@ def generic_client(
     )
 
 
-def test_paid_variable_presence_never_reads_its_value() -> None:
-    environ = EnvSpy({
-        FREE_API_KEY_ENV: "free-secret",
-        "GEMINI_TEAM_PAID_TOKEN": "must-never-be-read",
-    })
+@pytest.mark.parametrize(
+    "variable_name",
+    ["GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
+)
+def test_unauthorized_variable_presence_never_reads_its_value(variable_name: str) -> None:
+    environ = EnvSpy({FREE_API_KEY_ENV: "free-secret", variable_name: " "})
 
-    with pytest.raises(PaidKeyForbiddenError) as raised:
+    with pytest.raises(UnauthorizedCredentialError) as raised:
         resolve_free_api_key(environ)
 
-    assert raised.value.variable_name == "GEMINI_TEAM_PAID_TOKEN"
-    assert "GEMINI_TEAM_PAID_TOKEN" in environ.membership_checks
+    assert raised.value.variable_name == variable_name
+    assert str(raised.value) == f"credencial no autorizada presente: {variable_name}"
+    assert variable_name in environ.membership_checks
     assert environ.value_reads == []
 
 
@@ -182,6 +185,54 @@ def test_missing_free_key_is_fail_safe_and_exact_free_name_is_used() -> None:
     environ = EnvSpy({FREE_API_KEY_ENV: "explicit-free-key"})
     assert resolve_free_api_key(environ) == "explicit-free-key"
     assert environ.value_reads == [FREE_API_KEY_ENV]
+
+
+@pytest.mark.parametrize("free_value", ["", "   ", "\t\n"])
+def test_empty_or_whitespace_free_key_is_rejected(free_value: str) -> None:
+    with pytest.raises(MissingFreeApiKeyError, match="ausente o vacía"):
+        resolve_free_api_key(EnvSpy({FREE_API_KEY_ENV: free_value}))
+
+
+def test_unauthorized_credential_precedes_missing_free_key() -> None:
+    with pytest.raises(UnauthorizedCredentialError) as raised:
+        resolve_free_api_key(EnvSpy({"GOOGLE_API_KEY": " "}))
+    assert raised.value.variable_name == "GOOGLE_API_KEY"
+
+
+@pytest.mark.parametrize(
+    "variable_name",
+    ["GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_API_KEY", "GEMINI_API_KEY"],
+)
+def test_unauthorized_credential_prevents_sdk_construction(variable_name: str) -> None:
+    calls = []
+    with pytest.raises(UnauthorizedCredentialError):
+        build_gemini_client(
+            limiter=RecordingLimiter(),
+            model="fixture-model",
+            response_schema={"type": "object"},
+            environ={FREE_API_KEY_ENV: "free", variable_name: " "},
+            sdk_client_factory=lambda **kwargs: calls.append(kwargs),
+        )
+    assert calls == []
+
+
+def test_real_client_factory_uses_explicit_free_key_and_disables_vertex_adc() -> None:
+    calls = []
+
+    def sdk_factory(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    client = build_gemini_client(
+        limiter=RecordingLimiter(),
+        model="fixture-model",
+        response_schema={"type": "object"},
+        environ={FREE_API_KEY_ENV: " explicit-free-key "},
+        sdk_client_factory=sdk_factory,
+    )
+
+    assert isinstance(client, StructuredGeminiClient)
+    assert calls == [{"api_key": " explicit-free-key ", "vertexai": False}]
 
 
 def test_nested_grounding_is_rejected_before_limiter_or_transport() -> None:
@@ -199,6 +250,15 @@ def test_nested_grounding_is_rejected_before_limiter_or_transport() -> None:
     assert "google_search" in raised.value.path
     assert limiter.events == []
     assert transport.calls == []
+
+
+def test_generated_request_config_never_contains_grounding_or_tools() -> None:
+    transport = FakeTransport([response({"ok": True})])
+    client = generic_client(transport, RecordingLimiter())
+    assert client.generate_structured("offline", estimated_tokens=10) == {"ok": True}
+    config = transport.calls[0][1]
+    forbidden = {"tools", "google_search", "google_search_retrieval", "grounding"}
+    assert forbidden.isdisjoint(config)
 
 
 def test_canonical_certifier_schema_accepts_valid_response() -> None:

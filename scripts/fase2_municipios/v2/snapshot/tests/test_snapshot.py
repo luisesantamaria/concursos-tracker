@@ -14,6 +14,7 @@ from scripts.fase2_municipios.v2.snapshot import (
     CitationVerificationError,
     DuplicateSourceError,
     EvidenceSource,
+    SourceNotAllowedError,
     build_snapshot,
     verify_all,
     verify_citation,
@@ -22,9 +23,11 @@ from scripts.fase2_municipios.v2.snapshot import (
 
 pytestmark = pytest.mark.offline
 RETRIEVED_AT = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+TEST_SOURCE_IDS = {"a": "main", "b": "title", "c": "chrome", "same": "main", "known": "main", "empty": "main"}
 
 
 def source(source_id: str, content: str, *, url: str | None = None) -> EvidenceSource:
+    source_id = TEST_SOURCE_IDS.get(source_id, source_id)
     return EvidenceSource(
         source_id=source_id,
         url=url or f"https://example.invalid/{source_id}",
@@ -63,7 +66,14 @@ def test_snapshot_and_sources_are_deeply_immutable() -> None:
 def test_duplicate_source_id_is_rejected() -> None:
     with pytest.raises(DuplicateSourceError) as raised:
         build_snapshot([source("same", "one"), source("same", "two")])
-    assert raised.value.source_id == "same"
+    assert raised.value.source_id == "main"
+
+
+def test_source_allowlist_tripwire_accepts_official_role_and_rejects_foreign() -> None:
+    assert source("main", "official").source_id == "main"
+    with pytest.raises(SourceNotAllowedError, match="allowlist oficial V2") as raised:
+        source("radar_portal", "foreign")
+    assert raised.value.source_id == "radar_portal"
 
 
 def test_exact_textual_quote_passes_and_missing_quote_fails() -> None:
@@ -78,9 +88,8 @@ def test_exact_textual_quote_passes_and_missing_quote_fails() -> None:
 
 def test_unknown_source_is_fail_closed() -> None:
     snapshot = build_snapshot([source("known", "evidence")])
-    with pytest.raises(CitationVerificationError) as raised:
+    with pytest.raises(SourceNotAllowedError) as raised:
         anchor_citation(snapshot, {"source_id": "missing", "quote": "evidence"})
-    assert raised.value.reason == "source_not_found"
     assert raised.value.source_id == "missing"
 
 
@@ -172,11 +181,11 @@ def test_invalid_offset_types_are_rejected(start: object, end: object) -> None:
 def test_absent_or_empty_source_is_rejected_without_crashing() -> None:
     snapshot = build_snapshot([source("empty", "")])
     with pytest.raises(CitationVerificationError) as empty:
-        anchor_citation(snapshot, {"source_id": "empty", "quote": "x"})
+        anchor_citation(snapshot, {"source_id": "main", "quote": "x"})
     assert empty.value.reason == "empty_source"
-    with pytest.raises(CitationVerificationError) as absent:
+    with pytest.raises(SourceNotAllowedError) as absent:
         anchor_citation(snapshot, {"source_id": "absent", "quote": "x"})
-    assert absent.value.reason == "source_not_found"
+    assert absent.value.source_id == "absent"
 
 
 def test_unicode_offsets_are_python_str_character_indices() -> None:

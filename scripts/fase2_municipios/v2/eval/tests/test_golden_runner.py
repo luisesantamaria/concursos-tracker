@@ -335,7 +335,7 @@ def test_existing_golden_evaluator_is_called_for_parity(
         {"provider": "paid"},
         {"judge_model": "wrong-model"},
         {"tools": [{"google_search": {}}]},
-        {"environ": {"GEMINI_API_KEY_FREE": "free", "GEMINI_API_KEY_PAID": "paid"}},
+        {"environ": {"GEMINI_API_KEY_FREE": "free", "GOOGLE_API_KEY": "unauthorized"}},
         {"environ": {"GEMINI_API_KEY_FREE": "free", "GOOGLE_APPLICATION_CREDENTIALS": "/adc"}},
     ],
 )
@@ -372,6 +372,22 @@ def test_replay_never_reads_credentials_or_network(tmp_path: Path, monkeypatch) 
     }))
     artifact = make_runner().run_replay(golden_path=golden, corpus_path=replay)
     assert artifact["rows"]
+
+
+def test_v2_replay_e2e_has_coherent_final_decision_and_zero_external_attempts(
+    network_guard_spy,
+) -> None:
+    network_guard_spy.reset()
+    fixture_dir = Path(__file__).parent / "fixtures"
+    artifact = make_runner().run_replay(
+        golden_path=fixture_dir / "synthetic_golden.csv",
+        corpus_path=fixture_dir / "synthetic_replay_corpus.json",
+    )
+
+    assert runner_module.LiveContract.valid_for_tests().tools is None
+    assert artifact["rows"][0]["v2"]["decision"] == "indice_oficial"
+    assert artifact["rows"][0]["v2"]["url"]
+    assert network_guard_spy.blocked_attempts == 0
 
 
 def test_cli_help_works() -> None:
