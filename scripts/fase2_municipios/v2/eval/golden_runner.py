@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from scripts.eval import medir_golden_set as golden_evaluator
+from scripts.fase2_municipios.v2.eval.coverage_schema import (
+    CoverageSchemaError,
+    SinCoberturaV1Unit,
+    canonical_sin_cobertura_v1,
+    coverage_summary,
+)
 from scripts.fase2_municipios import cascade_municipios as cascade
 from scripts.fase2_municipios.v2.agents import ABCOrchestrator, ConflictJudge
 from scripts.fase2_municipios.v2.gemini import (
@@ -102,7 +108,13 @@ class JsonReplayFetchAdapter:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
 
-    def cases(self) -> tuple[Mapping[str, Any], ...]:
+    def document(
+        self,
+    ) -> tuple[
+        tuple[Mapping[str, Any], ...],
+        tuple[SinCoberturaV1Unit, ...],
+        Mapping[str, Any] | None,
+    ]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -112,7 +124,25 @@ class JsonReplayFetchAdapter:
         cases = raw.get("cases")
         if not isinstance(cases, list):
             raise ReplayEvidenceError("replay corpus cases must be a list")
-        return tuple(cases)
+        exclusions_raw = raw.get("sin_cobertura_v1", [])
+        if not isinstance(exclusions_raw, list):
+            raise ReplayEvidenceError("sin_cobertura_v1 must be a list")
+        try:
+            exclusions = canonical_sin_cobertura_v1(exclusions_raw)
+        except CoverageSchemaError as exc:
+            raise ReplayEvidenceError(str(exc)) from exc
+        coverage = raw.get("coverage")
+        if coverage is not None and (
+            not isinstance(coverage, Mapping)
+            or set(coverage) != {"total", "covered", "sin_cobertura_v1"}
+        ):
+            raise ReplayEvidenceError("coverage fields invalid")
+        if exclusions and coverage is None:
+            raise ReplayEvidenceError("coverage missing for sin_cobertura_v1")
+        return tuple(cases), exclusions, coverage
+
+    def cases(self) -> tuple[Mapping[str, Any], ...]:
+        return self.document()[0]
 
 
 class CassetteModelAdapter:
@@ -493,7 +523,9 @@ class GoldenDifferentialRunner:
         injected_now = self.clock.now()
         if not isinstance(injected_now, datetime):
             raise ReplayEvidenceError("clock must return datetime")
-        cases = JsonReplayFetchAdapter(corpus_path).cases()
+        cases, excluded_units, declared_coverage = JsonReplayFetchAdapter(
+            corpus_path
+        ).document()
         by_unit: dict[tuple[str, str], Mapping[str, Any]] = {}
         for case in cases:
             if not isinstance(case, Mapping):
@@ -509,20 +541,29 @@ class GoldenDifferentialRunner:
                 raise ReplayEvidenceError(f"duplicate replay unit: {municipio}/{bucket}")
             by_unit[key] = case
 
+        excluded_by_unit = {unit.key: unit for unit in excluded_units}
+        overlap = set(by_unit).intersection(excluded_by_unit)
+        if overlap:
+            raise ReplayEvidenceError("covered_and_sin_cobertura_v1_overlap")
+
         golden_rows = golden_evaluator.read_csv(Path(golden_path))
         rows = []
         metric_counts = {
             "v1": {bucket: Counter() for bucket, _main, _extra in BUCKET_COLUMNS},
             "v2": {bucket: Counter() for bucket, _main, _extra in BUCKET_COLUMNS},
         }
+        expected_units: set[tuple[str, str]] = set()
         for golden_row in golden_rows:
             municipio = golden_evaluator.get(golden_row, "municipio")
             if not municipio:
                 raise ReplayEvidenceError("golden row without municipio")
             for bucket, main_column, extra_column in BUCKET_COLUMNS:
                 key = (golden_evaluator.muni_key(municipio), bucket)
+                expected_units.add(key)
                 case = by_unit.get(key)
                 if case is None:
+                    if key in excluded_by_unit:
+                        continue
                     raise ReplayEvidenceError(
                         f"missing replay evidence/cassette for {municipio}/{bucket}"
                     )
@@ -569,6 +610,14 @@ class GoldenDifferentialRunner:
                         golden_main=golden_main, golden_extra=golden_extra,
                     ),
                 })
+        unexpected_cases = set(by_unit) - expected_units
+        if unexpected_cases:
+            raise ReplayEvidenceError("unexpected replay unit")
+        unexpected_exclusions = set(excluded_by_unit) - expected_units
+        if unexpected_exclusions:
+            raise ReplayEvidenceError("unexpected sin_cobertura_v1 unit")
+        if not rows:
+            raise ReplayEvidenceError("no_covered_units")
         rows.sort(key=lambda row: (
             golden_evaluator.muni_key(row["municipio"]), row["bucket"]
         ))
@@ -603,8 +652,17 @@ class GoldenDifferentialRunner:
             }
             for system, by_bucket in sorted(metric_counts.items())
         }
+        computed_coverage = coverage_summary(
+            total=len(expected_units),
+            covered=len(rows),
+            sin_cobertura_v1=len(excluded_units),
+        )
+        if declared_coverage is not None and dict(declared_coverage) != computed_coverage:
+            raise ReplayEvidenceError("coverage metadata inconsistent")
         return {
             "schema_version": SCHEMA_VERSION,
+            "coverage": computed_coverage,
+            "sin_cobertura_v1": [unit.as_mapping() for unit in excluded_units],
             "rows": rows,
             "adjudication": adjudication,
             "golden_metrics": metrics,

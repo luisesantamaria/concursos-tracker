@@ -25,8 +25,12 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
 from scripts.fase2_municipios.v2.eval.run_golden_live import (
     AUDIT_FILENAME,
     FINAL_FILENAMES,
+    GoldenLiveInputError,
+    golden_targets,
+    load_url_map,
     main,
 )
+from scripts.fase2_municipios.v2.eval.golden_runner import GoldenDifferentialRunner
 
 
 pytestmark = pytest.mark.offline
@@ -267,6 +271,23 @@ def _factories(*, blocked_unit=None):
     return calls, fetcher_factory, adapter_factory
 
 
+def _rewrite_url_map(
+    path: Path,
+    *,
+    rows: list[dict[str, str]],
+    fieldnames=("municipio", "bucket", "url"),
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _url_map_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 def test_turnkey_complete_run_writes_cassette_differential_and_flips_only_to_staging(
     fixture_run: FixtureRun,
     network_guard_spy,
@@ -405,3 +426,162 @@ def test_output_outside_injected_staging_root_fails_before_adapter(
     assert calls["fetcher"] == 0
     assert calls["adapter_kwargs"] == []
     assert not (tmp_path / "outside").exists()
+
+
+def test_missing_url_map_unit_default_off_stays_fail_closed(
+    fixture_run: FixtureRun,
+) -> None:
+    rows = _url_map_rows(fixture_run.url_map)
+    _rewrite_url_map(fixture_run.url_map, rows=rows[1:])
+
+    with pytest.raises(GoldenLiveInputError, match="url_map_missing_units:1"):
+        load_url_map(
+            fixture_run.url_map,
+            golden_targets(fixture_run.golden),
+        )
+
+
+def test_allow_sin_cobertura_v1_executes_only_covered_and_traces_exclusions(
+    fixture_run: FixtureRun,
+) -> None:
+    excluded = {
+        (MUNICIPIOS[1], BUCKETS[1]),
+        (MUNICIPIOS[0], BUCKETS[0]),
+    }
+    rows = [
+        row for row in _url_map_rows(fixture_run.url_map)
+        if (row["municipio"], row["bucket"]) not in excluded
+    ]
+    _rewrite_url_map(fixture_run.url_map, rows=rows)
+    calls, fetcher_factory, adapter_factory = _factories()
+    judge_calls = []
+
+    class RecordingModelAdapter:
+        def response_for(self, case):
+            judge_calls.append((case["municipio"], case["bucket"]))
+            return dict(case["v2"]["judge_response"])
+
+    def runner_factory(*, seed):
+        return GoldenDifferentialRunner(seed=seed, model_adapter=RecordingModelAdapter())
+
+    code = main(
+        [*_argv(fixture_run), "--allow-sin-cobertura-v1"],
+        environ={"GEMINI_API_KEY_FREE": "offline-free"},
+        staging_root=fixture_run.staging_root,
+        fetcher_factory=fetcher_factory,
+        adapter_factory=adapter_factory,
+        differential_runner_factory=runner_factory,
+    )
+
+    assert code == 0
+    expected_covered = {
+        (municipio, bucket)
+        for municipio in MUNICIPIOS for bucket in BUCKETS
+    } - excluded
+    assert set(calls["adapters"][0].calls) == expected_covered
+    assert set(judge_calls) == expected_covered
+    assert excluded.isdisjoint(calls["adapters"][0].calls)
+    assert excluded.isdisjoint(judge_calls)
+
+    cassette = json.loads(
+        (fixture_run.output_dir / FINAL_FILENAMES[0]).read_text(encoding="utf-8")
+    )
+    differential = json.loads(
+        (fixture_run.output_dir / FINAL_FILENAMES[1]).read_text(encoding="utf-8")
+    )
+    flips = json.loads(
+        (fixture_run.output_dir / FINAL_FILENAMES[3]).read_text(encoding="utf-8")
+    )
+    audit = json.loads(
+        (fixture_run.output_dir / AUDIT_FILENAME).read_text(encoding="utf-8")
+    )
+    canonical_exclusions = [
+        {
+            "municipio": MUNICIPIOS[0],
+            "bucket": BUCKETS[0],
+            "executed": False,
+            "motivo": "sin_cobertura_v1",
+        },
+        {
+            "municipio": MUNICIPIOS[1],
+            "bucket": BUCKETS[1],
+            "executed": False,
+            "motivo": "sin_cobertura_v1",
+        },
+    ]
+    summary = {"total": 4, "covered": 2, "sin_cobertura_v1": 2}
+    for artifact in (cassette, differential, flips, audit):
+        assert artifact["coverage"] == summary
+        assert artifact["sin_cobertura_v1"] == canonical_exclusions
+        assert len({(row["municipio"], row["bucket"]) for row in artifact["sin_cobertura_v1"]}) == 2
+    assert len(cassette["cases"]) == 2
+    assert len(differential["rows"]) == 2
+    assert len(flips["flips"]) == 2
+    assert excluded.isdisjoint(
+        (row["municipio"], row["bucket"]) for row in differential["rows"]
+    )
+    assert excluded.isdisjoint(
+        (row["municipio"], row["bucket"]) for row in flips["flips"]
+    )
+    assert all(
+        metrics["fpos"] == 0
+        for system in differential["golden_metrics"].values()
+        for metrics in system.values()
+    )
+
+
+@pytest.mark.parametrize("allow_partial", (False, True), ids=("flag_off", "flag_on"))
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("extra", "unexpected_url_map_unit_at_row"),
+        ("duplicate", "duplicate_url_map_unit_at_row"),
+        ("invalid_url", "invalid_url_map_url_at_row"),
+        ("columns", "url_map_columns_must_be"),
+    ],
+)
+def test_map_corruption_is_always_hard_error(
+    fixture_run: FixtureRun,
+    allow_partial: bool,
+    corruption: str,
+    message: str,
+) -> None:
+    rows = _url_map_rows(fixture_run.url_map)
+    fieldnames = ("municipio", "bucket", "url")
+    if corruption == "extra":
+        rows.append({
+            "municipio": "Fuera Golden",
+            "bucket": BUCKETS[0],
+            "url": "https://fuera-golden.rs.gov.br/concursos",
+        })
+    elif corruption == "duplicate":
+        rows.append(dict(rows[0]))
+    elif corruption == "invalid_url":
+        rows[0]["url"] = "not-a-url"
+    elif corruption == "columns":
+        fieldnames = ("municipio", "bucket", "wrong_url")
+        rows = [
+            {"municipio": row["municipio"], "bucket": row["bucket"], "wrong_url": row["url"]}
+            for row in rows
+        ]
+    _rewrite_url_map(fixture_run.url_map, rows=rows, fieldnames=fieldnames)
+
+    with pytest.raises(GoldenLiveInputError, match=message):
+        load_url_map(
+            fixture_run.url_map,
+            golden_targets(fixture_run.golden),
+            allow_sin_cobertura_v1=allow_partial,
+        )
+
+
+def test_allow_sin_cobertura_v1_rejects_zero_covered_units(
+    fixture_run: FixtureRun,
+) -> None:
+    _rewrite_url_map(fixture_run.url_map, rows=[])
+
+    with pytest.raises(GoldenLiveInputError, match="no_covered_units"):
+        load_url_map(
+            fixture_run.url_map,
+            golden_targets(fixture_run.golden),
+            allow_sin_cobertura_v1=True,
+        )

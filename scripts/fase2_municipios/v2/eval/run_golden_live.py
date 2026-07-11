@@ -26,6 +26,11 @@ from scripts.fase2_municipios.v2.eval.cassette_producer import (
     CassetteProducer,
     Run497V1Source,
 )
+from scripts.fase2_municipios.v2.eval.coverage_schema import (
+    SinCoberturaV1Unit,
+    canonical_sin_cobertura_v1,
+    coverage_summary,
+)
 from scripts.fase2_municipios.v2.eval.golden_runner import (
     BUCKET_COLUMNS,
     GoldenDifferentialRunner,
@@ -78,6 +83,24 @@ class GoldenLiveArtifacts:
     differential_csv: Path
     flips: Path
     audit: Path
+    coverage: Mapping[str, int]
+    sin_cobertura_v1: tuple[SinCoberturaV1Unit, ...]
+
+
+@dataclass(frozen=True)
+class GoldenTargetCoverage:
+    total: int
+    covered: tuple[tuple[str, str], ...]
+    target_urls: Mapping[tuple[str, str], str]
+    sin_cobertura_v1: tuple[SinCoberturaV1Unit, ...]
+
+    @property
+    def summary(self) -> dict[str, int]:
+        return coverage_summary(
+            total=self.total,
+            covered=len(self.covered),
+            sin_cobertura_v1=len(self.sin_cobertura_v1),
+        )
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -141,12 +164,18 @@ def golden_targets(golden_path: Path) -> tuple[tuple[str, str], ...]:
     rows = golden_evaluator.read_csv(Path(golden_path))
     targets: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
+    municipality_names: dict[str, str] = {}
     for row in rows:
         municipio = golden_evaluator.get(row, "municipio")
         if not municipio:
             raise GoldenLiveInputError("golden_row_without_municipio")
+        normalized_municipio = golden_evaluator.muni_key(municipio)
+        previous_name = municipality_names.get(normalized_municipio)
+        if previous_name is not None and previous_name != municipio:
+            raise GoldenLiveInputError(f"muni_key_collision:{normalized_municipio}")
+        municipality_names[normalized_municipio] = municipio
         for bucket, _main, _extra in BUCKET_COLUMNS:
-            key = (golden_evaluator.muni_key(municipio), bucket)
+            key = (normalized_municipio, bucket)
             if key in seen:
                 raise GoldenLiveInputError(f"duplicate_golden_unit:{municipio}/{bucket}")
             seen.add(key)
@@ -157,13 +186,17 @@ def golden_targets(golden_path: Path) -> tuple[tuple[str, str], ...]:
 
 
 def load_url_map(
-    path: Path, targets: tuple[tuple[str, str], ...]
-) -> dict[tuple[str, str], str]:
+    path: Path,
+    targets: tuple[tuple[str, str], ...],
+    *,
+    allow_sin_cobertura_v1: bool = False,
+) -> GoldenTargetCoverage:
     expected = {
         (golden_evaluator.muni_key(municipio), bucket): (municipio, bucket)
         for municipio, bucket in targets
     }
     supplied: dict[tuple[str, str], str] = {}
+    municipality_names: dict[str, str] = {}
     try:
         with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -175,7 +208,14 @@ def load_url_map(
                 municipio = (row.get("municipio") or "").strip()
                 bucket = (row.get("bucket") or "").strip()
                 url = (row.get("url") or "").strip()
-                key = (golden_evaluator.muni_key(municipio), bucket)
+                normalized_municipio = golden_evaluator.muni_key(municipio)
+                previous_name = municipality_names.get(normalized_municipio)
+                if previous_name is not None and previous_name != municipio:
+                    raise GoldenLiveInputError(
+                        f"muni_key_collision:{normalized_municipio}"
+                    )
+                municipality_names[normalized_municipio] = municipio
+                key = (normalized_municipio, bucket)
                 if key not in expected:
                     raise GoldenLiveInputError(
                         f"unexpected_url_map_unit_at_row:{row_number}"
@@ -193,12 +233,27 @@ def load_url_map(
     except (OSError, UnicodeError, csv.Error) as exc:
         raise GoldenLiveInputError("url_map_unreadable") from exc
     missing = sorted(set(expected) - set(supplied))
-    if missing:
+    if missing and not allow_sin_cobertura_v1:
         raise GoldenLiveInputError(f"url_map_missing_units:{len(missing)}")
-    return {
-        target: supplied[(golden_evaluator.muni_key(target[0]), target[1])]
+    covered = tuple(
+        target
         for target in targets
-    }
+        if (golden_evaluator.muni_key(target[0]), target[1]) in supplied
+    )
+    if allow_sin_cobertura_v1 and not covered:
+        raise GoldenLiveInputError("no_covered_units")
+    exclusions = canonical_sin_cobertura_v1(
+        SinCoberturaV1Unit(*expected[key]) for key in missing
+    )
+    return GoldenTargetCoverage(
+        total=len(targets),
+        covered=covered,
+        target_urls={
+            target: supplied[(golden_evaluator.muni_key(target[0]), target[1])]
+            for target in covered
+        },
+        sin_cobertura_v1=exclusions,
+    )
 
 
 def _outcome_audit(outcome: LiveABCOutcome) -> dict[str, Any]:
@@ -224,6 +279,8 @@ def _outcome_audit(outcome: LiveABCOutcome) -> dict[str, Any]:
 def _flips_view(differential: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": differential["schema_version"],
+        "coverage": differential["coverage"],
+        "sin_cobertura_v1": differential["sin_cobertura_v1"],
         "flips": [
             {
                 "municipio": row["municipio"],
@@ -247,8 +304,10 @@ def run_golden_live(
     staging_root: Path = CANONICAL_STAGING_ROOT,
     timeout_seconds: float = 15.0,
     seed: int = 0,
+    allow_sin_cobertura_v1: bool = False,
     fetcher_factory: Callable[[], Any] = OrionHTTPFetcher,
     adapter_factory: Callable[..., Any] = LiveABCAdapter.from_free_environment,
+    differential_runner_factory: Callable[..., GoldenDifferentialRunner] = GoldenDifferentialRunner,
 ) -> GoldenLiveArtifacts:
     # Credential policy is the first operation: no input parsing, directory
     # creation, fetch, or model construction occurs before it passes.
@@ -264,11 +323,16 @@ def run_golden_live(
     if not v1_dir.is_dir():
         raise GoldenLiveInputError("v1_corpus_dir_not_directory")
 
-    targets = golden_targets(golden)
-    target_urls = load_url_map(url_map, targets)
+    expected_targets = golden_targets(golden)
+    coverage = load_url_map(
+        url_map,
+        expected_targets,
+        allow_sin_cobertura_v1=allow_sin_cobertura_v1,
+    )
+    targets = coverage.covered
     adapter = adapter_factory(
         fetcher=fetcher_factory(),
-        target_urls=target_urls,
+        target_urls=coverage.target_urls,
         environ=environ,
         timeout_seconds=timeout_seconds,
     )
@@ -299,11 +363,18 @@ def run_golden_live(
         v1_source=Run497V1Source(v1_dir),
         abc_provider=adapter,
     )
-    result = producer.produce(targets)
+    result = producer.produce(
+        targets,
+        sin_cobertura_v1=coverage.sin_cobertura_v1,
+    )
     audit_path = destination / AUDIT_FILENAME
     audit = {
         "schema_version": 1,
         "complete": result.complete,
+        "coverage": coverage.summary,
+        "sin_cobertura_v1": [
+            unit.as_mapping() for unit in coverage.sin_cobertura_v1
+        ],
         "inputs": {
             "golden_sha256": _file_sha256(golden),
             "url_map_sha256": _file_sha256(url_map),
@@ -327,7 +398,7 @@ def run_golden_live(
 
     cassette_path = destination / FINAL_FILENAMES[0]
     producer.publish(result, destination=cassette_path, golden_path=golden)
-    differential = GoldenDifferentialRunner(seed=seed).run_replay(
+    differential = differential_runner_factory(seed=seed).run_replay(
         golden_path=golden,
         corpus_path=cassette_path,
     )
@@ -344,6 +415,8 @@ def run_golden_live(
         differential_csv=differential_csv,
         flips=flips_path,
         audit=audit_path,
+        coverage=coverage.summary,
+        sin_cobertura_v1=coverage.sin_cobertura_v1,
     )
 
 
@@ -360,6 +433,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=15.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--allow-sin-cobertura-v1", action="store_true")
     return parser
 
 
@@ -370,6 +444,7 @@ def main(
     staging_root: Path = CANONICAL_STAGING_ROOT,
     fetcher_factory: Callable[[], Any] = OrionHTTPFetcher,
     adapter_factory: Callable[..., Any] = LiveABCAdapter.from_free_environment,
+    differential_runner_factory: Callable[..., GoldenDifferentialRunner] = GoldenDifferentialRunner,
 ) -> int:
     args = _parser().parse_args(argv)
     environment = os.environ if environ is None else environ
@@ -383,8 +458,10 @@ def main(
             staging_root=staging_root,
             timeout_seconds=args.timeout_seconds,
             seed=args.seed,
+            allow_sin_cobertura_v1=args.allow_sin_cobertura_v1,
             fetcher_factory=fetcher_factory,
             adapter_factory=adapter_factory,
+            differential_runner_factory=differential_runner_factory,
         )
     except (GeminiClientError, GoldenLiveError) as exc:
         print(
@@ -392,10 +469,21 @@ def main(
             file=sys.stderr,
         )
         return 2
-    print(f"golden_live=complete output_dir={artifacts.output_dir}")
+    print(
+        "golden_live=complete "
+        f"output_dir={artifacts.output_dir} "
+        f"total={artifacts.coverage['total']} "
+        f"covered={artifacts.coverage['covered']} "
+        f"sin_cobertura_v1={artifacts.coverage['sin_cobertura_v1']}"
+    )
+    for unit in artifacts.sin_cobertura_v1:
+        print(
+            "golden_live=excluded "
+            f"municipio={unit.municipio!r} bucket={unit.bucket} "
+            "executed=false motivo=sin_cobertura_v1"
+        )
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -28,6 +28,12 @@ from scripts.fase2_municipios.v2.eval.golden_runner import (
     GoldenDifferentialRunner,
     JsonReplayFetchAdapter,
 )
+from scripts.fase2_municipios.v2.eval.coverage_schema import (
+    CoverageSchemaError,
+    SinCoberturaV1Unit,
+    canonical_sin_cobertura_v1,
+    coverage_summary,
+)
 from scripts.fase2_municipios.v2.snapshot import (
     CitationVerificationError,
     EvidenceSource as SnapshotEvidenceSource,
@@ -189,6 +195,7 @@ class Run497V1Source:
 
     def _load(self) -> dict[tuple[str, str], Mapping[str, Any]]:
         records: dict[tuple[str, str], Mapping[str, Any]] = {}
+        municipality_names: dict[str, str] = {}
         for path in sorted(self.corpus_dir.glob("*.json")):
             raw = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(raw, Mapping):
@@ -197,7 +204,12 @@ class Run497V1Source:
             bucket = self._BUCKET_MAP.get(raw.get("bucket"))
             if not isinstance(municipio, str) or not municipio or bucket is None:
                 continue
-            key = (golden_evaluator.muni_key(municipio), bucket)
+            normalized_municipio = golden_evaluator.muni_key(municipio)
+            previous_name = municipality_names.get(normalized_municipio)
+            if previous_name is not None and previous_name != municipio:
+                raise ValueError(f"muni_key_collision:{normalized_municipio}")
+            municipality_names[normalized_municipio] = municipio
+            key = (normalized_municipio, bucket)
             if key in records:
                 raise ValueError("DUPLICATE_UNIT")
             records[key] = dict(raw)
@@ -544,8 +556,14 @@ class CassetteProducer:
 
         return diagnostics
 
-    def produce(self, targets: Iterable[TargetUnit]) -> ProducerResult:
+    def produce(
+        self,
+        targets: Iterable[TargetUnit],
+        *,
+        sin_cobertura_v1: Iterable[SinCoberturaV1Unit] = (),
+    ) -> ProducerResult:
         materialized = list(targets)
+        excluded = canonical_sin_cobertura_v1(sin_cobertura_v1)
         diagnostics: list[Diagnostic] = []
         unique: dict[tuple[str, str], TargetUnit] = {}
 
@@ -564,6 +582,10 @@ class CassetteProducer:
                 diagnostics.append(Diagnostic(raw, DiagnosticCode.DUPLICATE_UNIT))
             else:
                 unique[key] = raw
+
+        overlap = set(unique).intersection(unit.key for unit in excluded)
+        if overlap:
+            raise CoverageSchemaError("covered_and_sin_cobertura_v1_overlap")
 
         cases: list[dict[str, Any]] = []
         units_ok: list[TargetUnit] = []
@@ -592,7 +614,19 @@ class CassetteProducer:
             golden_evaluator.muni_key(item.unit[0]), item.unit[1], item.code.value
         ))
         complete = not diagnostics and len(cases) == len(materialized)
-        corpus = {"schema_version": SCHEMA_VERSION, "cases": cases} if complete else None
+        corpus = (
+            {
+                "schema_version": SCHEMA_VERSION,
+                "cases": cases,
+                "sin_cobertura_v1": [unit.as_mapping() for unit in excluded],
+                "coverage": coverage_summary(
+                    total=len(materialized) + len(excluded),
+                    covered=len(cases),
+                    sin_cobertura_v1=len(excluded),
+                ),
+            }
+            if complete else None
+        )
         return ProducerResult(
             complete=complete,
             units_ok=tuple(units_ok),
@@ -641,8 +675,9 @@ class CassetteProducer:
         *,
         destination: Path,
         golden_path: Path,
+        sin_cobertura_v1: Iterable[SinCoberturaV1Unit] = (),
     ) -> ProducerResult:
-        result = self.produce(targets)
+        result = self.produce(targets, sin_cobertura_v1=sin_cobertura_v1)
         if result.complete:
             self.publish(result, destination=destination, golden_path=golden_path)
         return result
