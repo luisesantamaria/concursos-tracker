@@ -118,9 +118,11 @@ def clean_url(url: str) -> str:
 @dataclass
 class Page:
     url: str
+    requested_url: str = ""
     status: int = 0
     title: str = ""
     text: str = ""
+    html: str = ""
     links: list[tuple[str, str]] = field(default_factory=list)
     error: str = ""
     is_spa: bool = False  # served HTML is a JS shell (menu rendered client-side)
@@ -129,6 +131,18 @@ class Page:
     @property
     def ok(self) -> bool:
         return 200 <= self.status < 400 and not self.error
+
+
+@dataclass(frozen=True)
+class RenderedPage:
+    html: str
+    text: str
+    title: str
+    final_url: str
+    status: int = 200
+
+
+_DEFAULT_RENDERER = object()
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +162,12 @@ _RATE_LIMIT_STATUSES = {429, 503}
 
 
 def _page_from_html(final_url: str, status: int, content_type: str,
-                    html_text: str) -> Page:
+                    html_text: str, requested_url: str = "") -> Page:
     if "text/html" not in content_type and "text/plain" not in content_type:
-        return Page(url=final_url, status=status, error="not_html")
+        return Page(
+            url=final_url, requested_url=requested_url,
+            status=status, error="not_html",
+        )
     title = ""
     m = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
     if m:
@@ -178,7 +195,8 @@ def _page_from_html(final_url: str, status: int, content_type: str,
                     or "_cf_chl_opt" in html_low or "cf_chl_" in html_low
                     or "ddos-guard" in html_low)
     is_antibot = hard_markers or (challenge_title and len(body_text) < 1500)
-    return Page(url=final_url, status=status, title=title,
+    return Page(url=final_url, requested_url=requested_url, status=status,
+                title=title, html=html_text,
                 text=body_text, links=links, is_spa=is_spa, is_antibot=is_antibot)
 
 
@@ -227,7 +245,8 @@ def fetch_page(session: requests.Session, url: str, timeout: int = 15) -> Page:
             pass
         page = _page_from_html(
             str(resp.url), resp.status_code,
-            resp.headers.get("content-type", ""), resp.text)
+            resp.headers.get("content-type", ""), resp.text,
+            requested_url=url)
         return page
     except Exception as e:
         # Connection reset / TLS handshake rejected by a WAF — retry as a browser.
@@ -298,6 +317,28 @@ def is_dead_site(page: Page) -> bool:
     """A reachable page that is a parked / hosting / under-construction stub."""
     blob = norm(page.title + " " + page.text[:800])
     return any(p in blob for p in DEAD_SITE_PATTERNS)
+
+
+ANTIBOT_CHALLENGE_SIGNATURES = (
+    "security checkpoint",
+    "vercel security",
+    "just a moment",
+    "checking your browser",
+    "attention required",
+    "cloudflare",
+    "verifying you are human",
+    "enable javascript and cookies",
+)
+
+
+def is_antibot_challenge(page: Page) -> bool:
+    """True only for an explicit browser/security checkpoint signature."""
+    if page.error:
+        # DNS, timeout, refused connection and other transport failures are not
+        # browser challenges, even though they also produce a non-OK Page.
+        return False
+    blob = " ".join((page.title or "", page.text or "", page.html or "")).lower()
+    return any(signature in blob for signature in ANTIBOT_CHALLENGE_SIGNATURES)
 
 
 def is_broad_landing(url: str) -> bool:
@@ -448,13 +489,92 @@ def is_matching_official_municipality_domain(page: Page, municipio: str) -> bool
     return slugify(municipio) in municipal_labels
 
 
+def _official_host(url: str, municipio: str) -> str:
+    """Return the host only when the existing Tier 0 identity check accepts it."""
+    host = (urlparse(clean_url(url)).hostname or "").lower().rstrip(".")
+    neutral = Page(url=clean_url(url), status=200)
+    return host if is_matching_official_municipality_domain(neutral, municipio) else ""
+
+
+def fetch_page_with_official_fallback(
+        session: requests.Session, url: str, municipio: str,
+        official_url: str, timeout: int = 15,
+        render_page=_DEFAULT_RENDERER) -> Page:
+    """Fetch an unequivocal municipal official URL, rendering only a bad shell.
+
+    The normal fetch remains the source of the fallback decision. Playwright is
+    attempted once only when the requested/final host is exactly the official
+    host accepted by Tier 0's existing municipality identity mechanism.
+    """
+    # Preserve the caller's exact URL for the browser attempt and audit field;
+    # fetch_page performs its own established URL cleanup for the normal path.
+    requested_url = (url or "").strip()
+    normal_page = fetch_page(session, requested_url, timeout)
+
+    expected_host = _official_host(official_url, municipio)
+    response_host = _official_host(normal_page.url, municipio)
+    same_exact_official_host = bool(
+        expected_host and response_host and expected_host == response_host
+    )
+    recognized_challenge = is_antibot_challenge(normal_page)
+    unverifiable_shell = normal_page.ok and (
+        is_soft_404(normal_page) or is_dead_site(normal_page)
+    )
+    if not (same_exact_official_host
+            and (recognized_challenge or unverifiable_shell)):
+        return normal_page
+    if render_page is None:
+        return normal_page
+    if render_page is _DEFAULT_RENDERER:
+        render_page = render_page_sync
+
+    try:
+        # One direct render attempt. The renderer never calls this wrapper, so
+        # failure cannot recurse into another Playwright attempt.
+        rendered = render_page(requested_url)
+    except Exception as e:
+        print(f"      official fallback render error: {e}", flush=True)
+        return normal_page
+    if not rendered:
+        return normal_page
+
+    final_host = _official_host(rendered.final_url, municipio)
+    if not final_host or final_host != expected_host:
+        return normal_page
+
+    recovered = _page_from_html(
+        rendered.final_url, rendered.status, "text/html; charset=UTF-8",
+        rendered.html, requested_url=requested_url,
+    )
+    # Keep the browser's DOM-derived fields faithfully even for minimal test
+    # doubles. `ok`, soft-404 and dead-site remain normal Page validations.
+    recovered.title = rendered.title or recovered.title
+    recovered.text = rendered.text or recovered.text
+    if (not recovered.ok or is_antibot_challenge(recovered)
+            or is_soft_404(recovered) or is_dead_site(recovered)):
+        return normal_page
+    if not is_matching_official_municipality_domain(recovered, municipio):
+        return normal_page
+    if norm(municipio) not in norm(f"{recovered.title} {recovered.text}"):
+        return normal_page
+
+    # fetch_page has no page cache: only WAF host-state is cached. Therefore no
+    # checkpoint is promoted and no rendered DOM needs a cache replacement.
+    return recovered
+
+
 def tier0_find_site(session: requests.Session, municipio: str,
-                    timeout: int = 15) -> Page | None:
+                    timeout: int = 15,
+                    render_page=_DEFAULT_RENDERER) -> Page | None:
     candidates = domain_candidates(municipio)
     best = None
     best_score = -1
     for url in candidates:
-        page = fetch_page(session, url, timeout)
+        page = fetch_page_with_official_fallback(
+            session, url, municipio, url, timeout, render_page,
+        )
+        if is_antibot_challenge(page):
+            continue
         if not page.ok:
             continue
         score = score_site_page(page, municipio)
@@ -911,7 +1031,8 @@ def gemini_post(session: requests.Session, model: str, payload: dict,
 
 def tier2_grounded_search(session: requests.Session, model: str,
                           municipio: str, site_hint: str,
-                          timeout: int = 15) -> list[Candidate]:
+                          timeout: int = 15,
+                          render_page=_DEFAULT_RENDERER) -> list[Candidate]:
     hint = f"O site oficial e: {site_hint}. " if site_hint else ""
     prompt = (
         f"Voce e um investigador de sites oficiais de prefeituras do {UF_NOME} ({UF_SIGLA}), Brasil. "
@@ -987,7 +1108,9 @@ def tier2_grounded_search(session: requests.Session, model: str,
         if is_broad_landing(c.url):
             c.fetchable = False
             continue
-        page = fetch_page(session, c.url, timeout)
+        page = fetch_page_with_official_fallback(
+            session, c.url, municipio, site_hint, timeout, render_page,
+        )
         if page.ok and not is_soft_404(page):
             c.page = page
             c.content_preview = page.text[:1200]
@@ -1563,6 +1686,39 @@ def _get_browser():
     return _BROWSER
 
 
+def render_page_sync(url: str) -> RenderedPage | None:
+    """Render one URL with the shared sync browser and return the final DOM."""
+    try:
+        browser = _get_browser()
+    except Exception as e:
+        print(f"      challenge render unavailable: {e}", flush=True)
+        return None
+    context = None
+    try:
+        context = new_browser_context(browser, ignore_https_errors=True)
+        browser_page = context.new_page()
+        response = browser_page.goto(
+            url, wait_until="domcontentloaded", timeout=20000,
+        )
+        browser_page.wait_for_timeout(2000)
+        return RenderedPage(
+            html=browser_page.content(),
+            text=browser_page.locator("body").inner_text(),
+            title=browser_page.title(),
+            final_url=browser_page.url,
+            status=response.status if response is not None else 0,
+        )
+    except Exception as e:
+        print(f"      challenge render error: {e}", flush=True)
+        return None
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
 def _render_page_links(url: str, timeout: int = 20) -> list[tuple[str, str]]:
     """Load a JS-rendered page in a headless browser and return its <a> links.
 
@@ -2002,14 +2158,20 @@ class MunicipioResult:
 
 def process_municipio(session: requests.Session, municipio: str,
                       model: str, timeout: int = 15,
-                      use_playwright: bool = True) -> MunicipioResult:
+                      use_playwright: bool = True,
+                      render_page=_DEFAULT_RENDERER) -> MunicipioResult:
     result = MunicipioResult(municipio=municipio)
     tiers_used = []
     all_candidates: list[Candidate] = []
+    challenge_renderer = render_page
+    if challenge_renderer is _DEFAULT_RENDERER:
+        challenge_renderer = render_page_sync if use_playwright else None
 
     # --- TIER 0: Find site base (free slug guesses) ---
     print(f"  [{municipio}] Tier 0: finding site...", flush=True)
-    home = tier0_find_site(session, municipio, timeout)
+    home = tier0_find_site(
+        session, municipio, timeout, render_page=challenge_renderer,
+    )
     if home:
         tiers_used.append("t0")
     elif gemini_api_key():
@@ -2114,6 +2276,7 @@ def process_municipio(session: requests.Session, municipio: str,
         try:
             t2_candidates = tier2_grounded_search(
                 session, model, municipio, result.site_base, timeout,
+                render_page=challenge_renderer,
             )
             # Filter out candidates we already have
             existing_urls = {c.url for c in all_candidates}
