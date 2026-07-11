@@ -640,6 +640,7 @@ class CassetteProducer:
         *,
         destination: Path,
         golden_path: Path,
+        unit_allowlist: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
         if not result.complete or result.corpus is None:
             raise IncompleteCorpusError("INCOMPLETE_CORPUS")
@@ -663,6 +664,7 @@ class CassetteProducer:
             GoldenDifferentialRunner().run_replay(
                 golden_path=golden_path,
                 corpus_path=temporary,
+                unit_allowlist=unit_allowlist,
             )
             os.replace(temporary, destination)
         finally:
@@ -676,10 +678,16 @@ class CassetteProducer:
         destination: Path,
         golden_path: Path,
         sin_cobertura_v1: Iterable[SinCoberturaV1Unit] = (),
+        unit_allowlist: tuple[tuple[str, str], ...] | None = None,
     ) -> ProducerResult:
         result = self.produce(targets, sin_cobertura_v1=sin_cobertura_v1)
         if result.complete:
-            self.publish(result, destination=destination, golden_path=golden_path)
+            self.publish(
+                result,
+                destination=destination,
+                golden_path=golden_path,
+                unit_allowlist=unit_allowlist,
+            )
         return result
 
 

@@ -85,6 +85,7 @@ from scripts.fase2_municipios.v2.gemini import (
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CANONICAL_STAGING_ROOT = REPO_ROOT / "staging" / "fase2_v2" / "eval"
 URL_MAP_COLUMNS = ("municipio", "bucket", "url")
+VALID_UNIT_BUCKETS = frozenset(bucket for bucket, _main, _extra in BUCKET_COLUMNS)
 FINAL_FILENAMES = (
     "golden_cassette.schema1.json",
     "differential.json",
@@ -209,17 +210,76 @@ def golden_targets(golden_path: Path) -> tuple[tuple[str, str], ...]:
     return tuple(targets)
 
 
+def parse_unit_specs(specs: list[str] | tuple[str, ...] | None) -> tuple[tuple[str, str], ...]:
+    """Parse repeatable ``Municipio:bucket`` values without inventing units."""
+
+    if not specs:
+        return ()
+    parsed: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for position, spec in enumerate(specs, start=1):
+        if not isinstance(spec, str) or ":" not in spec:
+            raise GoldenLiveInputError(f"invalid_unit_spec_at:{position}")
+        municipio, bucket = (item.strip() for item in spec.rsplit(":", 1))
+        if not municipio or bucket not in VALID_UNIT_BUCKETS:
+            raise GoldenLiveInputError(f"invalid_unit_spec_at:{position}")
+        key = (golden_evaluator.muni_key(municipio), bucket)
+        if key in seen:
+            raise GoldenLiveInputError(f"duplicate_unit_spec_at:{position}")
+        seen.add(key)
+        parsed.append((municipio, bucket))
+    return tuple(parsed)
+
+
+def filter_golden_targets(
+    targets: tuple[tuple[str, str], ...],
+    unit_allowlist: tuple[tuple[str, str], ...] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Resolve an explicit unit allowlist against the canonical golden universe."""
+
+    if not unit_allowlist:
+        return targets
+    available = {
+        (golden_evaluator.muni_key(municipio), bucket): (municipio, bucket)
+        for municipio, bucket in targets
+    }
+    selected: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for municipio, bucket in unit_allowlist:
+        if bucket not in VALID_UNIT_BUCKETS:
+            raise GoldenLiveInputError(f"requested_unit_invalid_bucket:{bucket}")
+        key = (golden_evaluator.muni_key(municipio), bucket)
+        if key in seen:
+            raise GoldenLiveInputError(
+                f"requested_unit_duplicate:{municipio}:{bucket}"
+            )
+        seen.add(key)
+        resolved = available.get(key)
+        if resolved is None:
+            raise GoldenLiveInputError(
+                f"requested_unit_not_in_golden:{municipio}:{bucket}"
+            )
+        selected.append(resolved)
+    return tuple(selected)
+
+
 def load_url_map(
     path: Path,
     targets: tuple[tuple[str, str], ...],
     *,
     allow_sin_cobertura_v1: bool = False,
+    universe_targets: tuple[tuple[str, str], ...] | None = None,
 ) -> GoldenTargetCoverage:
     expected = {
         (golden_evaluator.muni_key(municipio), bucket): (municipio, bucket)
         for municipio, bucket in targets
     }
+    universe = {
+        (golden_evaluator.muni_key(municipio), bucket): (municipio, bucket)
+        for municipio, bucket in (universe_targets or targets)
+    }
     supplied: dict[tuple[str, str], str] = {}
+    seen_supplied: set[tuple[str, str]] = set()
     municipality_names: dict[str, str] = {}
     try:
         with Path(path).open("r", encoding="utf-8-sig", newline="") as handle:
@@ -240,23 +300,30 @@ def load_url_map(
                     )
                 municipality_names[normalized_municipio] = municipio
                 key = (normalized_municipio, bucket)
-                if key not in expected:
+                if key not in universe:
                     raise GoldenLiveInputError(
                         f"unexpected_url_map_unit_at_row:{row_number}"
                     )
-                if key in supplied:
+                if key in seen_supplied:
                     raise GoldenLiveInputError(
                         f"duplicate_url_map_unit_at_row:{row_number}"
                     )
+                seen_supplied.add(key)
                 parsed = urlsplit(url)
                 if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                     raise GoldenLiveInputError(
                         f"invalid_url_map_url_at_row:{row_number}"
                     )
-                supplied[key] = url
+                if key in expected:
+                    supplied[key] = url
     except (OSError, UnicodeError, csv.Error) as exc:
         raise GoldenLiveInputError("url_map_unreadable") from exc
     missing = sorted(set(expected) - set(supplied))
+    if missing and universe_targets is not None and not allow_sin_cobertura_v1:
+        municipio, bucket = expected[missing[0]]
+        raise GoldenLiveInputError(
+            f"requested_unit_missing_from_url_map:{municipio}:{bucket}"
+        )
     if missing and not allow_sin_cobertura_v1:
         raise GoldenLiveInputError(f"url_map_missing_units:{len(missing)}")
     covered = tuple(
@@ -564,6 +631,7 @@ def run_golden_live(
     gemini_timeout: float = 60.0,
     seed: int = 0,
     allow_sin_cobertura_v1: bool = False,
+    unit_allowlist: tuple[tuple[str, str], ...] | None = None,
     resume: bool = False,
     heartbeat_seconds: float = 30.0,
     isolate_model_calls: bool = True,
@@ -588,12 +656,19 @@ def run_golden_live(
     if not v1_dir.is_dir():
         raise GoldenLiveInputError("v1_corpus_dir_not_directory")
 
-    expected_targets = golden_targets(golden)
+    all_targets = golden_targets(golden)
+    expected_targets = filter_golden_targets(all_targets, unit_allowlist)
     coverage = load_url_map(
         url_map,
         expected_targets,
         allow_sin_cobertura_v1=allow_sin_cobertura_v1,
+        universe_targets=(all_targets if unit_allowlist else None),
     )
+    if unit_allowlist and coverage.sin_cobertura_v1:
+        unit = coverage.sin_cobertura_v1[0]
+        raise GoldenLiveInputError(
+            f"requested_unit_sin_cobertura_v1:{unit.municipio}:{unit.bucket}"
+        )
     unique_targets: dict[tuple[str, str], tuple[str, str]] = {}
     for target in coverage.covered:
         unique_targets.setdefault(normalize_unit(*target), target)
@@ -823,10 +898,16 @@ def run_golden_live(
             )
 
         cassette_path = destination / FINAL_FILENAMES[0]
-        producer.publish(result, destination=cassette_path, golden_path=golden)
+        producer.publish(
+            result,
+            destination=cassette_path,
+            golden_path=golden,
+            unit_allowlist=(targets if unit_allowlist else None),
+        )
         differential = differential_runner_factory(seed=seed).run_replay(
             golden_path=golden,
             corpus_path=cassette_path,
+            unit_allowlist=(targets if unit_allowlist else None),
         )
         differential_json = destination / FINAL_FILENAMES[1]
         differential_csv = destination / FINAL_FILENAMES[2]
@@ -891,6 +972,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-model-subprocess", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--allow-sin-cobertura-v1", action="store_true")
+    parser.add_argument(
+        "--units",
+        action="append",
+        metavar="MUNICIPIO:BUCKET",
+        help=(
+            "repeatable exact unit allowlist; bucket is concurso_publico or "
+            "processo_seletivo"
+        ),
+    )
     return parser
 
 
@@ -926,6 +1016,7 @@ def main(
             gemini_timeout=args.gemini_timeout,
             seed=args.seed,
             allow_sin_cobertura_v1=args.allow_sin_cobertura_v1,
+            unit_allowlist=parse_unit_specs(args.units),
             resume=args.resume,
             heartbeat_seconds=args.heartbeat_seconds,
             isolate_model_calls=not args.no_model_subprocess,

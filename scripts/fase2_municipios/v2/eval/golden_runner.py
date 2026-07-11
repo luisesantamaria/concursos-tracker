@@ -518,7 +518,13 @@ class GoldenDifferentialRunner:
             "reason_code": result.reason_code,
         }
 
-    def run_replay(self, *, golden_path: Path, corpus_path: Path) -> dict:
+    def run_replay(
+        self,
+        *,
+        golden_path: Path,
+        corpus_path: Path,
+        unit_allowlist: tuple[tuple[str, str], ...] | None = None,
+    ) -> dict:
         # Exercise the injected clock without allowing it into the artifact.
         injected_now = self.clock.now()
         if not isinstance(injected_now, datetime):
@@ -547,6 +553,13 @@ class GoldenDifferentialRunner:
             raise ReplayEvidenceError("covered_and_sin_cobertura_v1_overlap")
 
         golden_rows = golden_evaluator.read_csv(Path(golden_path))
+        requested_units = (
+            {
+                (golden_evaluator.muni_key(municipio), bucket)
+                for municipio, bucket in unit_allowlist
+            }
+            if unit_allowlist else None
+        )
         rows = []
         metric_counts = {
             "v1": {bucket: Counter() for bucket, _main, _extra in BUCKET_COLUMNS},
@@ -559,6 +572,8 @@ class GoldenDifferentialRunner:
                 raise ReplayEvidenceError("golden row without municipio")
             for bucket, main_column, extra_column in BUCKET_COLUMNS:
                 key = (golden_evaluator.muni_key(municipio), bucket)
+                if requested_units is not None and key not in requested_units:
+                    continue
                 expected_units.add(key)
                 case = by_unit.get(key)
                 if case is None:
@@ -610,6 +625,8 @@ class GoldenDifferentialRunner:
                         golden_main=golden_main, golden_extra=golden_extra,
                     ),
                 })
+        if requested_units is not None and requested_units != expected_units:
+            raise ReplayEvidenceError("requested replay unit not in golden")
         unexpected_cases = set(by_unit) - expected_units
         if unexpected_cases:
             raise ReplayEvidenceError("unexpected replay unit")
