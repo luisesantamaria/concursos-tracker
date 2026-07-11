@@ -273,6 +273,10 @@ def _outcome_audit(outcome: LiveABCOutcome) -> dict[str, Any]:
             if outcome.original_exception is not None
             else None
         ),
+        "events": [
+            {"phase": event.phase, "errors": list(event.errors)}
+            for event in outcome.audit_events
+        ],
     }
 
 

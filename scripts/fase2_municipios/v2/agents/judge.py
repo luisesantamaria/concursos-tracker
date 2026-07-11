@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -41,6 +41,9 @@ class JudgeOutcome:
     decision: str | None
     reason: str
     error_code: str | None = None
+    original_exception: BaseException | None = field(
+        default=None, compare=False, repr=False
+    )
 
 
 class ConflictJudge:
@@ -91,7 +94,9 @@ class ConflictJudge:
                 untrusted, ensure_ascii=False, sort_keys=True
             )
         except (TypeError, ValueError) as exc:
-            return JudgeOutcome(None, type(exc).__name__, "judge_error")
+            return JudgeOutcome(
+                None, type(exc).__name__, "judge_error", original_exception=exc
+            )
         contents = [
             {"role": "system", "parts": [{"text": self.system_prompt}]},
             {
@@ -118,13 +123,16 @@ class ConflictJudge:
                 decision=None,
                 reason=type(exc).__name__,
                 error_code="judge_error",
+                original_exception=exc,
             )
         if not isinstance(raw, Mapping):
             return JudgeOutcome(None, "empty_or_non_object", "judge_error")
         try:
             validate_json_schema(raw, JUDGE_OUTPUT_SCHEMA)
         except (JsonSchemaValidationError, UnsupportedJsonSchemaError) as exc:
-            return JudgeOutcome(None, type(exc).__name__, "judge_error")
+            return JudgeOutcome(
+                None, type(exc).__name__, "judge_error", original_exception=exc
+            )
         return JudgeOutcome(
             decision=raw["decision"],
             reason=raw["reason"],

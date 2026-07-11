@@ -18,12 +18,16 @@ import socket
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 
+from pydantic import ValidationError
+
 from scripts.fase2_municipios import cascade_municipios as cascade
 from scripts.fase2_municipios.v2.agents import (
     ABCOrchestrator,
+    AgentError,
     ConflictJudge,
     DecisionProposal,
     JudgeOutcome,
+    ProposalValidationError,
     build_certifier_agent,
     build_conflict_judge,
     build_prosecutor_agent,
@@ -38,6 +42,7 @@ from scripts.fase2_municipios.v2.eval.cassette_producer import (
     SourceLayer,
 )
 from scripts.fase2_municipios.v2.gemini import (
+    GeminiClientError,
     RealGeminiTransport,
     RoleModels,
     build_judge_client,
@@ -63,6 +68,10 @@ class LiveFetchError(RuntimeError):
     """An HTTP response was reached but could not become admissible evidence."""
 
 
+class ModelResponseValidationError(ValueError):
+    """A role returned a value that cannot satisfy the A/B/C response contract."""
+
+
 class LiveCauseKind(str, Enum):
     SUCCESS = "success"
     LEGITIMATE_ABSENCE = "legitimate_absence"
@@ -71,6 +80,7 @@ class LiveCauseKind(str, Enum):
     EVIDENCE_FAILURE = "evidence_failure"
     DISAGREEMENT_UNRESOLVED = "disagreement_unresolved"
     CONFIGURATION_FAILURE = "configuration_failure"
+    INTERNAL_FAILURE = "internal_failure"
 
 
 @dataclass(frozen=True)
@@ -78,6 +88,19 @@ class LiveCause:
     kind: LiveCauseKind
     code: str
     comment: str
+
+
+@dataclass(frozen=True)
+class LiveAuditEvent:
+    """Stable exception evidence captured at one live processing boundary.
+
+    Events are append-only and ordered by processing phase.  Each event stores
+    the outer exception followed by its explicit cause (or implicit context),
+    with object-identity de-duplication so chained exceptions occur once.
+    """
+
+    phase: str
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -89,6 +112,7 @@ class LiveABCOutcome:
     cause: LiveCause
     layer: ABCLayer | None
     original_exception: BaseException | None = None
+    audit_events: tuple[LiveAuditEvent, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -262,8 +286,34 @@ class _RecordingJudge:
 def _role_output(value: Any, role: str) -> Mapping[str, Any]:
     output = getattr(value, "output", value)
     if not isinstance(output, Mapping) or not output:
-        raise ValueError(f"{role}_empty_or_non_object")
+        raise ModelResponseValidationError(f"{role}_empty_or_non_object")
     return dict(output)
+
+
+def _stable_exception_text(exc: BaseException) -> str:
+    """Return ``Class: message`` without repr-only or multiline variability."""
+
+    message = " ".join(str(exc).split())
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
+
+
+def _exception_chain(exc: BaseException) -> tuple[str, ...]:
+    """Serialize an exception and its causal chain once, outermost first."""
+
+    errors: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        errors.append(_stable_exception_text(current))
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return tuple(errors)
 
 
 def _citation_layer(raw: Mapping[str, Any]) -> CitationLayer:
@@ -361,6 +411,8 @@ class LiveABCAdapter:
         kind: LiveCauseKind,
         code: str,
         error: BaseException | None = None,
+        phase: str | None = None,
+        audit_events: tuple[LiveAuditEvent, ...] = (),
     ) -> LiveABCOutcome:
         comments = {
             LiveCauseKind.ACCESS_FAILURE: "no se pudo acceder",
@@ -368,7 +420,11 @@ class LiveABCAdapter:
             LiveCauseKind.EVIDENCE_FAILURE: "evidencia o cita rechazada",
             LiveCauseKind.DISAGREEMENT_UNRESOLVED: "desacuerdo A/B/C no resuelto",
             LiveCauseKind.CONFIGURATION_FAILURE: "configuracion live invalida",
+            LiveCauseKind.INTERNAL_FAILURE: "error interno live inesperado",
         }
+        events = audit_events
+        if error is not None:
+            events += (LiveAuditEvent(phase or "unknown", _exception_chain(error)),)
         return LiveABCOutcome(
             municipio=municipio,
             bucket=bucket,
@@ -377,6 +433,7 @@ class LiveABCAdapter:
             cause=LiveCause(kind, code, comments[kind]),
             layer=None,
             original_exception=error,
+            audit_events=events,
         )
 
     @staticmethod
@@ -463,6 +520,7 @@ class LiveABCAdapter:
                 kind=LiveCauseKind.ACCESS_FAILURE,
                 code=type(exc).__name__,
                 error=exc,
+                phase="fetch",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -473,6 +531,7 @@ class LiveABCAdapter:
                 kind=LiveCauseKind.ACCESS_FAILURE,
                 code=type(exc).__name__,
                 error=exc,
+                phase="fetch",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -498,6 +557,7 @@ class LiveABCAdapter:
                 kind=LiveCauseKind.EVIDENCE_FAILURE,
                 code=type(exc).__name__,
                 error=exc,
+                phase="evidence_snapshot",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -525,13 +585,33 @@ class LiveABCAdapter:
             )
             proposal_a_layer = _proposal_layer(proposal_a)
             proposal_b_layer = _proposal_layer(proposal_b)
-        except Exception as exc:
+        except (
+            ValidationError,
+            ModelResponseValidationError,
+            ProposalValidationError,
+            AgentError,
+            GeminiClientError,
+            TimeoutError,
+            RuntimeError,
+        ) as exc:
             outcome = self._failure(
                 municipio,
                 bucket,
                 kind=LiveCauseKind.MODEL_FAILURE,
                 code=type(exc).__name__,
                 error=exc,
+                phase="model_response",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        except Exception as exc:
+            outcome = self._failure(
+                municipio,
+                bucket,
+                kind=LiveCauseKind.INTERNAL_FAILURE,
+                code=type(exc).__name__,
+                error=exc,
+                phase="abc_internal",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -551,6 +631,7 @@ class LiveABCAdapter:
                 kind=LiveCauseKind.DISAGREEMENT_UNRESOLVED,
                 code=type(exc).__name__,
                 error=exc,
+                phase="judge",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -566,6 +647,8 @@ class LiveABCAdapter:
                 bucket,
                 kind=LiveCauseKind.DISAGREEMENT_UNRESOLVED,
                 code=judge_outcome.error_code or "judge_unresolved",
+                error=judge_outcome.original_exception,
+                phase="judge_response",
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -645,9 +728,11 @@ __all__ = [
     "LiveABCAdapter",
     "LiveABCConfigurationError",
     "LiveABCOutcome",
+    "LiveAuditEvent",
     "LiveCause",
     "LiveCauseKind",
     "LiveFetchError",
+    "ModelResponseValidationError",
     "OrionFetcher",
     "OrionHTTPFetcher",
 ]
