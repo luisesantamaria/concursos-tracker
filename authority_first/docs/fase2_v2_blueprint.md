@@ -686,6 +686,57 @@ su fallback histórico, por lo que el replay lo envuelve externamente y no cambi
 su lógica. Los artefactos de corrida van en `staging/fase2_v2/eval/`, ignorado
 por Git. El golden, CSV canónico, V1 y skills permanecen intactos.
 
+## Selector estratificado para staging live (ronda 9)
+
+El selector offline vive en
+`scripts/fase2_municipios/v2/eval/stratified_selector.py`; toma como universo
+`authority_first/data/municipios_resources_rs.csv` y excluye por defecto las 24
+identidades de `golden_set_v1.csv`. La exclusión no compara texto crudo: crea
+identidades municipales con `cascade_municipios.norm` e identidades de recurso
+con `cascade_municipios._normalized_candidate_url`. Coincidir por cualquiera de
+las dos excluye la fila.
+
+La precedencia de familia es única, cerrada y está versionada en
+`portal_families_v1.json`: `multi24`, `oxy_elotech`, `atende_net`,
+`govbr_cloud`, `rs_gov_br` y fallback `desconocida`. Los cuatro primeros están
+declarados difíciles. Las reglas usan únicamente sufijos de host o fragmentos
+generales de URL; no contienen municipios, observaciones libres ni portales de
+casos individuales. `ip_delegado`, `multiples_hosts` y
+`usa_transparencia_externa` son booleanos separados y nunca crean familias
+adicionales.
+
+Los valores V1 observados `boa`, `nao_encontrada` y `revisar` se conservan en
+`estado_fuente`. Su agregado pertenece al vocabulario cerrado `confirmado`,
+`nao_encontrado`, `revisar`, `misto` o `sem_saida_previa`; este último significa
+ausencia de salida y no se confunde con un negativo. Un valor fuente desconocido
+aborta. `borderline` se deriva de la lista ordenada de razones
+`v1_revisar`, `familia_dificil`, `senal_ambigua`.
+
+La selección es jerárquica y no asigna puntos: primero reserva diez borderlines,
+round-robin entre familias lexicográficas y estados lexicográficos dentro de la
+familia; después llena el resto round-robin por familia, manteniendo estado como
+cobertura secundaria. Un estrato escaso se agota y el turno sobrante pasa al
+siguiente estrato de forma determinista. Los candidatos se ordenan por identidad
+antes de que `random.Random(seed)` baraje exclusivamente dentro de cada estrato
+`(familia, estado)`; el RNG nunca ordena estratos.
+
+El JSON schema 1 canónico es la fuente reproducible: UTF-8, LF, claves ordenadas,
+sin timestamps ni rutas ambientales. Incluye seed, tamaños, orden de estratos,
+muestra etiquetada y cobertura por familia, estado, borderline, señal y fase. El
+CSV es solo una vista derivada. Comando para preparar los 50 casos de Orion:
+
+```bash
+python -m scripts.fase2_municipios.v2.eval.stratified_selector \
+  --universe authority_first/data/municipios_resources_rs.csv \
+  --golden authority_first/data/golden_set_v1.csv \
+  --output-json staging/fase2_v2/eval/selector/sample.json \
+  --output-csv staging/fase2_v2/eval/selector/sample.csv \
+  --size 50 --seed <seed-acordada> --borderline-minimum 10
+```
+
+`staging/fase2_v2/eval/` ya está ignorado por Git. El selector no importa red,
+cliente Gemini ni credenciales y no modifica V1, skills, golden o CSV canónico.
+
 ## Decisiones abiertas para el CEREBRO
 
 - Revisar periódicamente la disponibilidad free de los modelos fijados en ronda
@@ -705,6 +756,9 @@ por Git. El golden, CSV canónico, V1 y skills permanecen intactos.
   implementación de producción.
 - Aportar el corpus replay real de los 24 municipios; los fixtures sintéticos
   solo prueban el contrato y no constituyen una medición representativa.
+- Revisar la tabla de familias cuando aparezcan proveedores nuevos: el CSV
+  previo actual no contiene `multi24`, `oxy_elotech` ni `govbr_cloud`, aunque el
+  golden sí documenta los dos primeros.
 
 Decisiones triviales resueltas conservadoramente en este paso: UTF-8 explícito,
 orden lexicográfico/fijo, contratos mínimos que no exigen opcionales, búsqueda de

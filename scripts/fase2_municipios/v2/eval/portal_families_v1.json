@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "families": [
+    {"name": "multi24", "difficult": true, "url_contains": ["/multi24/"]},
+    {"name": "oxy_elotech", "difficult": true, "host_suffixes": ["oxy.elotech.com.br"]},
+    {"name": "atende_net", "difficult": true, "host_suffixes": ["atende.net"]},
+    {"name": "govbr_cloud", "difficult": true, "host_suffixes": ["govbr.cloud"]},
+    {"name": "rs_gov_br", "difficult": false, "host_suffixes": ["rs.gov.br"]}
+  ],
+  "fallback": "desconocida"
+}
