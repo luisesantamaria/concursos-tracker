@@ -686,8 +686,16 @@ GEMINI_API_KEY_FREE=<free-key> python -m \
   --provider gemini_free --tools none --validate-only
 ```
 
-Para la ejecución real Orion inyecta sus adaptadores en `run_live`; este módulo
-no agrega fallback pago ni ADC. V1 no ofrece hoy un seam live limpio que elimine
+La capa A/B/C live está implementada en
+`scripts/fase2_municipios/v2/eval/live_abc_adapter.py`. Orion entrega el mapa
+explícito `(municipio, bucket) -> URL`; el adaptador realiza un único fetch por
+unidad, congela un `EvidenceSnapshot` compartido por A/B/C y usa exclusivamente
+el transporte Gemini free-only y el limitador compartido existentes. La ruta se
+habilita en `run_live` con `enable_live_abc=True`; el comportamiento histórico
+con `request_adapter` sigue siendo el default y ambas rutas son mutuamente
+excluyentes. Bloqueos, timeouts, evidencia/citas inválidas y desacuerdos no
+resueltos producen `revisar` con causa estructurada. No existe fallback pago,
+ADC, grounding ni native tools. V1 no ofrece hoy un seam live limpio que elimine
 su fallback histórico, por lo que el replay lo envuelve externamente y no cambia
 su lógica. Los artefactos de corrida van en `staging/fase2_v2/eval/`, ignorado
 por Git. El golden, CSV canónico, V1 y skills permanecen intactos.

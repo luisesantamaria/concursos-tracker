@@ -657,9 +657,37 @@ def validate_live_contract(contract: LiveContract) -> None:
         raise LiveContractError("free-only credential contract failed") from exc
 
 
-def run_live(*, contract: LiveContract, request_adapter: Any) -> Any:
+def run_live(
+    *,
+    contract: LiveContract,
+    request_adapter: Any | None = None,
+    enable_live_abc: bool = False,
+    abc_provider: Any | None = None,
+    municipio: str | None = None,
+    bucket: str | None = None,
+) -> Any:
     validate_live_contract(contract)
-    return request_adapter.request()
+    if request_adapter is not None and abc_provider is not None:
+        raise LiveContractError(
+            "request_adapter and abc_provider are mutually exclusive"
+        )
+    if not enable_live_abc:
+        if abc_provider is not None:
+            raise LiveContractError("abc_provider requires enable_live_abc")
+        if request_adapter is None:
+            raise LiveContractError("request_adapter is required")
+        return request_adapter.request()
+    if request_adapter is not None:
+        raise LiveContractError(
+            "request_adapter and enable_live_abc are mutually exclusive"
+        )
+    if abc_provider is None or not isinstance(municipio, str) or not municipio:
+        raise LiveContractError("live ABC provider and municipio are required")
+    if bucket not in {item[0] for item in BUCKET_COLUMNS}:
+        raise LiveContractError("valid live ABC bucket is required")
+    if hasattr(abc_provider, "request"):
+        return abc_provider.request(municipio, bucket)
+    return abc_provider.get(municipio, bucket)
 
 
 def _parser() -> argparse.ArgumentParser:
