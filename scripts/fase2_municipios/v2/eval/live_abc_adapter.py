@@ -48,6 +48,13 @@ from scripts.fase2_municipios.v2.eval.cassette_producer import (
     ProposalLayer,
     SourceLayer,
 )
+from scripts.fase2_municipios.v2.eval.live_model_policy import (
+    EvidenceInsufficientError,
+    ModelPolicyTelemetry,
+    PolicyTransport,
+    SemanticModelError,
+    classify_error,
+)
 from scripts.fase2_municipios.v2.gemini import (
     GeminiClientError,
     RealGeminiTransport,
@@ -71,11 +78,15 @@ class LiveABCConfigurationError(ValueError):
     """The live adapter cannot run safely with the supplied configuration."""
 
 
-class LiveFetchError(RuntimeError):
+class LiveFetchError(EvidenceInsufficientError):
     """An HTTP response was reached but could not become admissible evidence."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        self.status_code = status_code
+        super().__init__(message)
 
-class ModelResponseValidationError(ValueError):
+
+class ModelResponseValidationError(SemanticModelError):
     """A role returned a value that cannot satisfy the A/B/C response contract."""
 
 
@@ -245,6 +256,8 @@ class OrionHTTPFetcher:
         *,
         clock: Callable[[], datetime] | None = None,
         max_redirects: int = 5,
+        connect_timeout_seconds: float | None = None,
+        read_timeout_seconds: float | None = None,
     ) -> None:
         if (
             isinstance(max_redirects, bool)
@@ -254,6 +267,20 @@ class OrionHTTPFetcher:
             raise LiveABCConfigurationError("max_redirects_must_be_non_negative")
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_redirects = max_redirects
+        for name, value in (
+            ("connect_timeout_seconds", connect_timeout_seconds),
+            ("read_timeout_seconds", read_timeout_seconds),
+        ):
+            if value is not None and (
+                not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0
+            ):
+                raise LiveABCConfigurationError(f"{name}_must_be_positive")
+        self._connect_timeout_seconds = (
+            float(connect_timeout_seconds) if connect_timeout_seconds is not None else None
+        )
+        self._read_timeout_seconds = (
+            float(read_timeout_seconds) if read_timeout_seconds is not None else None
+        )
 
     @staticmethod
     def _connection(parsed, timeout_seconds: float):
@@ -285,16 +312,21 @@ class OrionHTTPFetcher:
             raise LiveABCConfigurationError("timeout_seconds_must_be_positive")
         requested_url = url
         current_url = url
+        connect_timeout = self._connect_timeout_seconds or float(timeout_seconds)
+        read_timeout = self._read_timeout_seconds or float(timeout_seconds)
         response = None
         payload = b""
         for redirect_count in range(self._max_redirects + 1):
             parsed = urlsplit(current_url)
-            connection = self._connection(parsed, timeout_seconds)
+            connection = self._connection(parsed, connect_timeout)
             path = parsed.path or "/"
             if parsed.query:
                 path += "?" + parsed.query
             try:
                 connection.request("GET", path, headers=_live_request_headers())
+                sock = getattr(connection, "sock", None)
+                if sock is not None:
+                    sock.settimeout(read_timeout)
                 response = connection.getresponse()
                 payload = response.read()
             except ExternalAccessBlocked:
@@ -314,7 +346,7 @@ class OrionHTTPFetcher:
         assert response is not None
         status = response.status
         if status < 200 or status >= 400:
-            raise LiveFetchError(f"http_status:{status}")
+            raise LiveFetchError("http_status", status_code=status)
         content_type = str(response.getheader("content-type", ""))
         if "text/html" not in content_type and "text/plain" not in content_type:
             raise LiveFetchError("response_not_html_or_text")
@@ -345,12 +377,47 @@ class OrionHTTPFetcher:
 
 
 class _RecordingJudge:
-    def __init__(self, delegate: JudgeRole) -> None:
+    def __init__(
+        self,
+        delegate: JudgeRole,
+        observer: Callable[[Mapping[str, Any]], None] | None = None,
+        model: str = "",
+    ) -> None:
         self.delegate = delegate
         self.outcome: JudgeOutcome | None = None
+        self.observer = observer
+        self.model = model
 
     def choose(self, **kwargs) -> JudgeOutcome:
-        self.outcome = self.delegate.choose(**kwargs)
+        if self.observer is not None:
+            self.observer({
+                "stage": "juez", "model": self.model,
+                "provider": "gemini_policy", "status": "start",
+            })
+        try:
+            self.outcome = self.delegate.choose(**kwargs)
+        except BaseException as exc:
+            if self.observer is not None:
+                self.observer({
+                    "stage": "juez", "model": self.model,
+                    "provider": "gemini_policy", "status": "error",
+                    "error_class": classify_error(exc).category.value,
+                    "error_message": type(exc).__name__,
+                })
+            raise
+        if self.observer is not None:
+            status = "error" if self.outcome.decision is None else "ok"
+            event = {
+                "stage": "juez", "model": self.model,
+                "provider": "gemini_policy", "status": status,
+            }
+            if status == "error":
+                original = self.outcome.original_exception
+                event["error_class"] = classify_error(
+                    original or SemanticModelError()
+                ).category.value
+                event["error_message"] = type(original).__name__ if original else "judge_unresolved"
+            self.observer(event)
         return self.outcome
 
 
@@ -420,6 +487,9 @@ class LiveABCAdapter:
         prosecutor: ProsecutorRole,
         judge: JudgeRole,
         timeout_seconds: float = 15.0,
+        observer: Callable[[Mapping[str, Any]], None] | None = None,
+        stage_transports: Mapping[str, PolicyTransport] | None = None,
+        telemetry: ModelPolicyTelemetry | None = None,
     ) -> None:
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
             raise LiveABCConfigurationError("timeout_seconds_must_be_positive")
@@ -429,7 +499,26 @@ class LiveABCAdapter:
         self.prosecutor = prosecutor
         self.judge = judge
         self.timeout_seconds = float(timeout_seconds)
+        self.observer = observer
+        self.stage_transports = dict(stage_transports or {})
+        self.telemetry = telemetry
         self._outcomes: dict[tuple[str, str], LiveABCOutcome] = {}
+
+    def set_observer(
+        self, observer: Callable[[Mapping[str, Any]], None] | None
+    ) -> None:
+        self.observer = observer
+        if self.telemetry is not None:
+            self.telemetry.set_observer(observer)
+
+    def _emit(self, **event: Any) -> None:
+        if self.observer is not None:
+            self.observer(dict(event))
+
+    def _bind_stage(self, stage: str, municipio: str, bucket: str) -> None:
+        transport = self.stage_transports.get(stage)
+        if transport is not None:
+            transport.set_unit(municipio, bucket)
 
     @classmethod
     def from_free_environment(
@@ -472,6 +561,75 @@ class LiveABCAdapter:
             prosecutor=prosecutor,
             judge=judge,
             timeout_seconds=timeout_seconds,
+        )
+
+    @classmethod
+    def from_model_policy_environment(
+        cls,
+        *,
+        fetcher: OrionFetcher,
+        target_urls: Mapping[tuple[str, str], str],
+        environ: Mapping[str, str],
+        limiter=None,
+        sdk_client_factory=None,
+        timeout_seconds: float = 30.0,
+        gemini_timeout: float = 60.0,
+        isolate_model_calls: bool = True,
+    ) -> "LiveABCAdapter":
+        free_key = environ.get("GEMINI_API_KEY_FREE")
+        paid_key = environ.get("GEMINI_API_KEY")
+        if not isinstance(free_key, str) or not free_key.strip():
+            raise LiveABCConfigurationError("free_model_credential_missing")
+        if not isinstance(paid_key, str) or not paid_key.strip():
+            raise LiveABCConfigurationError("paid_fallback_credential_missing")
+        models = RoleModels()
+        telemetry = ModelPolicyTelemetry()
+        free_transport = RealGeminiTransport(
+            free_key,
+            client_factory=sdk_client_factory,
+            timeout_seconds=gemini_timeout,
+        )
+        paid_transport = RealGeminiTransport(
+            paid_key,
+            client_factory=sdk_client_factory,
+            timeout_seconds=gemini_timeout,
+        )
+        stage_models = {
+            "A": models.certifier_model,
+            "B": models.prosecutor_model,
+            "juez": models.judge_model,
+        }
+        policies = {
+            stage: PolicyTransport(
+                free_transport=free_transport,
+                paid_transport=paid_transport,
+                model=model,
+                stage=stage,
+                telemetry=telemetry,
+                timeout_seconds=gemini_timeout,
+                isolate_calls=isolate_model_calls,
+            )
+            for stage, model in stage_models.items()
+        }
+        shared_limiter = limiter or get_shared_limiter()
+        certifier = build_certifier_agent(
+            transport=policies["A"], limiter=shared_limiter, models=models
+        )
+        prosecutor = build_prosecutor_agent(
+            transport=policies["B"], limiter=shared_limiter, models=models
+        )
+        judge_client = build_judge_client(
+            transport=policies["juez"], limiter=shared_limiter, models=models
+        )
+        return cls(
+            fetcher=fetcher,
+            target_urls=target_urls,
+            certifier=certifier,
+            prosecutor=prosecutor,
+            judge=build_conflict_judge(client=judge_client),
+            timeout_seconds=timeout_seconds,
+            stage_transports=policies,
+            telemetry=telemetry,
         )
 
     @staticmethod
@@ -582,9 +740,16 @@ class LiveABCAdapter:
             )
             self._outcomes[unit] = outcome
             return outcome
+        self._emit(stage="fetch", model="", provider="orion_http", status="start")
         try:
             fetched = self.fetcher.fetch(url, timeout_seconds=self.timeout_seconds)
         except (ExternalAccessBlocked, TimeoutError) as exc:
+            classified = classify_error(exc)
+            self._emit(
+                stage="fetch", model="", provider="orion_http", status="error",
+                error_class=classified.category.value,
+                error_message=type(exc).__name__,
+            )
             outcome = self._failure(
                 municipio,
                 bucket,
@@ -596,6 +761,12 @@ class LiveABCAdapter:
             self._outcomes[unit] = outcome
             return outcome
         except Exception as exc:
+            classified = classify_error(exc)
+            self._emit(
+                stage="fetch", model="", provider="orion_http", status="error",
+                error_class=classified.category.value,
+                error_message=type(exc).__name__,
+            )
             outcome = self._failure(
                 municipio,
                 bucket,
@@ -606,6 +777,7 @@ class LiveABCAdapter:
             )
             self._outcomes[unit] = outcome
             return outcome
+        self._emit(stage="fetch", model="", provider="orion_http", status="ok")
 
         try:
             snapshot, candidate_snapshot = self._snapshots(fetched)
@@ -633,6 +805,12 @@ class LiveABCAdapter:
             self._outcomes[unit] = outcome
             return outcome
 
+        models = RoleModels()
+        self._bind_stage("A", municipio, bucket)
+        self._emit(
+            stage="A", model=models.certifier_model,
+            provider="gemini_policy", status="start",
+        )
         try:
             certified = _role_output(
                 self.certifier.certify(
@@ -641,6 +819,35 @@ class LiveABCAdapter:
                 ),
                 "certifier",
             )
+            proposal_a = ABCOrchestrator._proposal_from_certifier(
+                certified, (candidate,)
+            )
+            proposal_a_layer = _proposal_layer(proposal_a)
+        except Exception as exc:
+            classified = classify_error(exc)
+            self._emit(
+                stage="A", model=models.certifier_model,
+                provider="gemini_policy", status="error",
+                error_class=classified.category.value,
+                error_message=type(exc).__name__,
+            )
+            outcome = self._failure(
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE, code=type(exc).__name__,
+                error=exc, phase="A",
+            )
+            self._outcomes[unit] = outcome
+            return outcome
+        self._emit(
+            stage="A", model=models.certifier_model,
+            provider="gemini_policy", status="ok",
+        )
+
+        self._bind_stage("B", municipio, bucket)
+        self._emit(
+            stage="B", model=models.prosecutor_model,
+            provider="gemini_policy", status="start",
+        )
+        try:
             prosecuted = _role_output(
                 self.prosecutor.audit(
                     snapshot=snapshot,
@@ -648,46 +855,33 @@ class LiveABCAdapter:
                 ),
                 "prosecutor",
             )
-            proposal_a = ABCOrchestrator._proposal_from_certifier(
-                certified, (candidate,)
-            )
             proposal_b = ABCOrchestrator._proposal_from_prosecutor(
                 prosecuted, proposal_a
             )
-            proposal_a_layer = _proposal_layer(proposal_a)
             proposal_b_layer = _proposal_layer(proposal_b)
-        except (
-            ValidationError,
-            ModelResponseValidationError,
-            ProposalValidationError,
-            AgentError,
-            GeminiClientError,
-            TimeoutError,
-            RuntimeError,
-        ) as exc:
-            outcome = self._failure(
-                municipio,
-                bucket,
-                kind=LiveCauseKind.MODEL_FAILURE,
-                code=type(exc).__name__,
-                error=exc,
-                phase="model_response",
-            )
-            self._outcomes[unit] = outcome
-            return outcome
         except Exception as exc:
+            classified = classify_error(exc)
+            self._emit(
+                stage="B", model=models.prosecutor_model,
+                provider="gemini_policy", status="error",
+                error_class=classified.category.value,
+                error_message=type(exc).__name__,
+            )
             outcome = self._failure(
-                municipio,
-                bucket,
-                kind=LiveCauseKind.INTERNAL_FAILURE,
-                code=type(exc).__name__,
-                error=exc,
-                phase="abc_internal",
+                municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE, code=type(exc).__name__,
+                error=exc, phase="B",
             )
             self._outcomes[unit] = outcome
             return outcome
+        self._emit(
+            stage="B", model=models.prosecutor_model,
+            provider="gemini_policy", status="ok",
+        )
 
-        recording_judge = _RecordingJudge(self.judge)
+        self._bind_stage("juez", municipio, bucket)
+        recording_judge = _RecordingJudge(
+            self.judge, observer=self.observer, model=models.judge_model
+        )
         try:
             result = ABCOrchestrator(judge=recording_judge).resolve(
                 snapshot=snapshot,
@@ -708,6 +902,10 @@ class LiveABCAdapter:
             return outcome
         judge_outcome = recording_judge.outcome
         if judge_outcome is None:
+            self._emit(
+                stage="juez", model=models.judge_model,
+                provider="gemini_policy", status="skipped",
+            )
             judge_response: Mapping[str, Any] = {
                 "decision": "revisar",
                 "reason": "not_invoked_consensus",

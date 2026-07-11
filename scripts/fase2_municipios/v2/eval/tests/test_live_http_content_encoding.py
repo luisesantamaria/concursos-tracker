@@ -224,7 +224,7 @@ def test_gentle_free_environment_preserves_network_and_locale_without_reading_pa
     }
 
 
-def test_turnkey_cli_removes_only_paid_credentials_from_real_child_environment(
+def test_turnkey_cli_loads_only_explicit_credential_file_without_adc_environment(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.setenv("GEMINI_API_KEY_FREE", "free-fixture")
@@ -233,6 +233,13 @@ def test_turnkey_cli_removes_only_paid_credentials_from_real_child_environment(
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid")
     monkeypatch.setenv("SSL_CERT_FILE", "/fixture/ca.pem")
     staging = tmp_path / "staging"
+    credentials = tmp_path / "gemini.env"
+    credentials.write_text(
+        "GEMINI_API_KEY_FREE=file-free\n"
+        "IGNORED_SECRET=ignored\n"
+        "GEMINI_API_KEY=file-paid\n",
+        encoding="utf-8",
+    )
 
     code = golden_live_main(
         [
@@ -243,13 +250,16 @@ def test_turnkey_cli_removes_only_paid_credentials_from_real_child_environment(
             "--url-map", str(tmp_path / "missing-map.csv"),
             "--v1-corpus-dir", str(tmp_path / "missing-v1"),
             "--output-dir", str(staging / "run"),
+            "--credentials-file", str(credentials),
         ],
         staging_root=staging,
     )
 
     assert code == 2
-    assert "GEMINI_API_KEY" not in os.environ
-    assert "VERTEX_TOKEN" not in os.environ
+    # Ambient credentials are neither selected nor rewritten; the runner's
+    # credential mapping comes solely from the explicit two-name file parser.
+    assert os.environ["GEMINI_API_KEY"] == "paid-fixture"
+    assert os.environ["VERTEX_TOKEN"] == "vertex-fixture"
     assert os.environ["GEMINI_API_KEY_FREE"] == "free-fixture"
     assert os.environ["HTTPS_PROXY"] == "http://proxy.invalid"
     assert os.environ["SSL_CERT_FILE"] == "/fixture/ca.pem"

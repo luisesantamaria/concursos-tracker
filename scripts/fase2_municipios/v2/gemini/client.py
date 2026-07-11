@@ -194,16 +194,38 @@ class RealGeminiTransport:
     V2 factory applies credential policy before constructing this adapter.
     """
 
-    def __init__(self, api_key: str, *, client_factory=None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        client_factory=None,
+        timeout_seconds: float | None = None,
+    ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise MissingFreeApiKeyError()
+        if timeout_seconds is not None and (
+            not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0
+        ):
+            raise TransportConfigurationError("Gemini timeout must be positive")
+        http_options = None
         if client_factory is None:
             try:
                 from google import genai  # type: ignore[import-not-found]
+                from google.genai import types  # type: ignore[import-not-found]
             except ImportError as exc:
                 raise TransportConfigurationError("Gemini SDK is not installed") from exc
             client_factory = genai.Client
-        self._client = client_factory(api_key=api_key, vertexai=False)
+            if timeout_seconds is not None:
+                # google-genai HttpOptions.timeout is a native transport deadline
+                # in milliseconds; it bounds connect and response read in the SDK.
+                http_options = types.HttpOptions(timeout=int(timeout_seconds * 1000))
+        elif timeout_seconds is not None:
+            # Injection seam for offline SDK fakes without importing SDK types.
+            http_options = {"timeout": int(timeout_seconds * 1000)}
+        kwargs = {"api_key": api_key, "vertexai": False}
+        if http_options is not None:
+            kwargs["http_options"] = http_options
+        self._client = client_factory(**kwargs)
 
     def generate(self, model: str, contents: Any, config: Mapping[str, Any]) -> RawResponse:
         response = self._client.models.generate_content(

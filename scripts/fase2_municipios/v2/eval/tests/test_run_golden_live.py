@@ -310,6 +310,10 @@ def test_turnkey_complete_run_writes_cassette_differential_and_flips_only_to_sta
     assert {item.name for item in fixture_run.output_dir.iterdir()} == {
         *FINAL_FILENAMES,
         AUDIT_FILENAME,
+        "events.jsonl",
+        "progress.csv",
+        "checkpoint.json",
+        "snapshots",
     }
     cassette = json.loads(
         (fixture_run.output_dir / FINAL_FILENAMES[0]).read_text(encoding="utf-8")
