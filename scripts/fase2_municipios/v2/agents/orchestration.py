@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Protocol
 
 from scripts.fase2_municipios import cascade_municipios as cascade
 from scripts.fase2_municipios.v2.agents.certifier import (
@@ -105,6 +106,30 @@ class OrchestrationResult:
     final_decision: cascade.FinalDecision
     reason_code: str
     judge_invoked: bool
+    capture_report: Any | None = None
+
+
+@dataclass(frozen=True)
+class CaptureBoundaryReport:
+    captured: bool
+    error_code: str | None = None
+
+
+class CaptureSink(Protocol):
+    """Write-only hook pre-bound to one already-structured learning candidate."""
+
+    def capture(self) -> Any: ...
+
+
+def _serialize_final_decision(final: cascade.FinalDecision) -> bytes:
+    """Materialize a stable decision payload before any optional side effect."""
+    return json.dumps(
+        asdict(final),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 class _FinalGateFailure(ValueError):
@@ -164,6 +189,7 @@ class ABCOrchestrator:
         task: str,
         certifier: Any,
         prosecutor: Any,
+        capture_sink: CaptureSink | None = None,
     ) -> OrchestrationResult:
         """Execute A then B; C remains conditional inside ``resolve``."""
         candidate_tuple = tuple(candidates)
@@ -179,6 +205,7 @@ class ABCOrchestrator:
             candidates=candidate_tuple,
             proposal_a=proposal_a,
             proposal_b=proposal_b,
+            capture_sink=capture_sink,
         )
 
     @staticmethod
@@ -245,6 +272,33 @@ class ABCOrchestrator:
         return final
 
     def resolve(
+        self,
+        *,
+        snapshot: EvidenceSnapshot,
+        candidates: Iterable[cascade.CandidateRecord],
+        proposal_a: Mapping[str, Any],
+        proposal_b: Mapping[str, Any],
+        capture_sink: CaptureSink | None = None,
+    ) -> OrchestrationResult:
+        result = self._resolve_without_capture(
+            snapshot=snapshot,
+            candidates=candidates,
+            proposal_a=proposal_a,
+            proposal_b=proposal_b,
+        )
+        if capture_sink is None:
+            return result
+        try:
+            _serialize_final_decision(result.final_decision)
+            report = capture_sink.capture()
+        except (OSError, TypeError, ValueError, UnicodeError):
+            report = CaptureBoundaryReport(
+                captured=False,
+                error_code="capture_error",
+            )
+        return replace(result, capture_report=report)
+
+    def _resolve_without_capture(
         self,
         *,
         snapshot: EvidenceSnapshot,

@@ -155,6 +155,17 @@ scripts/fase2_municipios/v2/
 │   └── tests/
 │       ├── test_agents.py
 │       └── test_orchestration.py
+├── memory/
+│   ├── __init__.py
+│   ├── _jsonl.py
+│   ├── models.py
+│   ├── store.py
+│   ├── capture.py
+│   ├── audit.py
+│   ├── promotion.py
+│   ├── audit_cli.py
+│   └── tests/
+│       └── test_memory.py
 ├── ratelimit/
 │   ├── __init__.py
 │   ├── limiter.py
@@ -170,12 +181,9 @@ scripts/fase2_municipios/v2/
 ```
 
 El rate limiter se implementó en ronda 2, el cliente Gemini free-only en ronda 3,
-el snapshot en ronda 4, el framework/certificador/fiscal en ronda 5 y el juez
-cerrado con orquestación A/B/C en ronda 6. Permanece futuro:
-
-```text
-v2/memory/{store,promotion}.py
-```
+el snapshot en ronda 4, el framework/certificador/fiscal en ronda 5, el juez
+cerrado con orquestación A/B/C en ronda 6 y el staging externo append-only en
+ronda 7.
 
 ## Contratos de interfaz de alto nivel
 
@@ -248,10 +256,14 @@ class ConflictJudge:
         prosecution: ProsecutionVerdict,
     ) -> JudgeVerdict: ...
 
-class VersionedExternalMemory:
-    def retrieve(self, query: MemoryQuery, *, version: str) -> tuple[MemoryCase, ...]: ...
-    def stage(self, proposal: LearningProposal) -> StagedLearning: ...
-    def promote(self, staged_id: str, validation: PromotionValidation) -> MemoryVersion: ...
+class CaptureSink:
+    def capture(self) -> CaptureReport: ...  # write-only, candidate pre-bound
+
+# Solo módulo/CLI humano separado; el pipeline no importa estas interfaces.
+def read_learning_events(path: Path) -> tuple[LearningEvent, ...]: ...
+def append_promotion_event(
+    path: Path, *, learning_id: str, actor: str, promoted_at: datetime,
+) -> PromotionEvent: ...
 ```
 
 ## Rate limiter (implementado ronda 2)
@@ -514,6 +526,60 @@ Timeout, cancelación, cuota y errores tipados del cliente, además de respuesta
 vacía/malformada o serialización inválida, se convierten en `judge_error` en el
 adaptador. No existe un `except` general que oculte errores internos.
 
+## Memoria externa append-only sin influencia (ronda 7)
+
+La escritura vive en `v2/memory/store.py`; el pipeline solo conoce el protocolo
+local `CaptureSink` write-only de `agents/orchestration.py`. El sink se construye
+fuera del pipeline con un `LearningCandidate` ya estructurado. No genera texto,
+no consulta modelos, red, entorno, ADC, skills ni memoria previa. Auditoría
+(`memory/audit.py`) y promoción (`memory/promotion.py`, `memory/audit_cli.py`)
+son módulos separados que `agents/orchestration.py` no importa.
+
+El log runtime es `staging/fase2_v2/memory/learnings.jsonl`. Cada evento schema
+1 contiene `id`, `schema_version`, `created_at`, `source_case={municipio,
+snapshot_ref}`, `observation`, `proposed_generalization` y `status="staged"`.
+`created_at` es un `datetime` timezone-aware inyectado; no se consulta reloj
+real. El ID es SHA-256 del JSON UTF-8 canónico de source_case, observation,
+generalización y schema_version; el timestamp queda fuera. Capturas idénticas
+se anexan como líneas separadas con el mismo ID. La auditoría puede colapsarlas
+por ID y reportar `occurrences`, sin deduplicar en escritura.
+
+Los textos no confiables exigen tipo string, se acotan (municipio/actor 200,
+snapshot ref 256 y textos 4.000 caracteres) y todo carácter Unicode de control
+se representa como secuencia visible `\\uXXXX`. Se serializa JSON estricto con
+`allow_nan=false`. Esos valores nunca forman rutas, filenames ni prompts; el
+path del store se configura por separado.
+
+`ABCOrchestrator.resolve()` termina primero el gate y materializa una
+`FinalDecision`; si hay sink, `_serialize_final_decision()` produce su JSON
+canónico antes de `capture()`. Errores concretos de I/O, validación o JSON se
+devuelven en `capture_report` como `capture_error`; la `FinalDecision` ya creada
+no cambia ni se reemplaza. Tests con spy demuestran que ningún método lector se
+invoca durante decisiones con o sin staging estacionado.
+
+Cada append abre un archivo `.lock`, toma `flock` exclusivo y ejecuta un único
+`os.write` con una línea JSON completa más newline, seguido de `fsync`. El lector
+rechaza cualquier línea completa corrupta, pero ignora una única última línea
+sin newline como resto truncado de una caída. Futuras versiones agregan eventos
+con otro `schema_version`; nunca migran reescribiendo historia.
+
+Promover no cambia el evento staged. La acción humana explícita agrega un evento
+nuevo a `staging/fase2_v2/memory/promotion_events.jsonl` con `learning_id`,
+`promoted_at` timezone-aware inyectado, `actor`, `schema_version` y
+`event="promoted"`. El único entrypoint es el CLI separado:
+
+```bash
+python -m scripts.fase2_municipios.v2.memory.audit_cli audit \
+  --learnings staging/fase2_v2/memory/learnings.jsonl
+python -m scripts.fase2_municipios.v2.memory.audit_cli promote \
+  --learnings staging/fase2_v2/memory/learnings.jsonl \
+  --promotions staging/fase2_v2/memory/promotion_events.jsonl \
+  --learning-id <sha256> --actor <humano> --promoted-at <ISO-8601-con-zona>
+```
+
+Ambos JSONL y sus locks están ignorados por Git. No existe API de promoción en
+certificador, fiscal, juez, gate u orquestador.
+
 ## Invariantes de seguridad
 
 - Free-only: V2 usa únicamente la credencial gratuita explícita. Está prohibido
@@ -536,8 +602,8 @@ adaptador. No existe un `except` general que oculte errores internos.
   cola/espera justa, reconciliación de tokens y cero fallback.
 - Logging estructurado con IDs/hashes, nunca secretos, keys, headers sensibles o
   cuerpos crudos que puedan contenerlos; errores de proveedor se redactan.
-- Memoria externa versionada: toda lección entra a staging y solo se promueve
-  después de validación humana/evidencia y evaluación sin regresiones/FP.
+- Memoria externa versionada: toda lección entra como evento staged append-only;
+  promoción es otro evento escrito solo por el CLI humano separado.
 
 ## Diferencial vs V1
 
@@ -549,14 +615,14 @@ importa ni altera el estado mutable, CLI o salida canónica de V1.
 
 ## Outputs de staging separados
 
-Las rondas futuras escribirán solo bajo rutas nuevas, por ejemplo:
+Los outputs runtime escriben solo bajo rutas nuevas, por ejemplo:
 
 ```text
 staging/fase2_v2/runs/<run_id>/snapshots/
 staging/fase2_v2/runs/<run_id>/verdicts/
 staging/fase2_v2/runs/<run_id>/audit.jsonl
-staging/fase2_v2/memory/staged/
-staging/fase2_v2/memory/versions/
+staging/fase2_v2/memory/learnings.jsonl
+staging/fase2_v2/memory/promotion_events.jsonl
 ```
 
 No se escribirá `data/fase2/municipios_rs.csv`, `data/cascade_output.csv`, ningún
@@ -575,8 +641,8 @@ autorización explícitas.
   cubre solo la salida del certificador.
 - Fijar máximos del tool loop y estrategia exacta de conteo/reconciliación de
   tokens después de medir prompts reales.
-- Definir backend, retención, formato de versión y autoridad de promoción de la
-  memoria externa.
+- Definir retención y autoridad organizacional de promoción; formato, versión y
+  frontera humana ya están fijados por los eventos append-only de ronda 7.
 - Decidir si `EvidenceSnapshot` conserva HTML completo fuera del objeto principal
   mediante content-addressed storage y cuáles son las reglas de redacción.
 - Resolver la divergencia Python local 3.14.4 versus objetivo 3.12 antes de una
