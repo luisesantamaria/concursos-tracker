@@ -38,7 +38,9 @@ For action=final provide output, and omit tool and args.
 Available local tools: list_sources(), get_source(source_id,start,length),
 find(source_id,needle). Tool observations are JSON and raw offsets are exact.
 Never invent evidence. A final answer is accepted only after local schema and
-citation verification."""
+citation verification. Every citation must declare the EvidenceSnapshot
+source_id. You may provide exact Python str start/end offsets; if omitted,
+Python will accept only one unique literal quote occurrence in that source."""
 
 
 class AgentError(RuntimeError):
@@ -92,6 +94,7 @@ class AgentRunResult:
 CitationExtractor = Callable[[Mapping[str, Any]], tuple[Citation, ...]]
 CitationRequirement = Callable[[Mapping[str, Any]], bool]
 OutputInvariant = Callable[[Mapping[str, Any]], None]
+OutputPreparer = Callable[[EvidenceSnapshot, Mapping[str, Any]], Mapping[str, Any]]
 
 
 def skill_markdown_body(content: str) -> str:
@@ -117,6 +120,7 @@ class AgentRunner:
         output_schema: Mapping[str, Any],
         extract_citations: CitationExtractor,
         requires_citations: CitationRequirement,
+        prepare_output: OutputPreparer | None = None,
         output_invariant: OutputInvariant | None = None,
         max_steps: int = 8,
         max_tool_calls: int = 6,
@@ -136,6 +140,7 @@ class AgentRunner:
         self.output_schema = output_schema
         self.extract_citations = extract_citations
         self.requires_citations = requires_citations
+        self.prepare_output = prepare_output or (lambda _snapshot, output: output)
         self.output_invariant = output_invariant
         self.max_steps = max_steps
         self.max_tool_calls = max_tool_calls
@@ -176,7 +181,34 @@ class AgentRunner:
 
     def _validate_final(
         self, snapshot: EvidenceSnapshot, output: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        try:
+            validate_json_schema(output, self.output_schema)
+        except JsonSchemaValidationError as exc:
+            raise AgentOutputRejected(
+                role=self.role, reason=f"role_schema:{exc.rule}@{exc.path}"
+            ) from exc
+        except UnsupportedJsonSchemaError as exc:
+            raise AgentOutputRejected(
+                role=self.role, reason=f"unsupported_role_schema:{exc.keyword}@{exc.path}"
+            ) from exc
+        try:
+            prepared = self.prepare_output(snapshot, output)
+        except CitationVerificationError as exc:
+            raise AgentOutputRejected(
+                role=self.role, reason="citation_verification_failed:1"
+            ) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AgentOutputRejected(
+                role=self.role, reason=f"citation_format:{type(exc).__name__}"
+            ) from exc
+        self._validate_for_consumption(snapshot, prepared)
+        return prepared
+
+    def _validate_for_consumption(
+        self, snapshot: EvidenceSnapshot, output: Mapping[str, Any]
     ) -> None:
+        """Revalidate hydrated output at the consume/persist boundary."""
         try:
             validate_json_schema(output, self.output_schema)
         except JsonSchemaValidationError as exc:
@@ -232,8 +264,9 @@ class AgentRunner:
             )
             if step.action == "final":
                 assert step.output is not None
-                self._validate_final(snapshot, step.output)
-                decision = step.output.get("decision", step.output.get("result", "unknown"))
+                parsed_output = self._validate_final(snapshot, step.output)
+                self._validate_for_consumption(snapshot, parsed_output)
+                decision = parsed_output.get("decision", parsed_output.get("result", "unknown"))
                 LOGGER.info(
                     "agent_final",
                     extra={
@@ -246,7 +279,7 @@ class AgentRunner:
                 )
                 return AgentRunResult(
                     role=self.role,
-                    output=step.output,
+                    output=parsed_output,
                     steps=step_number,
                     tool_calls=tool_calls,
                 )

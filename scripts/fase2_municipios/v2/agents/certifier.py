@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,11 @@ from scripts.fase2_municipios.v2.gemini import (
     Transport,
 )
 from scripts.fase2_municipios.v2.loader import load_canonical_resources
-from scripts.fase2_municipios.v2.snapshot import Citation, EvidenceSnapshot
+from scripts.fase2_municipios.v2.snapshot import (
+    Citation,
+    EvidenceSnapshot,
+    anchor_citation,
+)
 
 
 AFFIRMATIVE_CERTIFIER_DECISIONS = frozenset({
@@ -33,12 +38,26 @@ REQUIRED_CONFIRMATION_CITATION_DIMENSIONS = frozenset({
 
 
 def _certifier_citations(output: Mapping[str, Any]) -> tuple[Citation, ...]:
-    # Canonical Fase2CertifierOutput has source_field+quote, not offsets. The
-    # canonical skill/schema wins: source_field maps directly to snapshot source_id.
     return tuple(
-        Citation(source_id=item["source_field"], quote=item["quote"])
+        Citation(
+            source_id=item["source_id"],
+            start=item["start"],
+            end=item["end"],
+            quote=item["quote"],
+        )
         for item in output["citations"]
     )
+
+
+def _prepare_certifier_output(
+    snapshot: EvidenceSnapshot, output: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    prepared = copy.deepcopy(dict(output))
+    for item in prepared["citations"]:
+        citation = anchor_citation(snapshot, item)
+        item["start"] = citation.start
+        item["end"] = citation.end
+    return prepared
 
 
 def _certifier_invariants(output: Mapping[str, Any]) -> None:
@@ -101,6 +120,7 @@ def build_certifier_agent(
         client=client,
         output_schema=resources.references["schema.json"],
         extract_citations=_certifier_citations,
+        prepare_output=_prepare_certifier_output,
         requires_citations=lambda output: output.get("decision")
         in AFFIRMATIVE_CERTIFIER_DECISIONS,
         output_invariant=_certifier_invariants,

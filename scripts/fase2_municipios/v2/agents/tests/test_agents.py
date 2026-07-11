@@ -125,21 +125,25 @@ def certifier_output(*, quote: str = "Official index", citations: bool = True, d
                 "dimension": "identity",
                 "quote": "Official index",
                 "source_field": "main_content",
+                "source_id": "main_content",
             },
             {
                 "dimension": "page_role",
                 "quote": quote,
                 "source_field": "main_content",
+                "source_id": "main_content",
             },
             {
                 "dimension": "bucket",
                 "quote": "Concursos Públicos",
                 "source_field": "title",
+                "source_id": "title",
             },
             {
                 "dimension": "stability",
                 "quote": "Buscar",
                 "source_field": "main_content",
+                "source_id": "main_content",
             },
         ] if citations else []),
         "reason": "fixture decision",
@@ -333,7 +337,7 @@ def test_get_source_cap_returns_valid_json_metadata_and_raw_citable_offsets() ->
     raw_quote = observation["content"]
     verify_citation(
         snapshot,
-        Citation("main_content", raw_quote, start=0, end=len(raw_quote)),
+        Citation("main_content", 0, len(raw_quote), raw_quote),
     )
 
 
@@ -379,3 +383,71 @@ def test_prosecutor_requests_are_separate_and_contain_only_authorized_inputs() -
         assert certified.output["candidate_id"] in rendered
         assert not _contains_forbidden_config_key(request["config"])
     assert len(cert_transport.requests) == 2
+
+
+def test_certifier_and_prosecutor_happy_citations_are_hydrated_and_anchored() -> None:
+    snapshot = snapshot_with_marker()
+    certifier, _transport, _clock = make_certifier([
+        {"action": "final", "output": certifier_output()},
+    ])
+    certified = certifier.certify(snapshot=snapshot, task="Certify.")
+    assert all(
+        set(("source_id", "start", "end", "quote")) <= set(citation)
+        for citation in certified.output["citations"]
+    )
+
+    fiscal_output = prosecutor_output()
+    fiscal_output["citations"] = [
+        {"source_id": "main_content", "quote": "Official index", "extra": "ignored"}
+    ]
+    transport = FakeTransport([{"action": "final", "output": fiscal_output}])
+    limiter, _clock = limiter_with_fake_clock()
+    prosecutor = build_prosecutor_agent(
+        transport=transport, limiter=limiter, repo_root=REPO_ROOT
+    )
+    prosecuted = prosecutor.audit(snapshot=snapshot, certifier_output=certified.output)
+    assert prosecuted.output["citations"][0]["start"] == 0
+    assert prosecuted.output["citations"][0]["end"] == len("Official index")
+    assert prosecuted.output["citations"][0]["extra"] == "ignored"
+
+
+def test_citations_are_verified_at_parse_and_preconsumption_gates(monkeypatch) -> None:
+    from scripts.fase2_municipios.v2.agents import base
+
+    calls = []
+    real_verify_all = base.verify_all
+
+    def recording_verify_all(snapshot, citations):
+        calls.append(tuple(citations))
+        return real_verify_all(snapshot, citations)
+
+    monkeypatch.setattr(base, "verify_all", recording_verify_all)
+    agent, _transport, _clock = make_certifier([
+        {"action": "final", "output": certifier_output()},
+    ])
+    result = agent.certify(snapshot=snapshot_with_marker(), task="Certify.")
+
+    assert result.output["citations"][0]["start"] == 0
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
+def test_prosecutor_citation_cannot_anchor_to_certifier_output() -> None:
+    snapshot = snapshot_with_marker()
+    certifier, _transport, _clock = make_certifier([
+        {"action": "final", "output": certifier_output()},
+    ])
+    certified = certifier.certify(snapshot=snapshot, task="Certify.")
+    fiscal_output = prosecutor_output()
+    fiscal_output["citations"] = [
+        {"source_id": "main_content", "quote": certified.output["reason"]}
+    ]
+    transport = FakeTransport([{"action": "final", "output": fiscal_output}])
+    limiter, _clock = limiter_with_fake_clock()
+    prosecutor = build_prosecutor_agent(
+        transport=transport, limiter=limiter, repo_root=REPO_ROOT
+    )
+
+    with pytest.raises(AgentOutputRejected) as raised:
+        prosecutor.audit(snapshot=snapshot, certifier_output=certified.output)
+    assert raised.value.reason.startswith("citation_verification_failed")

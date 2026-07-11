@@ -20,8 +20,7 @@ AGENT_STEP_SCHEMA = {
 
 OFFSET_CITATION_SCHEMA = {
     "type": "object",
-    "additionalProperties": False,
-    "required": ["source_id", "start", "end", "quote"],
+    "required": ["source_id", "quote"],
     "properties": {
         "source_id": {"type": "string", "minLength": 1},
         "start": {"type": "integer"},

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from scripts.fase2_municipios.v2.snapshot import (
+    anchor_citation,
     Citation,
     CitationBatchVerificationError,
     CitationVerificationError,
@@ -68,16 +69,17 @@ def test_duplicate_source_id_is_rejected() -> None:
 def test_exact_textual_quote_passes_and_missing_quote_fails() -> None:
     snapshot = build_snapshot([source("page", "Concursos Públicos\n1 resultado")])
 
-    verify_citation(snapshot, Citation("page", "Concursos Públicos"))
+    citation = anchor_citation(snapshot, {"source_id": "page", "quote": "Concursos Públicos"})
+    verify_citation(snapshot, citation)
     with pytest.raises(CitationVerificationError) as raised:
-        verify_citation(snapshot, Citation("page", "concursos públicos"))
+        anchor_citation(snapshot, {"source_id": "page", "quote": "concursos públicos"})
     assert raised.value.reason == "quote_not_found"
 
 
 def test_unknown_source_is_fail_closed() -> None:
     snapshot = build_snapshot([source("known", "evidence")])
     with pytest.raises(CitationVerificationError) as raised:
-        verify_citation(snapshot, Citation("missing", "evidence"))
+        anchor_citation(snapshot, {"source_id": "missing", "quote": "evidence"})
     assert raised.value.reason == "source_not_found"
     assert raised.value.source_id == "missing"
 
@@ -88,11 +90,11 @@ def test_raw_offsets_must_match_quote_exactly() -> None:
     quote = "Concurso Público"
     start = content.index(quote)
 
-    verify_citation(snapshot, Citation("page", quote, start=start, end=start + len(quote)))
+    verify_citation(snapshot, Citation("page", start, start + len(quote), quote))
     with pytest.raises(CitationVerificationError) as raised:
         verify_citation(
             snapshot,
-            Citation("page", quote, start=start + 1, end=start + len(quote) + 1),
+            Citation("page", start + 1, start + len(quote) + 1, quote),
         )
     assert raised.value.reason == "offset_quote_mismatch"
 
@@ -101,9 +103,9 @@ def test_verify_all_identifies_bad_index_without_dumping_source_content() -> Non
     secret_tail = "SENSITIVE-SOURCE-CONTENT-" * 20
     snapshot = build_snapshot([source("page", f"good one\ngood two\n{secret_tail}")])
     citations = (
-        Citation("page", "good one"),
-        Citation("page", "missing quote that is intentionally short"),
-        Citation("page", "good two"),
+        Citation("page", 0, 8, "good one"),
+        Citation("page", 9, 64, "missing quote that is intentionally short"),
+        Citation("page", 9, 17, "good two"),
     )
 
     with pytest.raises(CitationBatchVerificationError) as raised:
@@ -119,17 +121,107 @@ def test_verify_all_identifies_bad_index_without_dumping_source_content() -> Non
 
 def test_injected_whitespace_normalizer_is_opt_in_and_offsets_remain_raw() -> None:
     snapshot = build_snapshot([source("page", "Alpha    Beta\nGamma")])
-    citation = Citation("page", "Alpha Beta")
+    citation = Citation("page", 0, len("Alpha Beta"), "Alpha Beta")
     collapse_spaces = lambda text: " ".join(text.split())
 
-    with pytest.raises(CitationVerificationError):
-        verify_citation(snapshot, citation)
-    verify_citation(snapshot, citation, normalizer=collapse_spaces)
-
+    with pytest.raises(TypeError):
+        verify_citation(snapshot, citation, normalizer=collapse_spaces)
     with pytest.raises(CitationVerificationError) as raised:
-        verify_citation(
+        verify_citation(snapshot, citation)
+    assert raised.value.reason == "quote_not_found"
+
+
+@pytest.mark.parametrize("missing", ["source_id", "start", "end", "quote"])
+def test_citation_contract_rejects_any_missing_required_field(missing: str) -> None:
+    snapshot = build_snapshot([source("main", "evidence")])
+    raw = {"source_id": "main", "start": 0, "end": 8, "quote": "evidence"}
+    raw.pop(missing)
+
+    with pytest.raises((CitationVerificationError, TypeError, KeyError)):
+        anchor_citation(snapshot, raw, require_offsets=True)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(-1, 1), (0, 9), (4, 3), (3, 3)],
+)
+def test_invalid_offset_ranges_are_rejected(start: int, end: int) -> None:
+    snapshot = build_snapshot([source("main", "evidence")])
+    with pytest.raises(CitationVerificationError):
+        anchor_citation(
             snapshot,
-            Citation("page", "Alpha Beta", start=0, end=len("Alpha Beta")),
-            normalizer=collapse_spaces,
+            {"source_id": "main", "start": start, "end": end, "quote": "evidence"},
+            require_offsets=True,
         )
-    assert raised.value.reason == "offset_quote_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(True, 1), (0, False), (0.0, 1), (0, 1.0), ("0", 1), (0, "1"), (None, 1), (0, None)],
+)
+def test_invalid_offset_types_are_rejected(start: object, end: object) -> None:
+    snapshot = build_snapshot([source("main", "evidence")])
+    with pytest.raises(CitationVerificationError):
+        anchor_citation(
+            snapshot,
+            {"source_id": "main", "start": start, "end": end, "quote": "e"},
+            require_offsets=True,
+        )
+
+
+def test_absent_or_empty_source_is_rejected_without_crashing() -> None:
+    snapshot = build_snapshot([source("empty", "")])
+    with pytest.raises(CitationVerificationError) as empty:
+        anchor_citation(snapshot, {"source_id": "empty", "quote": "x"})
+    assert empty.value.reason == "empty_source"
+    with pytest.raises(CitationVerificationError) as absent:
+        anchor_citation(snapshot, {"source_id": "absent", "quote": "x"})
+    assert absent.value.reason == "source_not_found"
+
+
+def test_unicode_offsets_are_python_str_character_indices() -> None:
+    text = "Ação pública — seleção"
+    snapshot = build_snapshot([source("main", text)])
+    quote = "pública — seleção"
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": quote})
+
+    assert citation.start == text.index(quote)
+    assert citation.end == citation.start + len(quote)
+    assert citation.end < len(text.encode("utf-8"))
+    verify_citation(snapshot, citation)
+
+
+def test_main_and_chrome_citations_are_distinct_even_with_same_quote() -> None:
+    snapshot = build_snapshot([
+        source("main", "Editais oficiais"),
+        source("chrome", "DOM: Editais oficiais"),
+    ])
+    main = anchor_citation(snapshot, {"source_id": "main", "quote": "Editais oficiais"})
+    chrome = anchor_citation(snapshot, {"source_id": "chrome", "quote": "Editais oficiais"})
+
+    assert main.source_id == "main" and main.start == 0
+    assert chrome.source_id == "chrome" and chrome.start == 5
+    with pytest.raises(CitationVerificationError):
+        anchor_citation(snapshot, {"quote": "Editais oficiais"})
+
+
+def test_repeated_quote_without_offsets_fails_closed_but_explicit_offsets_disambiguate() -> None:
+    snapshot = build_snapshot([source("main", "Edital / Edital")])
+    with pytest.raises(CitationVerificationError) as ambiguous:
+        anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
+    assert ambiguous.value.reason == "quote_ambiguous"
+
+    citation = anchor_citation(
+        snapshot,
+        {"source_id": "main", "start": 9, "end": 15, "quote": "Edital"},
+    )
+    verify_citation(snapshot, citation)
+
+
+def test_unknown_citation_fields_are_ignored() -> None:
+    snapshot = build_snapshot([source("main", "evidence")])
+    citation = anchor_citation(
+        snapshot,
+        {"source_id": "main", "quote": "evidence", "future_metadata": {"v": 2}},
+    )
+    assert citation == Citation("main", 0, 8, "evidence")

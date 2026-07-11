@@ -18,12 +18,14 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": false,
-        "required": ["dimension", "quote", "source_field"],
+        "required": ["dimension", "quote", "source_field", "source_id"],
         "properties": {
           "dimension": {"enum": ["authority", "identity", "page_role", "bucket", "stability", "rejection"]},
           "quote": {"type": "string", "minLength": 1},
-          "source_field": {"enum": ["title", "heading", "main_content", "event_row", "anchor", "provenance", "status"]}
+          "source_field": {"enum": ["title", "heading", "main_content", "event_row", "anchor", "provenance", "status"]},
+          "source_id": {"type": "string", "minLength": 1},
+          "start": {"type": "integer"},
+          "end": {"type": "integer"}
         }
       }
     },

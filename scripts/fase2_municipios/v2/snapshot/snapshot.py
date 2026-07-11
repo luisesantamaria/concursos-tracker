@@ -2,10 +2,9 @@
 
 This module accepts content already captured by a caller. It performs no fetch,
 file access, path resolution, symlink handling or clock lookup. Raw rendered text
-is retained byte-for-byte as a Python string and hashed explicitly as UTF-8.
-
-Citation matching is exact by default. An injected normalizer may relax matching
-for quote-only citations, but offsets always address and must match raw content.
+is retained unchanged as a Python ``str`` and hashed explicitly as UTF-8. The
+snapshot normalization is therefore identity; offsets are Python character
+indices over that same string, never byte offsets.
 Empty source content is allowed and receives the standard SHA-256 of ``b""``;
 it remains reproducible evidence but cannot support a non-empty citation.
 """
@@ -14,12 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 
 
-Normalizer = Callable[[str], str]
 QUOTE_PREVIEW_LIMIT = 48
 
 
@@ -148,6 +146,10 @@ class EvidenceSnapshot:
             reason="source_not_found",
         )
 
+    def normalized_text(self, source_id: str) -> str:
+        """Return the exact string used for citation character offsets."""
+        return self.get_source(source_id).content
+
 
 def build_snapshot(sources: Iterable[EvidenceSource]) -> EvidenceSnapshot:
     """Validate, detach, sort and hash already-provided evidence sources."""
@@ -177,9 +179,9 @@ def build_snapshot(sources: Iterable[EvidenceSource]) -> EvidenceSnapshot:
 @dataclass(frozen=True)
 class Citation:
     source_id: str
+    start: int
+    end: int
     quote: str
-    start: int | None = None
-    end: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_id, str) or not self.source_id.strip():
@@ -190,75 +192,112 @@ class Citation:
             raise CitationVerificationError(
                 source_id=self.source_id, reason="empty_quote"
             )
-        if (self.start is None) != (self.end is None):
+        if (
+            isinstance(self.start, bool)
+            or isinstance(self.end, bool)
+            or not isinstance(self.start, int)
+            or not isinstance(self.end, int)
+            or self.start < 0
+            or self.end <= self.start
+        ):
             raise CitationVerificationError(
                 source_id=self.source_id,
-                reason="incomplete_offsets",
+                reason="invalid_offsets",
                 quote=self.quote,
             )
-        if self.start is not None:
-            if (
-                isinstance(self.start, bool)
-                or isinstance(self.end, bool)
-                or not isinstance(self.start, int)
-                or not isinstance(self.end, int)
-                or self.start < 0
-                or self.end <= self.start
-            ):
-                raise CitationVerificationError(
-                    source_id=self.source_id,
-                    reason="invalid_offsets",
-                    quote=self.quote,
-                )
+
+
+def anchor_citation(
+    snapshot: EvidenceSnapshot,
+    raw: Mapping[str, object],
+    *,
+    require_offsets: bool = False,
+) -> Citation:
+    """Hydrate omitted offsets only for one unique literal occurrence.
+
+    Unknown envelope fields are ignored. ``source_id`` and ``quote`` are always
+    mandatory. Both offsets may be omitted only at the model-response seam.
+    """
+    if not isinstance(raw, Mapping):
+        raise CitationVerificationError(
+            source_id="<missing>", reason="citation_not_object"
+        )
+    missing_core = tuple(name for name in ("source_id", "quote") if name not in raw)
+    has_start = "start" in raw
+    has_end = "end" in raw
+    if missing_core or (require_offsets and (not has_start or not has_end)):
+        raise CitationVerificationError(
+            source_id=str(raw.get("source_id", "<missing>")),
+            reason="missing_required_fields",
+        )
+    source_id = raw["source_id"]
+    quote = raw["quote"]
+    if not isinstance(source_id, str) or not source_id.strip():
+        raise CitationVerificationError(
+            source_id=str(source_id), reason="invalid_source_id"
+        )
+    if not isinstance(quote, str) or not quote:
+        raise CitationVerificationError(source_id=source_id, reason="empty_quote")
+    if has_start != has_end:
+        raise CitationVerificationError(
+            source_id=source_id, reason="incomplete_offsets", quote=quote
+        )
+    if has_start:
+        citation = Citation(
+            source_id=source_id,
+            start=raw["start"],  # type: ignore[arg-type]
+            end=raw["end"],  # type: ignore[arg-type]
+            quote=quote,
+        )
+        verify_citation(snapshot, citation)
+        return citation
+
+    text = snapshot.normalized_text(source_id)
+    if not text:
+        raise CitationVerificationError(
+            source_id=source_id, reason="empty_source", quote=quote
+        )
+    position = text.find(quote)
+    if position < 0:
+        raise CitationVerificationError(
+            source_id=source_id, reason="quote_not_found", quote=quote
+        )
+    if text.find(quote, position + 1) >= 0:
+        raise CitationVerificationError(
+            source_id=source_id, reason="quote_ambiguous", quote=quote
+        )
+    citation = Citation(source_id, position, position + len(quote), quote)
+    verify_citation(snapshot, citation)
+    return citation
 
 
 def verify_citation(
     snapshot: EvidenceSnapshot,
     citation: Citation,
-    *,
-    normalizer: Normalizer | None = None,
 ) -> None:
-    """Verify one quote exactly, or via an injected quote-only normalizer."""
-    source = snapshot.get_source(citation.source_id)
-    if citation.start is not None:
-        assert citation.end is not None
-        if citation.end > len(source.content):
-            raise CitationVerificationError(
-                source_id=citation.source_id,
-                reason="offset_out_of_bounds",
-                quote=citation.quote,
-            )
-        if source.content[citation.start:citation.end] != citation.quote:
-            raise CitationVerificationError(
-                source_id=citation.source_id,
-                reason="offset_quote_mismatch",
-                quote=citation.quote,
-            )
-        return
-
-    if normalizer is None:
-        matched = citation.quote in source.content
-    else:
-        try:
-            normalized_quote = normalizer(citation.quote)
-            normalized_content = normalizer(source.content)
-        except Exception as exc:
-            raise CitationVerificationError(
-                source_id=citation.source_id,
-                reason=f"normalizer_failed:{type(exc).__name__}",
-                quote=citation.quote,
-            ) from exc
-        if not isinstance(normalized_quote, str) or not isinstance(normalized_content, str):
-            raise CitationVerificationError(
-                source_id=citation.source_id,
-                reason="normalizer_non_string",
-                quote=citation.quote,
-            )
-        matched = bool(normalized_quote) and normalized_quote in normalized_content
-    if not matched:
+    """Verify one strict citation against the snapshot's normalized string."""
+    if not isinstance(citation, Citation):
+        raise CitationVerificationError(
+            source_id="<invalid>", reason="invalid_citation_type"
+        )
+    text = snapshot.normalized_text(citation.source_id)
+    if not text:
         raise CitationVerificationError(
             source_id=citation.source_id,
-            reason="quote_not_found",
+            reason="empty_source",
+            quote=citation.quote,
+        )
+    if citation.end > len(text):
+        raise CitationVerificationError(
+            source_id=citation.source_id,
+            reason="offset_out_of_bounds",
+            quote=citation.quote,
+        )
+    if text[citation.start:citation.end] != citation.quote:
+        reason = "offset_quote_mismatch" if citation.quote in text else "quote_not_found"
+        raise CitationVerificationError(
+            source_id=citation.source_id,
+            reason=reason,
             quote=citation.quote,
         )
 
@@ -273,8 +312,6 @@ class CitationVerificationReport:
 def verify_all(
     snapshot: EvidenceSnapshot,
     citations: Iterable[Citation],
-    *,
-    normalizer: Normalizer | None = None,
 ) -> CitationVerificationReport:
     """Verify every citation, collecting all failures before rejecting a batch."""
     citation_tuple = tuple(citations)
@@ -283,7 +320,7 @@ def verify_all(
     source_ids: list[str] = []
     for index, citation in enumerate(citation_tuple):
         try:
-            verify_citation(snapshot, citation, normalizer=normalizer)
+            verify_citation(snapshot, citation)
         except CitationVerificationError as exc:
             failures.append(CitationFailure(
                 index=index,

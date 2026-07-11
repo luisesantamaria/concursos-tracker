@@ -228,9 +228,9 @@ class EvidenceSnapshot:
 @dataclass(frozen=True)
 class Citation:
     source_id: str
+    start: int
+    end: int
     quote: str
-    start: int | None = None
-    end: int | None = None
 
 class ResourceCertifier:
     def certify(self, *, snapshot: EvidenceSnapshot, task: str) -> AgentRunResult: ...
@@ -341,19 +341,20 @@ tupla. `snapshot_sha256` es SHA-256 del JSON UTF-8 compacto de pares ordenados
 unicidad y ambos niveles de hash en `__post_init__`; `get_source()` hace lookup
 sin exponer un dict mutable.
 
-`Citation` admite quote literal o quote con `start`/`end`. El default de
-`verify_citation()` busca exactamente el substring en el contenido crudo, sin
+`Citation` exige siempre `source_id`, `start`, `end` y `quote`. El snapshot no
+transforma el contenido: su normalización es identidad sobre el `str` crudo.
+Por tanto, `start`/`end` son índices de caracteres Python sobre ese mismo `str`,
+no offsets de bytes. `verify_citation()` comprueba exactamente el slice, sin
 normalizar Unicode, mayúsculas ni espacios. Los offsets siempre refieren al
-contenido crudo y requieren `content[start:end] == quote`. Un normalizer
-inyectable puede relajar solo citas sin offsets; nunca cambia el contenido
-almacenado ni la semántica de offsets. Fuente inexistente, quote ausente,
+contenido crudo y requieren `content[start:end] == quote`; no existe un
+normalizador alternativo inyectable. Fuente inexistente o vacía, quote ausente,
 límites inválidos o incoherencia offset/quote fallan cerrados.
 
 `verify_all()` evalúa el lote completo y, si hay fallos, emite
 `CitationBatchVerificationError` con índices, source IDs, razones y previews de
 quote limitados a 48 caracteres; nunca vuelca el contenido fuente. Cuando todas
 pasan devuelve un reporte frozen con índices y fuentes verificadas. Los agentes
-de rondas futuras recibirán el snapshot solo para lectura: toda afirmación
+reciben el snapshot solo para lectura: toda afirmación
 material deberá aportar una `Citation` y superar `verify_all()` antes de poder
 confirmarse, auditarse o juzgarse.
 
@@ -438,13 +439,17 @@ retrieval.
 
 El formato V2 offset canónico es `{source_id,start,end,quote}`, con `start`
 inclusivo, `end` exclusivo y la invariancia literal
-`content[start:end] == quote`. Es el formato del schema local del fiscal. El
-schema canónico del certificador manda y no contiene offsets: sus citas
-`{dimension,quote,source_field}` se mapean sin invención como
-`source_field → source_id` y se verifican como quote literal contra esa fuente.
+`content[start:end] == quote`. Certificador y fiscal declaran `source_id`; los
+offsets explícitos se validan sin búsqueda. Si el modelo omite ambos offsets,
+Python los hidrata únicamente cuando `quote` tiene una sola ocurrencia literal
+dentro de esa fuente. Cero o múltiples ocurrencias fallan cerrado. Los campos
+desconocidos del envelope de cita se conservan/ignoran y no invalidan los cuatro
+campos obligatorios del contrato hidratado.
 
-Después del schema del rol se extraen y verifican **todas** las citas contra el
-snapshot congelado. Cualquier formato, fuente, quote u offset inválido rechaza
+Después del schema del rol se hidratan, extraen y verifican **todas** las citas
+contra el snapshot congelado, y se vuelven a verificar inmediatamente antes de
+construir el `AgentRunResult`, seam actual de consumo/persistencia. Cualquier
+formato, fuente, quote u offset inválido rechaza
 el output completo con `AgentOutputRejected`; nunca se ignora una cita mala. Una
 decisión afirmativa del certificador (`indice_oficial`, combinado o portal
 externo) exige al menos una cita y, fiel a la skill, las dimensiones

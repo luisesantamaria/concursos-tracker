@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -19,7 +20,11 @@ from scripts.fase2_municipios.v2.agents.schemas import (
 from scripts.fase2_municipios.v2.agents.tools import ToolLimits
 from scripts.fase2_municipios.v2.gemini import RoleModels, StructuredGeminiClient, Transport
 from scripts.fase2_municipios.v2.loader import load_canonical_resources
-from scripts.fase2_municipios.v2.snapshot import Citation, EvidenceSnapshot
+from scripts.fase2_municipios.v2.snapshot import (
+    Citation,
+    EvidenceSnapshot,
+    anchor_citation,
+)
 
 
 REQUIRED_ACCUSATION_CODES = frozenset({
@@ -54,6 +59,20 @@ def _prosecutor_citations(output: Mapping[str, Any]) -> tuple[Citation, ...]:
         )
         for item in raw_citations
     )
+
+
+def _prepare_prosecutor_output(
+    snapshot: EvidenceSnapshot, output: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    prepared = copy.deepcopy(dict(output))
+    raw_citations = list(prepared["citations"])
+    for accusation in prepared["accusations"]:
+        raw_citations.extend(accusation["citations"])
+    for item in raw_citations:
+        citation = anchor_citation(snapshot, item)
+        item["start"] = citation.start
+        item["end"] = citation.end
+    return prepared
 
 
 def _prosecutor_requires_citations(output: Mapping[str, Any]) -> bool:
@@ -150,6 +169,7 @@ def build_prosecutor_agent(
         client=client,
         output_schema=PROSECUTOR_OUTPUT_SCHEMA,
         extract_citations=_prosecutor_citations,
+        prepare_output=_prepare_prosecutor_output,
         requires_citations=_prosecutor_requires_citations,
         output_invariant=_prosecutor_invariants,
         max_steps=max_steps,
