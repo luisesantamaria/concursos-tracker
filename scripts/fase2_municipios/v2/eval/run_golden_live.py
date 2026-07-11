@@ -47,6 +47,7 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
 from scripts.fase2_municipios.v2.gemini import (
     GeminiClientError,
     RoleModels,
+    gentle_free_only_environment,
     resolve_free_api_key,
 )
 
@@ -451,7 +452,15 @@ def main(
     differential_runner_factory: Callable[..., GoldenDifferentialRunner] = GoldenDifferentialRunner,
 ) -> int:
     args = _parser().parse_args(argv)
-    environment = os.environ if environ is None else environ
+    source_environment = os.environ if environ is None else environ
+    environment = gentle_free_only_environment(source_environment)
+    if environ is None:
+        # This process is the turnkey CLI child. Remove only paid credential
+        # variables from its real environment so the SDK cannot discover them;
+        # proxy/resolver/CA/SSL/locale and every other runtime setting survive.
+        for name in tuple(os.environ):
+            if name not in environment:
+                os.environ.pop(name, None)
     try:
         artifacts = run_golden_live(
             golden_path=args.golden,

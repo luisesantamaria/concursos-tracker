@@ -19,6 +19,7 @@ from .client import (
     build_certifier_client,
     build_gemini_client,
     build_judge_client,
+    gentle_free_only_environment,
     resolve_free_api_key,
 )
 from .schema_validation import validate_json_schema
@@ -42,6 +43,7 @@ __all__ = [
     "build_certifier_client",
     "build_gemini_client",
     "build_judge_client",
+    "gentle_free_only_environment",
     "resolve_free_api_key",
     "validate_json_schema",
 ]

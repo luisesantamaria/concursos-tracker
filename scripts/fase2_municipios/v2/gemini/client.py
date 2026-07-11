@@ -154,6 +154,27 @@ def assert_no_forbidden_credentials(environ: Mapping[str, str]) -> None:
             raise UnauthorizedCredentialError(name)
 
 
+def gentle_free_only_environment(environ: Mapping[str, str]) -> dict[str, str]:
+    """Preserve runtime networking/locale state while removing paid credentials.
+
+    Forbidden values are never read.  The turnkey CLI uses this instead of an
+    empty environment so proxy, resolver, CA bundle, SSL and locale variables
+    remain available to HTTP and Gemini transports.
+    """
+
+    sanitized: dict[str, str] = {}
+    for name in environ:
+        normalized = name.upper()
+        is_paid = (
+            name in FORBIDDEN_ENV_NAMES
+            or normalized.startswith("VERTEX")
+            or "SERVICE_ACCOUNT" in normalized
+        )
+        if not is_paid:
+            sanitized[name] = environ[name]
+    return sanitized
+
+
 def resolve_free_api_key(environ: Mapping[str, str] | None = None) -> str:
     """Resolve only ``GEMINI_API_KEY_FREE`` after name-only forbidden guards."""
     environment = os.environ if environ is None else environ

@@ -13,12 +13,19 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import gzip
 import http.client
 import socket
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
+import zlib
 
 from pydantic import ValidationError
+
+try:
+    import brotli as _brotli
+except ImportError:  # Optional: do not advertise br when no decoder is installed.
+    _brotli = None
 
 from scripts.fase2_municipios import cascade_municipios as cascade
 from scripts.fase2_municipios.v2.agents import (
@@ -70,6 +77,68 @@ class LiveFetchError(RuntimeError):
 
 class ModelResponseValidationError(ValueError):
     """A role returned a value that cannot satisfy the A/B/C response contract."""
+
+
+def _looks_like_zlib(payload: bytes) -> bool:
+    if len(payload) < 2 or payload[0] != 0x78:
+        return False
+    return payload[0] & 0x0F == 8 and int.from_bytes(payload[:2], "big") % 31 == 0
+
+
+def _content_codings(payload: bytes, content_encoding: str) -> tuple[str, ...]:
+    declared = tuple(
+        item.strip().lower()
+        for item in content_encoding.split(",")
+        if item.strip() and item.strip().lower() != "identity"
+    )
+    if declared:
+        return declared
+    if payload.startswith(b"\x1f\x8b"):
+        return ("gzip",)
+    if _looks_like_zlib(payload):
+        return ("deflate",)
+    return ()
+
+
+def _decompress_payload(payload: bytes, content_encoding: str) -> bytes:
+    """Decode HTTP content codings, falling back to gzip/zlib magic bytes."""
+
+    decoded = payload
+    # Content codings are listed in application order and removed in reverse.
+    for coding in reversed(_content_codings(payload, content_encoding)):
+        try:
+            if coding in {"gzip", "x-gzip"}:
+                decoded = gzip.decompress(decoded)
+            elif coding == "deflate":
+                try:
+                    decoded = zlib.decompress(decoded)
+                except zlib.error as wrapped_error:
+                    try:
+                        decoded = zlib.decompress(decoded, -zlib.MAX_WBITS)
+                    except zlib.error as raw_error:
+                        raise raw_error from wrapped_error
+            elif coding == "br":
+                if _brotli is None:
+                    raise LiveFetchError("brotli_decoder_unavailable")
+                decoded = _brotli.decompress(decoded)
+            else:
+                raise LiveFetchError(f"unsupported_content_encoding:{coding}")
+        except LiveFetchError:
+            raise
+        except Exception as exc:
+            raise LiveFetchError("response_decompression_failed") from exc
+    return decoded
+
+
+def _live_request_headers() -> dict[str, str]:
+    headers = dict(cascade.REQUEST_HEADERS)
+    if _brotli is None:
+        advertised = headers.get("Accept-Encoding", "")
+        headers["Accept-Encoding"] = ", ".join(
+            item.strip() for item in advertised.split(",")
+            if item.strip().lower() != "br"
+        )
+    return headers
 
 
 class LiveCauseKind(str, Enum):
@@ -225,7 +294,7 @@ class OrionHTTPFetcher:
             if parsed.query:
                 path += "?" + parsed.query
             try:
-                connection.request("GET", path, headers=dict(cascade.REQUEST_HEADERS))
+                connection.request("GET", path, headers=_live_request_headers())
                 response = connection.getresponse()
                 payload = response.read()
             except ExternalAccessBlocked:
@@ -249,6 +318,8 @@ class OrionHTTPFetcher:
         content_type = str(response.getheader("content-type", ""))
         if "text/html" not in content_type and "text/plain" not in content_type:
             raise LiveFetchError("response_not_html_or_text")
+        content_encoding = str(response.getheader("content-encoding", ""))
+        payload = _decompress_payload(payload, content_encoding)
         charset = response.headers.get_content_charset() or "utf-8"
         try:
             response_text = payload.decode(charset)
