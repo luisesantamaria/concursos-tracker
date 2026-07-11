@@ -1,0 +1,544 @@
+# Fase 2 V2 AI-first — recon y blueprint de staging
+
+Estado: blueprint del paso 1. La V2 es totalmente paralela y aditiva. **V1 no se
+modifica**: `scripts/fase2_municipios/cascade_municipios.py`,
+`offline_validate.py`, sus tests, los contratos de `scripts/eval/`, el CSV
+canónico y `authority_first/data/` permanecen fuera del alcance de V2.
+
+## Superficie exacta de V1
+
+### Entrada, CLI y salida
+
+El entrypoint es `scripts/fase2_municipios/cascade_municipios.py:3204`. Su CLI
+define `--golden` (líneas 3208-3210), `--all` (3211-3212), `--municipio`
+(3213-3214), `--output` (3215-3216), `--model` (3217-3218),
+`--gemini-free-first` (3219-3221), `--no-playwright` (3222-3223), `--timeout`
+(3224), `--limit` (3225-3226), `--letras` (3227-3229), `--append`
+(3230-3233), `--skip-existing` (3234-3238) y el flag de compatibilidad
+`--grounded-verify` (3239-3242). Los cinco flags pedidos explícitamente son:
+
+- `--all`: procesa los 497 municipios RS.
+- `--letras`: filtra por iniciales sin acentos.
+- `--append`: mezcla por municipio con un CSV existente.
+- `--skip-existing`: omite filas con ambos buckets confirmados y preserva el
+  bucket ya confirmado cuando solo uno lo está.
+- `--output`: selecciona la ruta; por defecto `data/cascade_output.csv`.
+
+`OUTPUT_FIELDS` está en `cascade_municipios.py:2996-3003` y el escritor en
+`cascade_municipios.py:3050-3084`. Las columnas, en orden, son: `uf`,
+`municipio`, `site_base`, `url_concursos`, `confianza_concursos`,
+`url_processos_seletivos`, `confianza_processos`, `urls_extras_concursos`,
+`urls_extras_processos`, `tier_concursos`, `tier_processos`, `method`, `razao`,
+`notes`, `checked_at`.
+
+### Módulos y cadena contractual
+
+La superficie V1 bajo `scripts/fase2_municipios/` está concentrada en:
+
+- `cascade_municipios.py`: cascade, captura, adjudicador central, selector,
+  cierre y CLI.
+- `offline_validate.py`: replay desde evidencia congelada, sin red; su docstring
+  y contrato están en líneas 1-11 y la entrada en 115.
+- `tests/test_batch_snapshot_seam.py`, `test_candidate_decision_chain.py`,
+  `test_contrato_estructural.py` y `test_producer_hydration_seam.py`.
+
+El contrato estructural consumido por el adjudicador procede de
+`scripts/eval/verdict_extract.py`: `build_candidate_record()` llama a
+`verdict.evaluate_candidate_contract()` en `cascade_municipios.py:811-877`.
+No hay hoy un módulo separado llamado `adjudicador`; el adjudicador central está
+embebido en esa función y en las funciones de contrato importadas.
+
+La cadena es:
+
+1. `CandidateRecord` (`cascade_municipios.py:510-581`) congela identidad,
+   autoridad, rol, estado de evidencia, bucket, decisión, provenance y el
+   `EvidenceSnapshot` exacto.
+2. Tier 3 es solo selector: `tier3_classify_and_pick()`
+   (`cascade_municipios.py:2100-2186`) elige un `candidate_id` existente entre
+   records elegibles; no reclasifica.
+3. `SelectedResource` (`cascade_municipios.py:584-590`) conserva la instancia
+   exacta y el bucket.
+4. `derive_final_decision()` (`cascade_municipios.py:2038-2096`) produce el
+   `FinalDecision` (`cascade_municipios.py:593-602`) sin refetch ni nueva
+   adjudicación.
+
+### Gemini en V1
+
+V1 no tiene un cliente reutilizable fuera de `cascade_municipios.py`: el wrapper
+HTTP local es `gemini_post()` (`1567-1585`), apoyado por
+`_gemini_post_once()` (`1527-1536`) y `_gemini_post_paid()` (`1543-1564`). La
+clave gratuita se obtiene de la variable **`GEMINI_API_KEY_FREE`**
+(`1413-1415`); el camino histórico/pago usa `GEMINI_API_KEY` (`1398-1400`).
+
+Tier 2 usa Google Search grounding **encendido** mediante
+`"tools": [{"google_search": {}}]` en `tier2_grounded_search()`
+(`1588-1612`), `tier2_find_site_grounded()` (`1681-1703`) y
+`tier2_directed_bucket_search()` (`1759-1779`). Tier 3 usa grounding **apagado**:
+su payload no contiene tools y solicita JSON por `responseMimeType` en
+`2100-2174`. V1 puede caer de free a pago (`1575-1584`); esa conducta queda
+expresamente prohibida en V2.
+
+## Skills y referencias canónicas
+
+Archivos canónicos, y únicamente éstos:
+
+- `skills/fase2-resource-certifier/SKILL.md`: certifica una superficie estable
+  por autoridad, identidad, rol, bucket y evidencia congelada; recibe
+  `EvidenceSnapshot`/provenance y produce JSON estricto, citas, decisión,
+  posible tool request y propuesta de aprendizaje (líneas 11-42, 208-244).
+- `skills/fase2-fp-prosecutor/SKILL.md`: auditor adversarial independiente;
+  recibe snapshot, propuesta y citas, prueba acusaciones de falso positivo y
+  devuelve `sustain`, `block`, `needs_tool` o `review` con evidencia
+  (líneas 11-39, 54-65).
+- `skills/fase2-conflict-judge/SKILL.md`: resuelve solo conflictos entre
+  certificador y fiscal desde snapshot, salidas y citas; devuelve `confirm`,
+  `reject`, `request_tool` o `review` (líneas 11-24, 36-41, 75-77).
+- `skills/fase2-resource-certifier/references/schema.json`: objeto JSON con
+  `$schema`, `title`, `type`, `additionalProperties`, `required` y `properties`.
+  **Es un JSON Schema Draft 2020-12 para `Fase2CertifierOutput`; no es un schema
+  aplicable a los otros tres references** (líneas 1-48).
+- `portal_families.json`: objeto JSON `{version: int, families: list}` con 15
+  familias; cada entrada tiene `id` y metadatos operativos opcionales.
+- `failure_modes.json`: objeto JSON `{version: int, failure_modes: list}` con 14
+  modos; cada entrada tiene `id`, `fp`, `action` y, a veces, `contrast`.
+- `casebook.jsonl`: JSON Lines, un objeto por línea, 19 líneas/19 registros.
+  Cada registro contiene `case_id`, `municipio`, `family`, `expected`, `bucket`,
+  `facts` (lista de strings) y `lesson`.
+
+`jsonschema` no está instalado en `.venv`, y aun si lo estuviera el schema no
+aplica a las otras referencias. Por tanto, el loader de este paso valida cada
+archivo con contratos estructurales mínimos propios; no instala dependencias.
+
+## Tests e intérprete
+
+El framework es pytest 9.1.1 en `.venv`; los tests V1 viven en
+`scripts/fase2_municipios/tests/`. No existe configuración pytest ni markers
+`network`/`integration` en la superficie inspeccionada. Tampoco hay llamadas
+reales a `requests`, sockets o Playwright en los tests; los seams externos se
+mockean. La suite recolecta 88 tests.
+
+Comando unitario/offline exacto:
+
+```bash
+env -u GEMINI_API_KEY -u GEMINI_API_KEY_FREE -u GEMINI_API_KEY_PAID \
+  -u GEMINI_FREE_FIRST .venv/bin/python -m pytest -q scripts/fase2_municipios/tests
+```
+
+`CLAUDE.md:19-24` prescribe crear y activar `.venv`. La ruta comprobada es
+`<repo>/.venv/bin/python`; actualmente informa Python 3.14.4, aunque AGENTS.md
+declara Python 3.12 como versión objetivo. Esta divergencia se reporta, no se
+corrige en este paso.
+
+## Layout V2 propuesto
+
+En disco, las rondas 1 a 5 crean solamente:
+
+```text
+scripts/fase2_municipios/v2/
+├── __init__.py
+├── loader.py
+├── gemini/
+│   ├── __init__.py
+│   ├── client.py
+│   ├── schema_validation.py
+│   └── tests/
+│       └── test_client.py
+├── agents/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── certifier.py
+│   ├── prosecutor.py
+│   ├── schemas.py
+│   ├── tools.py
+│   └── tests/
+│       └── test_agents.py
+├── ratelimit/
+│   ├── __init__.py
+│   ├── limiter.py
+│   └── tests/
+│       └── test_limiter.py
+├── snapshot/
+│   ├── __init__.py
+│   ├── snapshot.py
+│   └── tests/
+│       └── test_snapshot.py
+└── tests/
+    └── test_loader.py
+```
+
+El rate limiter se implementó en ronda 2, el cliente Gemini free-only en ronda 3,
+el snapshot en ronda 4 y el framework/certificador/fiscal en ronda 5. Submódulos
+futuros, documentados pero **no creados todavía**:
+
+```text
+v2/agents/judge.py
+v2/orchestration.py
+v2/memory/{store,promotion}.py
+```
+
+## Contratos de interfaz de alto nivel
+
+Firmas de diseño; loader y rate limiter ya están implementados, las restantes
+continúan como contratos futuros:
+
+```python
+def find_repo_root(start: Path | None = None, *, max_parents: int = 8) -> Path: ...
+
+def load_canonical_resources(
+    *, repo_root: Path | None = None,
+    skills_dir: Path | None = None,
+    references_dir: Path | None = None,
+) -> CanonicalResources: ...
+
+@dataclass(frozen=True)
+class LimiterConfig:
+    rpm: int = 15
+    tpm: int = 250_000
+    rpd: int | None = None
+    rpd_policy: Literal["raise", "block"] = "raise"
+
+class ProjectRateLimiter:
+    def acquire(self, estimated_tokens: int) -> Reservation: ...
+    def reconcile(self, reservation: Reservation, actual_tokens: int) -> None: ...
+
+class Transport(Protocol):
+    def generate(
+        self, model: str, contents: object, config: Mapping[str, object],
+    ) -> RawResponse: ...
+
+class StructuredGeminiClient:
+    def generate_structured(
+        self, contents: object, *, estimated_tokens: int,
+        config_overrides: Mapping[str, object] | None = None,
+    ) -> object: ...
+
+@dataclass(frozen=True)
+class EvidenceSource:
+    source_id: str
+    url: str
+    retrieved_at: datetime
+    content: str
+    content_sha256: str
+
+@dataclass(frozen=True)
+class EvidenceSnapshot:
+    sources: tuple[EvidenceSource, ...]
+    snapshot_sha256: str
+
+@dataclass(frozen=True)
+class Citation:
+    source_id: str
+    quote: str
+    start: int | None = None
+    end: int | None = None
+
+class ResourceCertifier:
+    def certify(self, *, snapshot: EvidenceSnapshot, task: str) -> AgentRunResult: ...
+
+class FalsePositiveProsecutor:
+    def audit(
+        self, *, snapshot: EvidenceSnapshot,
+        certifier_output: Mapping[str, object],
+    ) -> AgentRunResult: ...
+
+class ConflictJudge:
+    async def judge(
+        self, snapshot: EvidenceSnapshot, proposal: CertifierVerdict,
+        prosecution: ProsecutionVerdict,
+    ) -> JudgeVerdict: ...
+
+class VersionedExternalMemory:
+    def retrieve(self, query: MemoryQuery, *, version: str) -> tuple[MemoryCase, ...]: ...
+    def stage(self, proposal: LearningProposal) -> StagedLearning: ...
+    def promote(self, staged_id: str, validation: PromotionValidation) -> MemoryVersion: ...
+```
+
+## Rate limiter (implementado ronda 2)
+
+La implementación real vive en `scripts/fase2_municipios/v2/ratelimit/`. Usa
+`LimiterConfig`, inmutable, con defaults 15 RPM, 250.000 TPM, RPD ilimitado y
+`rpd_policy="raise"`. `ProjectRateLimiter.acquire(estimated_tokens)` reserva en
+una cola FIFO antes de llamar al proveedor y devuelve un `Reservation`;
+`Reservation.reconcile(actual_tokens)` —o el método equivalente del limiter—
+reemplaza la estimación por el consumo real. RPM/TPM son ventanas deslizantes de
+60 segundos con reloj monotónico inyectable; RPD hace rollover a medianoche UTC
+con reloj UTC inyectable.
+
+El default RPD `raise` produce `QuotaExhaustedError` auditable y evita bloquear
+una corrida durante casi 24 horas. `block` queda disponible como decisión
+explícita. El singleton es compartido y thread-safe solo dentro de un proceso,
+alcance suficiente para certificador/fiscal/juez en esta fase. Los hooks
+`_synchronize_cross_process_locked()` y `_publish_cross_process_locked()` son el
+seam pendiente para coordinación futura con file-lock; ronda 2 no implementa
+estado cross-proceso.
+
+## Cliente Gemini free-only (ronda 3)
+
+La implementación vive en `scripts/fase2_municipios/v2/gemini/`. El cliente
+genérico `StructuredGeminiClient` recibe un `Transport`, limiter, modelo y
+`response_schema`; no conoce roles ni loader. `Transport.generate(model,
+contents, config)` no maneja credenciales y devuelve `RawResponse` con texto y
+tokens de prompt/candidatos/total. Solo `RealGeminiTransport(api_key)` recibe la
+key explícita en construcción, importa perezosamente `google.genai` y construye
+el SDK únicamente con `api_key=...`; Vertex, ADC y gcloud no tienen fallback ni
+constructor alternativo.
+
+`resolve_free_api_key()` usa exclusivamente `GEMINI_API_KEY_FREE`. Antes de leer
+esa variable, inspecciona por membresía/nombre —nunca por valor—
+`GEMINI_API_KEY`, nombres `GEMINI_*`/`GOOGLE_*` que contengan `PAID` o `PAGO`,
+`GOOGLE_API_KEY` y `GOOGLE_APPLICATION_CREDENTIALS`. Cualquier presencia produce
+`PaidKeyForbiddenError`; ausencia o vacío de la key free produce
+`MissingFreeApiKeyError`. No existe default implícito ni fallback pago.
+
+Grounding está apagado por construcción: overrides superiores usan allowlist y
+`_guard_grounding()` recorre mappings, listas, dataclasses y objetos tipados para
+rechazar en cualquier nivel `tools`, `google_search`,
+`google_search_retrieval`, `grounding`, `retrieval` y equivalentes normalizados.
+La infracción falla antes de reservar cuota o invocar el transporte.
+
+Structured output es siempre `application/json`. El cliente acepta cualquier
+schema compatible con el subconjunto Draft 2020-12 implementado de forma
+fail-closed por `validate_json_schema()`. JSON no parseable y objeto que incumple
+schema generan `SchemaValidationError` con `reason="invalid_json"` y
+`reason="schema_mismatch"`, respectivamente, sin incluir respuesta o prompt.
+Como el loader no ofrece validación pública de instancias, la factoría
+`build_certifier_client()` reutiliza su entrypoint público exacto
+`load_canonical_resources()` para cargar `Fase2CertifierOutput` desde
+`references/schema.json`; el cliente genérico permanece desacoplado.
+
+Los defaults configurables de `RoleModels` son certificador y fiscal
+`gemini-3.1-flash-lite`, y juez `gemini-3.5-flash`. La inyección de Transport y
+la construcción separada de clientes son el seam para sesiones y prompts
+independientes del fiscal; el cableado ocurre en la ronda de agentes.
+
+Cada intento hace `acquire(estimated_tokens)` antes del transporte y reconcilia
+en `finally` el total real reportado antes de parsear/validar, de modo que incluso
+una respuesta JSON/schema inválida contabiliza tokens. `max_attempts=3` significa
+un intento más dos reintentos, exclusivamente para `TransientTransportError`;
+cada intento reserva y reconcilia por separado. Credenciales, grounding, schema,
+usage y `QuotaExhaustedError` nunca se reintentan ni disparan fallback.
+
+Usage ausente, negativo, no entero o con `total != prompt + candidates` produce
+`UsageInconsistencyError`: no se asume cero, no se reintenta y la reserva
+estimada permanece cargada. Logging estructurado incluye solo modelo, intento,
+tipo de error y contadores de tokens; excluye key, contents, prompt, respuesta y
+texto de excepciones.
+
+## EvidenceSnapshot + citas verificables (ronda 4)
+
+La implementación autocontenida vive en
+`scripts/fase2_municipios/v2/snapshot/` y no importa V1. `EvidenceSource` es un
+dataclass frozen con `source_id`, URL, timestamp timezone-aware recibido del
+caller, contenido renderizado crudo y SHA-256 calculado sobre `content.encode(
+"utf-8")`. No consulta reloj, filesystem ni red. Se permite contenido vacío: su
+hash es el SHA-256 estándar de `b""`; es evidencia reproducible, aunque no puede
+sostener una cita no vacía.
+
+`build_snapshot()` rechaza IDs vacíos o duplicados, reconstruye defensivamente
+cada fuente, recalcula hashes, ordena por `source_id` y expone únicamente una
+tupla. `snapshot_sha256` es SHA-256 del JSON UTF-8 compacto de pares ordenados
+`[source_id, content_sha256]`. `EvidenceSnapshot` vuelve a comprobar orden,
+unicidad y ambos niveles de hash en `__post_init__`; `get_source()` hace lookup
+sin exponer un dict mutable.
+
+`Citation` admite quote literal o quote con `start`/`end`. El default de
+`verify_citation()` busca exactamente el substring en el contenido crudo, sin
+normalizar Unicode, mayúsculas ni espacios. Los offsets siempre refieren al
+contenido crudo y requieren `content[start:end] == quote`. Un normalizer
+inyectable puede relajar solo citas sin offsets; nunca cambia el contenido
+almacenado ni la semántica de offsets. Fuente inexistente, quote ausente,
+límites inválidos o incoherencia offset/quote fallan cerrados.
+
+`verify_all()` evalúa el lote completo y, si hay fallos, emite
+`CitationBatchVerificationError` con índices, source IDs, razones y previews de
+quote limitados a 48 caracteres; nunca vuelca el contenido fuente. Cuando todas
+pasan devuelve un reporte frozen con índices y fuentes verificadas. Los agentes
+de rondas futuras recibirán el snapshot solo para lectura: toda afirmación
+material deberá aportar una `Citation` y superar `verify_all()` antes de poder
+confirmarse, auditarse o juzgarse.
+
+### Mapeo conceptual V1 → V2, sin acoplamiento
+
+- V1 define su `EvidenceSnapshot` frozen en
+  `scripts/fase2_municipios/cascade_municipios.py:153-173`, con HTML, texto,
+  título, URL solicitada/final, status, productor, estado y links. V2 conserva la
+  idea de evidencia renderizada separada de su productor, pero reduce cada
+  unidad verificable a `EvidenceSource` con contenido crudo, URL e identidad.
+- V1 congela listas de links en tuplas (`:167-173`); V2 generaliza la
+  deep-immutability mediante una tupla ordenada de fuentes y no expone mappings
+  mutables.
+- V1 calcula un fingerprint SHA-1 del payload completo en `:776-791`. V2 no usa
+  esa función: calcula SHA-256 por contenido y un SHA-256 agregado reproducible
+  ligado a `source_id`.
+- V1 construye/copía snapshots desde `Page` en `:947-976`. V2 no conoce `Page`,
+  requests ni Playwright: `build_snapshot()` recibe exclusivamente strings y
+  timestamps ya proporcionados, y nunca adquiere contenido.
+- Título, status, links, requested/final URL y `evidence_state` no se importan
+  como campos implícitos en ronda 4. Si un agente necesita citarlos, deben entrar
+  explícitamente como contenido de una fuente futura o mediante un contrato
+  versionado; no se infieren desde V1.
+
+## Framework de agentes + tool loop (ronda 5)
+
+### Lectura canónica y contratos de rol
+
+La factoría carga las skills con `load_canonical_resources()` y no modifica ni
+copia su semántica. El certificador recibe el expediente/snapshot municipal y
+produce `Fase2CertifierOutput`: dimensiones, decisión, confianza, `citations`,
+razón, tool request y propuesta de aprendizaje. Su schema canónico define cita
+como `{dimension, quote, source_field}` y exige citas literales para toda
+confirmación. El fiscal recibe el mismo snapshot, la salida propuesta del
+certificador y sus citas; rehace el análisis de forma adversarial y devuelve
+`sustain`, `block`, `needs_tool` o `review`, con acusaciones probadas,
+descartadas/no resueltas y evidencia. Nunca recibe el historial o razonamiento
+operativo del certificador.
+
+Las skills no delimitan una subsección separada de system prompt. Por eso se
+elimina únicamente el frontmatter YAML de metadata y se inyecta **verbatim todo
+el cuerpo Markdown restante** de `fase2-resource-certifier/SKILL.md` o
+`fase2-fp-prosecutor/SKILL.md`, respectivamente. No se resume ni reinterpreta el
+texto canónico. Cada rol usa un `StructuredGeminiClient`, contents, modelo y
+system prompt separados; ambos modelos default son `gemini-3.1-flash-lite`.
+
+### Tool loop de aplicación
+
+No se usa function-calling nativo porque el guard free-only prohíbe la clave
+`tools` en config junto con grounding. Cada respuesta del modelo es un
+`Fase2AgentStepV2` plano: `action` es `tool` o `final`, con propiedades
+opcionales `tool`, `args` y `output`. Primero se valida con
+`validate_json_schema()`; Python exige después `tool+args` y ausencia de output
+para `tool`, o `output` y ausencia de tool/args para `final`. JSON/schema o
+invariante inválida produce `InvalidAgentStepError` inmediato, sin reintento.
+
+El loop comienza con system prompt, tarea autorizada, protocolo AgentStep e
+inventario local `list_sources`. Cada turno, incluido `final`, consume un paso.
+Defaults configurables: `max_steps=8`, `max_tool_calls=6` y estimación de 4.000
+tokens por intento. Agotar cualquiera produce `AgentLoopLimitError`; nunca se
+inventa un final. Una tool desconocida o args semánticamente inválidos generan
+observación JSON de error y consumen paso/tool-call; límites o fallos internos
+son errores tipados.
+
+Tools locales, todas offline y de solo lectura:
+
+- `list_sources()`: IDs, URLs, longitudes y hashes, sin contenido.
+- `get_source(source_id,start,length)`: slice crudo con máximo configurable
+  4.000 caracteres (default solicitado 2.000). La observación contiene
+  `source_id`, `start`, `requested_length`, `returned_length`, `next_start`,
+  `has_more` y `content`. El límite recorta el campo content, nunca el JSON; no
+  normaliza Unicode ni espacios.
+- `find(source_id,needle)`: búsqueda literal case-sensitive, sin regex; needle
+  máximo 256 caracteres y máximo 20 offsets, con `has_more`. Needle vacío genera
+  observación de error, no todas las posiciones.
+
+Cada observación se serializa como JSON válido y se añade a los contents del
+mismo rol. Ninguna config enviada al cliente contiene `tools`, grounding o
+retrieval.
+
+### Citas y gating fail-closed
+
+El formato V2 offset canónico es `{source_id,start,end,quote}`, con `start`
+inclusivo, `end` exclusivo y la invariancia literal
+`content[start:end] == quote`. Es el formato del schema local del fiscal. El
+schema canónico del certificador manda y no contiene offsets: sus citas
+`{dimension,quote,source_field}` se mapean sin invención como
+`source_field → source_id` y se verifican como quote literal contra esa fuente.
+
+Después del schema del rol se extraen y verifican **todas** las citas contra el
+snapshot congelado. Cualquier formato, fuente, quote u offset inválido rechaza
+el output completo con `AgentOutputRejected`; nunca se ignora una cita mala. Una
+decisión afirmativa del certificador (`indice_oficial`, combinado o portal
+externo) exige al menos una cita y, fiel a la skill, las dimensiones
+`identity`, `page_role`, `bucket` y `stability`. En el fiscal, `block` o cualquier acusación
+`proved` exige al menos una cita offset verificable; `sustain`, `needs_tool`,
+`review` y resultados negativos pueden tener cero. `verify_all([])` por sí solo
+no satisface un resultado afirmativo.
+
+### Fiscal independiente y schema propuesto
+
+No existe schema canónico del fiscal. Ronda 5 crea únicamente el schema V2-local
+`Fase2ProsecutorOutputV2ProposalForOrion` en `agents/schemas.py`, marcado
+explícitamente como **propuesta para Orion, no promovida**. Deriva fielmente de
+la skill: `result`, `reason`, lista de `accusations` con outcome
+`proved|discarded|unresolved` y citas, citas globales, `tool_request` y
+`failure_mode_proposal`. `block` exige al menos una acusación probada.
+Python exige además las 15 acusaciones canónicas, sin duplicados; `sustain` no
+puede contener una acusación probada y `needs_tool` exige un tool request.
+
+La tarea fiscal contiene solamente `certifier_output` y `snapshot_sha256`; el
+inventario inicial y sus tools operan sobre el mismo snapshot. No se copian
+contents, observaciones, llamadas a tools, tarea privada ni mensajes del
+certificador. Logging registra rol, número de paso, acción, nombre de tool,
+contador y decisión, sin prompts, contents ni citas completas.
+
+El juez de conflictos y la orquestación certificador→fiscal→juez quedan
+deliberadamente para la ronda siguiente; `AgentRunner` ya es role-genérico para
+soportarlos sin cambiar el protocolo.
+
+## Invariantes de seguridad
+
+- Free-only: V2 usa únicamente la credencial gratuita explícita. Está prohibido
+  leer o usar `GEMINI_API_KEY_PAID`, usar `GEMINI_API_KEY` como fallback o llamar
+  cualquier ruta/modelo pago. Ante cuota o error, espera/falla de forma tipada;
+  nunca degrada a pago.
+- Grounding siempre off: ningún payload incorpora Google Search ni herramientas
+  externas. Las tools permitidas operan contra evidencia local/congelada.
+- Structured output obligatorio, seguido de validación estricta contra el schema
+  de salida correspondiente; JSON inválido no se reinterpreta heurísticamente.
+- Toda cita debe localizarse literalmente en el `EvidenceSnapshot` por campo y
+  hash. Una cita no verificable impide confirmar.
+- Tool loop acotado por número de rondas, llamadas, bytes y tiempo; allowlist de
+  tools, argumentos validados y trazabilidad completa.
+- Rate limiter único y compartido: defaults 15 RPM, 250k TPM y RPD configurable;
+  cola/espera justa, reconciliación de tokens y cero fallback.
+- Logging estructurado con IDs/hashes, nunca secretos, keys, headers sensibles o
+  cuerpos crudos que puedan contenerlos; errores de proveedor se redactan.
+- Memoria externa versionada: toda lección entra a staging y solo se promueve
+  después de validación humana/evidencia y evaluación sin regresiones/FP.
+
+## Diferencial vs V1
+
+V1 combina adquisición, adjudicación determinista, selector Gemini, grounding,
+fallback free/pago y output en un script principal. V2 separa carga canónica,
+captura congelada, cliente free-only sin grounding, rate limiting compartido,
+tres roles independientes y memoria versionada. El cambio es paralelo: V2 no
+importa ni altera el estado mutable, CLI o salida canónica de V1.
+
+## Outputs de staging separados
+
+Las rondas futuras escribirán solo bajo rutas nuevas, por ejemplo:
+
+```text
+staging/fase2_v2/runs/<run_id>/snapshots/
+staging/fase2_v2/runs/<run_id>/verdicts/
+staging/fase2_v2/runs/<run_id>/audit.jsonl
+staging/fase2_v2/memory/staged/
+staging/fase2_v2/memory/versions/
+```
+
+No se escribirá `data/fase2/municipios_rs.csv`, `data/cascade_output.csv`, ningún
+CSV canónico ni `authority_first/data/`. La promoción a cualquier consumidor de
+producción queda fuera de esta arquitectura de staging y requiere una ronda y
+autorización explícitas.
+
+## Decisiones abiertas para el CEREBRO
+
+- Revisar periódicamente la disponibilidad free de los modelos fijados en ronda
+  3 (`gemini-3.1-flash-lite` para certificador/fiscal y `gemini-3.5-flash` para
+  juez); el cliente nunca cambia de modelo ni cae a pago automáticamente.
+- Definir el RPD free exacto por modelo/proyecto y su política de rollover; RPM y
+  TPM quedan fijados como defaults configurables, no como garantía del proveedor.
+- Especificar schemas separados para fiscal y juez: el schema canónico actual
+  cubre solo la salida del certificador.
+- Fijar máximos del tool loop y estrategia exacta de conteo/reconciliación de
+  tokens después de medir prompts reales.
+- Definir backend, retención, formato de versión y autoridad de promoción de la
+  memoria externa.
+- Decidir si `EvidenceSnapshot` conserva HTML completo fuera del objeto principal
+  mediante content-addressed storage y cuáles son las reglas de redacción.
+- Resolver la divergencia Python local 3.14.4 versus objetivo 3.12 antes de una
+  implementación de producción.
+
+Decisiones triviales resueltas conservadoramente en este paso: UTF-8 explícito,
+orden lexicográfico/fijo, contratos mínimos que no exigen opcionales, búsqueda de
+raíz acotada a ocho padres, errores sin volcado de contenido y estructuras
+recursivamente inmutables.

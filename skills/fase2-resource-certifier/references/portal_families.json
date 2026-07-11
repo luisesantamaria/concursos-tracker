@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "families": [
+    {"id":"simple_official_menu","discovery":["official anchors","sitemap"],"verification":["main content","index shell"]},
+    {"id":"atende_split_subsites","discovery":["transparencia","portal cidadao","menu lateral"],"risk":["year-only pages","generic Páginas fallback","dead URL"]},
+    {"id":"delegated_ip_multi24","discovery":["follow official button"],"verification":["official chain","final URL","municipality identity"]},
+    {"id":"oxy_elotech","discovery":["official transparency link"],"verification":["category content","official chain"]},
+    {"id":"pg_php_subarea","discovery":["menu subareas","all-years parameter"],"risk":["wrong subarea","single year"]},
+    {"id":"internal_categories","discovery":["category buttons"],"verification":["category content","bucket isolation"]},
+    {"id":"combined_index","verification":["both event families in content","stable shell"],"risk":["title claims both but rows show one"]},
+    {"id":"state_tabs","verification":["andamento","encerrados","homologados/vigentes"],"output":["canonical plus optional extras"]},
+    {"id":"combobox","tool":"render_browser","risk":["content hidden until selection"]},
+    {"id":"embedded_consult","tool":"render_browser","risk":["iframe/button required"]},
+    {"id":"spa_hash","tool":"render_browser","risk":["static shell empty","hash must be preserved"]},
+    {"id":"news_tag","risk":["editorial articles mistaken for index"]},
+    {"id":"scpi","discovery":["Pessoal","Concursos/Teste Seletivo","HomeConcursos.aspx"],"risk":["database error","broken instance"]},
+    {"id":"generic_documents","risk":["licitations dominate","editais is semantically generic"]},
+    {"id":"antibot","tool":"render_browser","rule":"rendered DOM outranks degraded refetch for that frozen candidate"}
+  ]
+}
