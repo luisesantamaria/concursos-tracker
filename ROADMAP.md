@@ -50,10 +50,10 @@ RS. No extrae editais (eso es F6).
   idéntica V2 22/23 vs V1 2/23; 438 tests verdes.** Fixture envenenado:
   **FP=0/15, capturas netas B/C=0**, free=41, paid=0.
 - **2c 🔄 Cierre RS** (pasos F2.P1-P8 del PLAN_MAESTRO): fixes mecánicos ✅ →
-  política de índice ✅ → fixture envenenado ✅ → R4 golden ✅ (30/36, 0 FP;
-  unión R4∪R5 = 31/36 demostradas, varianza del modelo free documentada) →
-  **adjudicación humana (F2.P5, paso actual)** → **holdout ciego de 50** →
-  sonda de cuota → corrida de los 497 con auditoría muestral.
+  política de índice ✅ → fixture envenenado ✅ → R4 golden ✅ (30/36, 0 FP) →
+  adjudicación humana ✅ (30/36 ratificado por Luis, 0 FP) → **holdout ciego
+  de 50 (F2.P6, paso actual)** → sonda de cuota → corrida de los 497 con
+  auditoría muestral.
 - **Gate de salida**: mapa RS completo con provenance, FP=0 auditado por
   muestreo, tasa de revisión humana ≤~25%.
 

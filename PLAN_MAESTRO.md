@@ -49,6 +49,13 @@ comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
   `f2_p4_report_20260712/informe_f2_p4_y_entregable_p5.md`. Higiene: seed
   `2026071206` se reutilizó en R4 (inofensivo; futuras corridas seed nuevo).
   Paso exacto siguiente: **F2.P5** (adjudicación de Luis, tablas listas).
+- F2.P5 cerrado (12-jul): **14/14 unidades de la tabla P5 RATIFICADAS por Luis,
+  0 FP** — auditoría manual en navegador (Fable) de las 9 URLs + CSV oficial
+  (Gravataí) + decisión de oráculo (Porto Alegre "em andamento"). Acta:
+  `f2_p5_acta_adjudicacion_20260712.md`. Golden RS cerrado: 30/36 confirmadas
+  humanamente sin FP; 6 abstenciones legítimas (Almirante×2, Arambaré/CP,
+  Caxias/PSS, Itaara/PSS, Canoas/PSS-bug). Paso siguiente: **F2.P6** (holdout
+  ciego de 50, REQUIERE autorización de Luis).
 - Comparación controlada (`semantic_matrix_r3_20260712/`): sobre evidencia
   idéntica, V2 acierta 22/23 vs 2/23 de las heurísticas V1.
 - Fixture y oracle: `url_map_golden_fixture_20260712.csv` (36 URLs verificadas),
@@ -172,7 +179,15 @@ clasificado: `revisar legítimo` (adjudicado por Luis) o `bug` (→ fix general
 **SI match <30 tras R5**: presentar matriz a Luis y decidir si el techo
 restante es aceptable (el golden marca 7 unidades requiere_revision_humana).
 
-### F2.P5 — Adjudicación humana de cierre RS-golden
+### F2.P5 ✅ (12-jul-2026) — Adjudicación humana de cierre RS-golden
+**RESULTADO**: 14/14 unidades de la tabla P5 RATIFICADAS por Luis, **0 FP**.
+Método: pre-auditoría 14 agentes (citas vs snapshot) + auditoría manual en
+navegador por Fable (9 URLs verificadas: índices reales con filtros/tablas/
+paginación/combobox/ciclo) + CSV oficial (Gravataí) + decisión de oráculo de
+Luis (Porto Alegre "em andamento" = índice válido; homologados→eventos F5).
+Acta: `staging/fase2_v2/eval/f2_p5_acta_adjudicacion_20260712.md`. Bug abierto
+no bloqueante: Canoas/PSS. Paso exacto siguiente: **F2.P6** (holdout 50,
+requiere autorización de Luis).
 **ENTRADA**: R4/R5 con FP=0.
 **ACCIONES**: Luis revisa (a) confirmaciones nuevas, (b) differ marcados
 `revisar legítimo`, (c) las 6-7 unidades requiere_revision_humana que V2
