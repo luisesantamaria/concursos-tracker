@@ -1,121 +1,117 @@
 # Concursos Tracker
 
-## O que é este projeto
+[![CI](https://github.com/luisesantamaria/concursos-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/luisesantamaria/concursos-tracker/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12%2B-blue)
+![Fase](https://img.shields.io/badge/fase-2%20de%208%20·%20RS-orange)
+![Golden](https://img.shields.io/badge/golden%20RS-22%2F36-yellow)
+![Precisão](https://img.shields.io/badge/falsos%20positivos-0%20em%2022%20auditadas-brightgreen)
+![Tests](https://img.shields.io/badge/tests%20V2-419%20verdes-brightgreen)
+![Atualizado](https://img.shields.io/badge/estado%20verificado-2026--07--12-blue)
 
-Um portal/app de avisos de **concursos públicos e processos seletivos** de
-todo o Brasil. O usuário cadastra seu perfil — escolaridade, profissão,
-cidade (com raio de distância ou cidades para onde aceitaria se mudar) e
-salário mínimo — e o portal mostra os certames elegíveis para ele e envia
-alertas do ciclo de vida: novo edital, retificação, inscrições encerrando,
-convocação, homologação, nomeação.
+**Motor de dados e portal de avisos para concursos públicos e processos
+seletivos no Brasil.** Descobre, verifica e monitora as fontes oficiais de
+~5.570 municípios, bancas e diários — com um requisito de projeto inegociável:
+**zero falsos positivos, toda afirmação rastreável até o documento oficial que
+a prova.**
 
-## O propósito
+## Visão geral
 
-Quem presta concurso hoje precisa vigiar dezenas de sites de bancas, portais
-de prefeituras e diários oficiais — ou depender de agregadores incompletos,
-atrasados e sem link para a fonte. O propósito deste projeto é que **nenhuma
-oportunidade pública passe despercebida para quem ela serve**, com um padrão
-que os agregadores não têm: **zero falsos positivos e toda afirmação
-respaldada por evidência verificável** (cada dado do portal aponta para o
-documento oficial que o prova). Um aviso errado custa ao usuário uma taxa de
-inscrição ou uma mudança de cidade — por isso precisão vale mais que
-cobertura, e a abstenção honesta ("revisar") é preferível a um chute.
+Quem presta concurso vigia dezenas de sites de bancas, prefeituras e diários —
+ou depende de agregadores incompletos, atrasados e sem link para a fonte. O
+Concursos Tracker resolve o problema na camada de dados: um usuário cadastra
+seu perfil (escolaridade, cidade + raio, salário mínimo) e recebe apenas os
+certames elegíveis, com alertas de ciclo de vida (novo edital, retificação,
+inscrições encerrando, convocação) — cada um apontando para a fonte oficial.
+Um aviso errado custa uma taxa de inscrição ou uma mudança de cidade; por isso
+o sistema prefere **abster-se a chutar**, e cada dado publicado carrega sua
+proveniência.
 
-## O que vamos fazer
+## Como funciona
 
-O projeto tem duas metades, e a difícil é a primeira:
-
-**1. O motor de dados (o fosso competitivo).** Descobrir, verificar e
-monitorar as fontes oficiais dos ~5.570 municípios + bancas + diários:
-
-- **Descobrir**: onde cada município/banca publica seus certames (a URL
-  estável do índice). Verificar isso à mão para 5.570 municípios é inviável —
-  por isso a descoberta é automatizada (padrões por plataforma de CMS,
-  registro de domínios oficiais, busca dirigida) e a **decisão final é de um
-  juiz de IA com citações literais verificadas por código** (motor V2), com
-  meta de 0 falsos positivos.
-- **Monitorar**: releituras periódicas das fontes confirmadas para detectar
-  novos editais e eventos — priorizadas por um sinal de atividade nacional
-  (Querido Diário, bancas, radares), não por força bruta.
-- **Extrair e consolidar**: transformar páginas e PDFs em certames
-  estruturados (cargos, escolaridade, remuneração, cronograma) e unir as
-  menções de várias fontes na mesma entidade (resolução de identidade), com
-  a linha do tempo completa de cada certame.
-
-**2. O produto.** O portal/app com perfis, filtros, matching geográfico e
-alertas — construído sobre o motor (ver `MANUAL_APP.md`).
-
-## Como vamos fazer (os princípios que não se negociam)
-
-- **Fontes de verdade convergentes**: nenhuma fonte manda em tudo. A banca é
-  a mais rica do ciclo ativo *quando existe* (a maioria dos PSS e alguns
-  concursos nunca passam por banca); a prefeitura é o publicador legal e
-  muitas vezes a única fonte de PSS; o diário oficial é o registro com valor
-  legal; os radares (Ache, PCI) só descobrem e auditam, nunca provam. A
-  autoridade é atribuída **por tipo de fato** (matriz fonte × evento) e as
-  fontes se corroboram.
-- **IA adjudica conteúdo, código verifica fatos**: o certificador de IA lê a
-  evidência congelada e cita trechos literais; o código verifica cada citação
-  caractere por caractere, a autoridade/identidade do domínio e o estado da
-  página. Nada é publicado sem passar por esse portão.
-- **Precisão sobre cobertura**: 0 FP > cobertura alta; ~condição de parada:
-  um único falso positivo detido interrompe a fase (protocolo STOP).
-- **Verdade de campo humana**: golden sets construídos à mão são o oráculo de
-  desenvolvimento; holdouts cegos medem a generalização antes de escalar; o
-  sistema não aprende sozinho do oráculo — padrões entram só como fatos
-  curados com proveniência humana.
-
-## Onde estamos (2026-07-12)
-
-- **Fase 1 (bancas RS)**: feita.
-- **Fase 2 (descoberta municipal RS)**: motor V2 funcionando — no golden de
-  36 unidades: 22 acertos, **0 falsos positivos**; sobre evidência idêntica,
-  a IA acerta 22/23 contra 2/23 das heurísticas antigas. Suite: 419 testes
-  verdes. Falta o fechamento (fixture envenenado, holdout de 50, corrida dos
-  497) — ver `PLAN_MAESTRO.md`.
-- O caminho completo por fases está no `ROADMAP.md`; o passo a passo
-  executável com gates e ramas de falha, no `PLAN_MAESTRO.md`.
-
-## Documentos (por ordem de leitura)
-
-| Documento | O que contém |
-|---|---|
-| `README.md` | Este arquivo: o que é o projeto, propósito, como fazemos. |
-| `ROADMAP.md` | O projeto inteiro dividido em fases: de onde viemos, onde estamos, para onde vamos. |
-| `PLAN_MAESTRO.md` | O plano executável: cada passo com pré-requisito, ações, prova de sucesso e rama de falha. **Plano de registro.** |
-| `MANUAL_IMPLEMENTACION.md` | Arquitetura do motor: 4 planos, modelo de dados canônico, funil de descoberta. |
-| `MANUAL_APP.md` | Como construir o portal/app: stack, 9 etapas, LGPD, alertas. |
-| `CLAUDE.md` | Regras operativas para agentes/humanos (intocáveis, comandos, disciplina). |
-| `docs/` | Documentação técnica (arquitetura fase 2, runbook de corridas do Brasil, specs) e arquivo histórico (`docs/archivo/`). |
-
-## Estrutura do repositório
-
-```text
-scripts/fase1_bancas/         Crawlers de bancas (RS).
-scripts/fase2_municipios/     Cascata de descoberta municipal (V1, congelada)
-  v2/                         Motor V2 de adjudicação (agentes, portão, eval,
-                              registro de domínios, snapshot/citações, render).
-scripts/eval/                 Avaliador golden + baseline V1 (protegido).
-scripts/shared/               Escopo RS, perfil de navegador, waf guard.
-config/                       Matriz de autoridade, schema, escopo (YAML).
-data/                         Golden set, registros, saídas do pipeline.
-docs/                         Docs técnicos + docs/archivo/ (histórico).
-staging/                      Corridas de avaliação congeladas (gitignored).
+```mermaid
+flowchart LR
+    subgraph Fontes["Fontes de verdade (convergentes)"]
+        B[Bancas]
+        P[Prefeituras]
+        D[Diários oficiais]
+        R[Radares · só sinal]
+    end
+    Fontes --> DESC["Descoberta<br/>registro de domínios ·<br/>padrões por CMS · cascata"]
+    DESC --> V2["Adjudicação V2 (IA)<br/>certificador com citações<br/>verificadas por código +<br/>fiscal adversarial + portão"]
+    V2 --> REG[("Registro vivo<br/>URLs confirmadas<br/>com proveniência")]
+    REG --> MON["Monitoramento<br/>diff + classificação<br/>de eventos"]
+    MON --> EXT["Extração<br/>certames estruturados +<br/>resolução de identidade"]
+    EXT --> API["API / Portal / Alertas"]
 ```
 
-## Instalação e comandos
+- **Fontes convergentes, não hierarquia**: a banca é a fonte mais rica do
+  ciclo ativo *quando existe* (a maioria dos PSS nunca passa por banca); a
+  prefeitura é o publicador legal; o diário é o registro com valor legal; os
+  radares (Ache, PCI) apenas descobrem e auditam. A autoridade é atribuída
+  **por tipo de fato** e as fontes se corroboram.
+- **IA adjudica, código verifica**: o certificador lê a evidência congelada e
+  cita trechos literais; o código verifica cada citação caractere a caractere,
+  além da autoridade e identidade do domínio. Nada é publicado sem passar pelo
+  portão.
+- **Escala por demanda, não por força bruta**: um sinal de atividade nacional
+  (Querido Diário, bancas, radares) decide *onde* e *quando* verificar —
+  ~US$20/ano de inferência contra meses de backfill exaustivo.
 
-Python 3.12+ (o venv das corridas vive no WSL: `.venv/bin/python`).
+## Status
+
+| Fase | Escopo | Estado | Resultado-chave |
+|---|---|---|---|
+| F0-F1 | Modelo de autoridade · crawlers de bancas RS | ✅ | Base de certames de bancas |
+| **F2** | **Descoberta municipal RS (motor V2)** | 🔄 | Golden 36: **22 acertos, 0 FP**; sobre evidência idêntica, IA 22/23 vs heurísticas 2/23; 419 testes verdes |
+| F3-F4 | Descoberta industrializada · sinal demand-driven | ⬜ | — |
+| F5-F6 | Monitoramento · extração + identidade | ⬜ | — |
+| F7-F8 | Expansão nacional · portal/app | ⬜ | — |
+
+Divisão completa das fases: [`ROADMAP.md`](ROADMAP.md) · plano executável
+passo a passo com gates e ramas de falha: [`PLAN_MAESTRO.md`](PLAN_MAESTRO.md).
+
+## Começando
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt && playwright install chromium
 
-# Suite de testes do motor V2
+# suite de testes do motor V2
 python -m pytest scripts/fase2_municipios/v2 -q
 ```
 
-Os comandos de avaliação/corrida (golden live, comparação semântica,
-avaliador legado) estão no `PLAN_MAESTRO.md` §0 com todas as flags. Regras de
-segurança (nunca commitar segredos, corridas congeladas, protocolo STOP por
-FP): `CLAUDE.md`.
+Comandos de avaliação (golden live, comparação semântica) com todas as flags:
+`PLAN_MAESTRO.md` §0. Regras operativas e arquivos protegidos: `CLAUDE.md`.
+
+## Estrutura
+
+```text
+scripts/fase1_bancas/       Crawlers de bancas (RS)
+scripts/fase2_municipios/   Cascata de descoberta (V1, congelada)
+  └─ v2/                    Motor de adjudicação V2 (agentes, portão, eval,
+                            registro de domínios, snapshot/citações, render)
+scripts/eval/               Avaliador golden + baseline V1 (protegido)
+scripts/shared/             Escopo RS, perfil de navegador, waf guard
+config/  data/  docs/       Config · golden set e registros · docs técnicos
+staging/                    Corridas de avaliação congeladas (gitignored)
+```
+
+## Documentação
+
+| Documento | Conteúdo |
+|---|---|
+| [`ROADMAP.md`](ROADMAP.md) | O projeto em fases F0-F8: passado, presente, futuro, gates |
+| [`PLAN_MAESTRO.md`](PLAN_MAESTRO.md) | Plano de registro: cada passo com pré-requisito, ações, prova e rama de falha |
+| [`MANUAL_IMPLEMENTACION.md`](MANUAL_IMPLEMENTACION.md) | Arquitetura do motor: 4 planos, modelo de dados canônico, funil de descoberta |
+| [`MANUAL_APP.md`](MANUAL_APP.md) | Construção do portal/app: stack, etapas, LGPD, alertas |
+| [`CLAUDE.md`](CLAUDE.md) | Regras operativas para agentes e humanos |
+| `docs/` | Docs técnicos (arquitetura fase 2, runbook Brasil, specs) e histórico (`docs/archivo/`) |
+
+## Governança de qualidade
+
+- **Protocolo STOP**: um único falso positivo detectado interrompe a fase até
+  a correção geral (nunca remendo por município).
+- **Golden → holdout**: toda capacidade nova valida contra verdade manual e
+  depois contra um conjunto cego antes de operar em escala.
+- **Sem auto-aprendizado do oráculo**: padrões entram apenas como fatos
+  curados com proveniência humana (registro de domínios versionado).

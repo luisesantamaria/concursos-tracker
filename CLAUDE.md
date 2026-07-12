@@ -18,6 +18,18 @@ The project began as an Ache Concursos radar prototype and evolved into a source
 
 Do not restart from scratch unless the user explicitly asks.
 
+## Living Docs (obligatorio al avanzar)
+
+`README.md` (tabla Status + badge de fase), `ROADMAP.md` (estados ✅/🔄/⬜) y
+`PLAN_MAESTRO.md` §0 (estado verificado + pasos marcados) son la fuente de
+verdad de "dónde estamos". **Una sesión que cierra un paso, corre una
+evaluación o cambia el estado del proyecto NO está terminada hasta
+actualizarlos** — usa la skill `/actualizar-docs` (checklist y reglas de
+consistencia en `.claude/skills/actualizar-docs/SKILL.md`). Regla dura: solo
+hechos con artefacto verificable; nunca marcar ✅ sin la PRUEBA del paso
+cumplida; los mismos números en los tres documentos. Docs desactualizados =
+el próximo agente da vueltas en círculos = bug.
+
 ## Commands
 
 Install:
