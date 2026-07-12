@@ -56,6 +56,19 @@ comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
   humanamente sin FP; 6 abstenciones legítimas (Almirante×2, Arambaré/CP,
   Caxias/PSS, Itaara/PSS, Canoas/PSS-bug). Paso siguiente: **F2.P6** (holdout
   ciego de 50, REQUIERE autorización de Luis).
+- F2.P6 ejecutado (12-jul, cierre pendiente): holdout ciego de 50 municipios
+  NO-golden (88 unidades, URLs V1 sin curar, gemini_policy free→pagado
+  funcionó). **21/88 confirmadas (24%); auditoría de las 21: 17 ratificadas,
+  4 dudas, 0 FP duros** (oráculo pendiente: Canela = índice oficial vacío).
+  Cobertura NO cumple gate → SI-FALLA activada. Diagnóstico de las 64
+  no-confirmadas (`docs/f2_p6_acta_holdout_20260712.md`): #1 cobertura de
+  autoridad en municipios nuevos 39% (registro solo cubre golden; gate
+  fail-closed degrada consensos A+B válidos) · #2 render interactivo 27% ·
+  #3 citas quote_ambiguous+charset 19% · #4 transporte 6%; drift V1 marginal
+  (~3%). Proyección con palancas 1-4: 73-85% → re-corrida del holdout cierra
+  el paso.
+- F3.P1 runner construido (12-jul): `v2/eval/platform_probe_runner.py` +
+  42 tests offline (suite 480 verdes). NO corrido sobre los 497 aún.
 - Comparación controlada (`semantic_matrix_r3_20260712/`): sobre evidencia
   idéntica, V2 acierta 22/23 vs 2/23 de las heurísticas V1.
 - Fixture y oracle: `url_map_golden_fixture_20260712.csv` (36 URLs verificadas),
@@ -195,7 +208,18 @@ confirmó con URL exacta (¿match válido o sobre-confirmación?).
 **PRUEBA**: acta escrita (doc en staging) con cada differ adjudicado.
 **SI aparece un FP**: R-T1.
 
-### F2.P6 — Holdout 50 (prueba de generalización; NO antes de P5)
+### F2.P6 🔄 (12-jul-2026, ejecutado — cierre pendiente) — Holdout 50
+**RESULTADO**: 21/88 confirmadas (24%). Auditoría de las 21: **17 ratificadas,
+4 dudas, 0 FP duros** (pendiente oráculo de Luis sobre Canela = índice oficial
+vacío). Gate de cobertura NO cumplido → rama SI-FALLA activada. Diagnóstico
+completo de las 64 no-confirmadas (acta:
+`docs/f2_p6_acta_holdout_20260712.md`): la palanca #1 (39%) es COBERTURA DE
+AUTORIDAD en municipios nuevos (registro solo cubre golden; el gate fail-closed
+degrada consensos A+B válidos a revisar) → F3.P2 + reglas de plataforma
+delegada; #2 render interactivo (27%, F3.P5); #3 sub-bugs de citas
+quote_ambiguous+charset (19%); #4 transporte SSL/Content-Type (6%). El drift
+de URLs V1 resultó marginal (~3%). Proyección honesta con palancas 1-4:
+73-85%. Re-corrida del holdout tras implementar palancas = criterio de cierre.
 **ENTRADA**: acta de P5; autorización explícita de Luis.
 **ACCIONES**: 50 municipios de los 497 NO presentes en el golden,
 estratificados por plataforma. Descubrimiento SIN curación manual (registro +
