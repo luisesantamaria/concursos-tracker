@@ -2,8 +2,11 @@
 
 [![CI](https://github.com/luisesantamaria/concursos-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/luisesantamaria/concursos-tracker/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
-![Status](https://img.shields.io/badge/fase-2%20de%208%20·%20RS-orange)
-![Precisão](https://img.shields.io/badge/falsos%20positivos-0%20medidos-brightgreen)
+![Fase](https://img.shields.io/badge/fase-2%20de%208%20·%20RS-orange)
+![Golden](https://img.shields.io/badge/golden%20RS-22%2F36-yellow)
+![Precisão](https://img.shields.io/badge/falsos%20positivos-0%20em%2022%20auditadas-brightgreen)
+![Tests](https://img.shields.io/badge/tests%20V2-419%20verdes-brightgreen)
+![Atualizado](https://img.shields.io/badge/estado%20verificado-2026--07--12-blue)
 
 **Motor de dados e portal de avisos para concursos públicos e processos
 seletivos no Brasil.** Descobre, verifica e monitora as fontes oficiais de
