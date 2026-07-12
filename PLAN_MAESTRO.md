@@ -231,6 +231,26 @@ confirmadas con FP=0.
 **SALIDA DE FASE**: descubrimiento sin manos para la mayoría; residuo humano
 acotado y medido.
 
+### F3.P5 — Exploración interactiva acotada (paginación/filtros en la evidencia)
+**ENTRADA**: F3.P4; o antes, si el holdout F2.P6 muestra ≥5 unidades
+bloqueadas solo por interacción.
+**ACCIONES**: extender el fallback de render de V2 a una exploración ACOTADA
+cuando el índice renderizado no muestra ítems del bucket pero SÍ controles de
+exploración: (a) whitelist de interacciones seguras — enlaces de paginación
+(hasta 3 páginas), filtro de año → "todos"/ano=0, submit de búsqueda VACÍA,
+pestañas vigente/encerrado; JAMÁS formularios con datos, login ni descargas;
+(b) cada estado capturado entra como fuente adicional del EvidenceSnapshot
+con provenance del camino de interacción (qué control, en qué orden); (c) las
+citas se verifican contra el estado que las contiene; (d) límite duro por
+unidad (≤5 interacciones, timeout global) y respeto de waf_guard.
+**PRUEBA**: golden de interacción chico (10 unidades reales que hoy exigen
+paginación/filtro/clic — incluidas las `requiere_revision_humana` que Luis
+adjudique automatizables): ≥7/10 llegan a evidencia con ítems del bucket
+visibles, 0 FP nuevos, y el fiscal B recibe el camino para fiscalizar.
+**SI FALLA** (portales frágiles/raros): esas unidades quedan `revisar` con
+nota `requiere_interaccion` y el camino pre-navegado documentado — cola
+humana asistida, nunca adivinanza.
+
 # FASE 4 — Señal de actividad (demand-driven)
 
 ### F4.P1 — Prototipo Querido Diário sobre RS

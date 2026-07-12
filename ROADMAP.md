@@ -61,7 +61,9 @@ RS. No extrae editais (eso es F6).
 Cerrar el hueco que V2 no cubre: PROPONER candidatas a escala sin curación
 manual. Activar Tier 1.5 (patrones por plataforma CMS, ~50% de cobertura) como
 proponente principal; registro dominio↔código IBGE (Wikidata + sondeo DNS);
-agente navegador solo para la cola larga.
+agente navegador solo para la cola larga; **exploración interactiva acotada**
+(paginación, filtros de año, "consultar") para índices que exigen navegar —
+whitelist segura, evidencia por estado con provenance del camino (F3.P5).
 - **Gate**: en RS, ≥45% de unidades propuestas por patrón con WRNG=0; registro
   ≥95% de dominios RS automático.
 
