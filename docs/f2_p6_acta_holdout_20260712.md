@@ -15,19 +15,28 @@ activada (el hueco es aguas arriba, no del adjudicador).
 ## Auditoría de las 21 confirmadas (7 lotes de pre-auditores anti-FP)
 **17 RATIFICADAS limpias · 4 DUDA · 0 FP duros** (ningún municipio equivocado,
 ninguna licitação-como-concurso, ninguna noticia-como-índice).
-Las 4 dudas:
-- **Canela CP+PSS**: portal de búsqueda oficial del municipio, estructura del
-  bucket presente, pero CERO ítems en todos los años y la cita de bucket ancla
-  en el MENSAJE DE AUSENCIA ("Não foram encontrados..."). El "combinado" con
-  confianza alta viola el espíritu del check de doble evidencia. → PENDIENTE
-  DE ORÁCULO (Luis): ¿índice oficial vacío = confirmable o revisar?
-- **Montenegro/CP**: URL y decisión correctas (ítems reales verificados en
-  vivo), pero la cita de bucket ancló en menú y no en ítem → nota de calidad
-  de cita, no FP.
-- **Itacurubi/PSS**: contenido anclado real, pero usó el contenedor genérico
-  "Editais Diversos" cuando el hermano CP ya usa /site/concursos específica →
-  mejorar URL, no FP.
-Precisión estricta: 17/21 (81%) · precisión sin-FP-duro: 21/21 con 2-4 notas.
+Las 4 dudas — RESUELTAS por verificación en navegador (12-jul, delegado por
+Luis a Fable: "no me preguntes veredictos, sácalos tú"):
+- **Canela CP+PSS = FALSO POSITIVO REAL (×2)**. Verificado en vivo: la
+  búsqueda del portal de transparencia con filtros "Todos" (todas las
+  entidades, años 2013-2026) devuelve "Nenhum registro encontrado" — cero
+  ítems en la historia del módulo. Y el municipio SÍ publica sus certames:
+  en canela.rs.gov.br/sitenovo/categorias-publicacoes/cat-publicacoes-legais/
+  (categoría "Concurso / Processos Seletivos", filtro combobox) viven el PSS
+  01/2026 (Legalle), el Concurso 01/2023 con convocatorias 2025 y el PSS de
+  estagiários 2026. Confirmamos un módulo que la prefeitura nunca alimenta:
+  un usuario suscrito jamás recibiría alerta. → R-T1 STOP: corrección general
+  (regla anti-índice-vacío: las citas de bucket deben anclar en ítems, nunca
+  en mensajes de ausencia) + caso al fixture envenenado.
+- **Montenegro/CP = RATIFICADA**. Verificado en vivo: índice real con
+  Concurso Público 2016, 2019 y 2025. La cita anclada en menú es nota de
+  calidad, no FP.
+- **Itacurubi/PSS = RATIFICADA**. Verificado en vivo: los PSS VIGENTES
+  (Edital 01/2026 PIM, PSS 001/2026 cozinheira) se publican en /site/editais;
+  /site/concursos solo tiene PSS de 2015. El motor eligió la página correcta.
+**Precisión final del holdout: 19/21 (90.5%), 2 FP (Canela ×2)** → protocolo
+STOP R-T1 activado; el fix general + caso al fixture envenenado entran con
+las palancas ANTES de cualquier re-corrida.
 
 ## Diagnóstico de las 64 no-confirmadas (8 clasificadores + síntesis)
 | Palanca | N | % |
