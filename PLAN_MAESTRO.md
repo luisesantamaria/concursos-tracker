@@ -1,14 +1,16 @@
 # PLAN MAESTRO — Concursos Tracker
 
-**Versión**: 1.0 (12-jul-2026) · **Autoridad**: este documento manda sobre
-ROADMAP.md (historial) y complementa CLAUDE.md (reglas operativas).
+**Versión**: 2.0 (12-jul-2026) · **Autoridad**: este es el plan de registro.
+`ROADMAP.md` divide el proyecto en las MISMAS fases (F0-F8) con la vista de
+alto nivel; `CLAUDE.md` tiene las reglas operativas; los manuales tienen la
+arquitectura (`MANUAL_IMPLEMENTACION.md`) y el producto (`MANUAL_APP.md`).
 
 **Cómo usar este documento (para cualquier agente/IA/humano)**: cada PASO
 tiene `ENTRADA` (prerrequisito verificable), `ACCIONES` (qué hacer, con
 comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
-(la rama a tomar). Ejecutar en orden; no saltar gates. Antes de tocar código,
-leer CLAUDE.md (intocables, reglas) y `MANUAL_IMPLEMENTACION.md`
-(la arquitectura de 4 planos y el embudo convergente §6b).
+(la rama a tomar). Ejecutar en orden; no saltar gates. F0 y F1 están hechas
+(ver ROADMAP); este plan arranca en la fase actual (F2) y llega al producto
+(F8).
 
 ---
 
@@ -25,15 +27,15 @@ leer CLAUDE.md (intocables, reglas) y `MANUAL_IMPLEMENTACION.md`
   idéntica, V2 acierta 22/23 vs 2/23 de las heurísticas V1.
 - Fixture y oracle: `url_map_golden_fixture_20260712.csv` (36 URLs verificadas),
   `golden_oracle_manifest_20260712.json`, diff razonado en
-  `url_fixture_diff_20260712.csv`.
+  `url_fixture_diff_20260712.csv` (todo en `staging/fase2_v2/eval/`).
 - Advertencia estadística vigente: 0-FP demostrado solo sobre n=22
   confirmaciones (cota superior 13.6% al 95%). No prometer 0-FP a escala
-  hasta cumplir F1.P6.
-- Análisis de escala (síntesis Opus 12-jul): demand-driven >> backfill
+  hasta cumplir F2.P8.
+- Análisis de escala (síntesis adversarial 12-jul): demand-driven >> backfill
   (~$15-20/año y ~12 h-humano/año vs 208 días free / ~200 h); techo free
   EMPÍRICO ~125 req/día (contradice blogs de 1.500) — verificar antes de
-  planear; Tier 1.5 nunca corrido a escala; B/C sin capturas netas en 133
-  unidades pero nunca enfrentaron veneno.
+  planear; Tier 1.5 nunca corrido a escala; fiscal B/juez C sin capturas
+  netas en 133 unidades pero nunca enfrentaron veneno.
 
 **Comandos base (Windows→WSL; el .venv es Linux):**
 ```bash
@@ -46,41 +48,42 @@ wsl.exe -e bash -lc '... .venv/bin/python -m scripts.fase2_municipios.v2.eval.ru
   --url-map staging/fase2_v2/eval/url_map_golden_fixture_20260712.csv \
   --no-v1-differential --render-fallback \
   --output-dir staging/fase2_v2/eval/<RUN_NUEVO> \
-  --credentials-file /home/orion/.hermes/gemini_concursos.env --seed <YYYYMMDDNN>'
+  --credentials-file <env-file-con-GEMINI_API_KEY_FREE> --seed <YYYYMMDDNN>'
 # matriz semántica ex-post (sin modelo)
-wsl.exe ... -m scripts.fase2_municipios.v2.eval.semantic_comparison --run-dir <RUN> --golden ... --output-dir <NUEVO>
+wsl.exe ... -m scripts.fase2_municipios.v2.eval.semantic_comparison --run-dir <RUN> --golden data/golden_set_v1.csv --output-dir <NUEVO>
 ```
 
-## Reglas transversales (aplican a TODOS los pasos)
+## Reglas transversales (aplican a TODOS los pasos de TODAS las fases)
 
-- **R-T1 · Protocolo STOP por FP**: si una auditoría encuentra UNA confirmación
-  con URL/decisión equivocada → parar la fase, abrir análisis de causa raíz,
-  corregir de forma GENERAL (nunca hardcode municipal), añadir el caso al
-  fixture envenenado, re-correr el gate de la fase. Ningún avance con FP
-  abierto.
-- **R-T2 · No enseñar etiquetas**: el golden/manifiesto jamás se lee en
-  runtime; las URLs son input de adquisición, las decisiones se ganan
-  adjudicando contenido vivo. Aprendizajes entran SOLO como hechos curados
-  con provenance (registro de dominios, v2/memory promotion por humano).
-- **R-T3 · Corridas congeladas**: durante una corrida de evaluación no se
-  toca código ni skills; output SIEMPRE a directorio nuevo en
-  `staging/fase2_v2/eval/`; corridas previas no se sobrescriben; seed nuevo
-  por corrida; sin promoción al CSV canónico desde corridas de evaluación.
-- **R-T4 · RED→GREEN**: todo fix lleva primero un test que falla; la suite
-  completa v2 debe quedar verde antes de cualquier corrida.
-- **R-T5 · Paid=0 y grounding=off** en evaluación salvo autorización explícita
-  de Luis. Producción a escala usará pagado (decisión F1.P7).
-- **R-T6 · Intocables**: ver CLAUDE.md; incluye verdict_extract.py,
-  cascade_municipios.py, golden CSV, corridas congeladas.
-- **R-T7 · Memoria**: al cerrar cada paso, actualizar el checkpoint del
-  proyecto (memoria del agente o HANDOFF.md) con: qué se hizo, números, y el
-  paso siguiente.
+- **R-T1 · Protocolo STOP por FP**: si una auditoría encuentra UNA afirmación
+  publicable equivocada (URL confirmada errada; más adelante: campo extraído
+  errado, evento mal tipificado) → parar la fase, causa raíz, corrección
+  GENERAL (nunca hardcode por municipio/portal), añadir el caso al fixture
+  envenenado de esa fase, re-correr el gate. Ningún avance con FP abierto.
+- **R-T2 · No enseñar etiquetas**: los goldens/manifiestos jamás se leen en
+  runtime; las decisiones se ganan adjudicando contenido vivo. Aprendizajes
+  entran SOLO como hechos curados con provenance humana (registro de
+  dominios, promoción v2/memory).
+- **R-T3 · Corridas congeladas**: sin cambios de código/prompts durante una
+  corrida de evaluación; output a directorio nuevo en `staging/`; seed nuevo;
+  corridas previas intactas; sin promoción a datos canónicos desde evaluación.
+- **R-T4 · RED→GREEN**: todo fix con test que falla primero; suite verde
+  antes de cualquier corrida.
+- **R-T5 · Paid=0 y grounding=off** en evaluación salvo autorización
+  explícita. Producción usará API pagada (decisión F2.P7).
+- **R-T6 · Intocables**: ver CLAUDE.md (verdict_extract.py,
+  cascade_municipios.py, golden CSV, corridas congeladas).
+- **R-T7 · Cierre de paso**: al terminar cada paso, registrar en la memoria
+  del proyecto: qué se hizo, números y el paso siguiente.
+- **R-T8 · Patrón golden→holdout**: toda capacidad nueva (descubrimiento,
+  señal, monitoreo, extracción) se valida contra una verdad manual chica y
+  luego contra un holdout ciego antes de operarse a escala.
 
 ---
 
-# FASE 1 — Cerrar RS con V2 (el gate de todo lo demás)
+# FASE 2 — Cerrar descubrimiento municipal RS (fase actual)
 
-### F1.P1 — Fixes mecánicos de evidencia/fetch
+### F2.P1 — Fixes mecánicos de evidencia/fetch
 **ENTRADA**: suite 419 verde.
 **ACCIONES** (cada una con test RED→GREEN):
 1. `MAX_DIRECT_SNAPSHOT_CHARS` 200.000 → 400.000 en
@@ -97,160 +100,299 @@ wsl.exe ... -m scripts.fase2_municipios.v2.eval.semantic_comparison --run-dir <R
    orchestration + adapter + scoring del runner; el gate sigue sin publicar
    nada afirmativo sin citas.
 **PRUEBA**: suite completa verde; tests nuevos cubren los 4 casos.
-**SI FALLA** (algún fix rompe otra cosa): revertir SOLO ese fix, documentar en
-el paso, continuar con los demás — ninguno depende de otro.
+**SI FALLA** (algún fix rompe otra cosa): revertir SOLO ese fix, documentar,
+continuar con los demás — ninguno depende de otro.
 
-### F1.P2 — Política de índice (2 reglas generales en skills)
+### F2.P2 — Política de índice (2 reglas generales en skills)
 **ENTRADA**: decisión de Luis registrada (estado 12-jul: contenedor mixto =
-SÍ, ya implícito en README "content over slug"; feed-tag = pendiente de
-confirmación explícita, default recomendado SÍ).
+SÍ, ya implícito en el principio "content over slug"; feed-tag = pendiente,
+default recomendado SÍ).
 **ACCIONES**: en `skills/fase2-resource-certifier/SKILL.md` añadir (general,
 sin municipios): (a) contenedor oficial mixto cuenta como índice del bucket
 SI contiene ítems citables del bucket; (b) feed/tag oficial agregador cuenta
 como listado (una noticia individual sigue rechazada); (c) sección vacía
-NUNCA se confirma. Espejo en fiscal B (nuevo motivo de acusación si el
-contenedor no tiene ítems del bucket).
-**PRUEBA**: suite verde; los sha256 de skills re-registrados en memoria.
-**SI FALLA** (Luis dice NO a feed-tag): solo (a) y (c); Canoas/PS queda como
-revisar legítimo esperado y el techo de F1.P4 baja en 1.
+NUNCA se confirma. Espejo en fiscal B (motivo de acusación si el contenedor
+no tiene ítems del bucket).
+**PRUEBA**: suite verde; sha256 de skills re-registrados.
+**SI Luis dice NO a feed-tag**: solo (a) y (c); Canoas/PS queda como revisar
+legítimo y el techo de F2.P4 baja en 1.
 
-### F1.P3 — Fixture envenenado (mide a B/C y blinda el 0-FP)
-**ENTRADA**: F1.P1 hecho.
+### F2.P3 — Fixture envenenado (mide al fiscal B y blinda el 0-FP)
+**ENTRADA**: F2.P1 hecho.
 **ACCIONES**: construir `staging/fase2_v2/eval/fixture_envenenado_v1.csv` con
-15-20 unidades donde la URL es PLAUSIBLE pero INCORRECTA, tomadas de páginas
-reales de RS fuera del golden: (tipos obligatorios) página de licitações,
-noticia individual de un concurso, índice del bucket contrario, índice de
-OTRO municipio, página de detalle de un edital, sección cultural
-(soberanas), soft-404 con 200. Correr V2 sobre ellas (mismo comando patrón,
-golden sintético con expectativa `rechazo/revisar` por unidad).
-**PRUEBA (doble)**: (1) **FP=0**: ninguna unidad envenenada termina
-`confirmado` — si una pasa, R-T1 (STOP) y el hueco es del gate/skills, no de
-B. (2) Conteo de capturas de B/C: ¿cuántos venenos detuvo B que A no detuvo
-solo?
-**SI B/C capturan ≥1 neto**: se quedan como están. **SI capturan 0**: activar
-modo slim por defecto (A+gate; B/C solo en desacuerdo o muestreo aleatorio
-10%), manteniendo el código de B/C intacto para re-activación.
+15-20 unidades donde la URL es PLAUSIBLE pero INCORRECTA, de páginas reales
+de RS fuera del golden: (tipos obligatorios) licitações, noticia individual
+de concurso, índice del bucket contrario, índice de OTRO municipio, detalle
+de un edital, sección cultural (soberanas), soft-404 con 200. Correr V2 con
+golden sintético (expectativa `rechazo/revisar` por unidad).
+**PRUEBA (doble)**: (1) **FP=0**: ninguna envenenada termina `confirmado` —
+si una pasa: R-T1 y el hueco es del gate/skills. (2) Conteo de capturas
+netas de B/C (venenos que A no detuvo solo).
+**SI B/C capturan ≥1 neto**: se quedan. **SI capturan 0**: modo slim por
+defecto (A+gate; B/C solo en desacuerdo o muestreo 10%), código intacto.
 
-### F1.P4 — R4 contra el golden 36
-**ENTRADA**: F1.P1-P3 verdes.
-**ACCIONES**: corrida R4 (comando patrón, `--output-dir ...golden36_<fecha>_r4`,
-seed nuevo). Generar `v2_only_differential` + `semantic_comparison`.
-**PRUEBA**: (1) FP=0 (differ solo abstenciones) — si no, R-T1. (2) match ≥
-30/36. (3) Cada differ restante clasificado y con dueño: `revisar legítimo`
-(adjudicado por Luis como correcto) o `bug` (→ fix general → R5).
-**SI match < 30**: diagnosticar por clase con los artefactos (observability),
-UNA ronda más de fixes generales, R5. Si R5 sigue < 30: presentar a Luis la
-matriz y decidir si el techo restante es aceptable (los "revisar honestos"
-pueden ser correctos — el golden marca 7 unidades requiere_revision_humana).
+### F2.P4 — R4 contra el golden 36
+**ENTRADA**: F2.P1-P3 verdes.
+**ACCIONES**: corrida R4 (comando patrón §0, output nuevo, seed nuevo);
+generar `v2_only_differential` + `semantic_comparison`.
+**PRUEBA**: (1) FP=0 — si no, R-T1. (2) match ≥30/36. (3) Cada differ
+clasificado: `revisar legítimo` (adjudicado por Luis) o `bug` (→ fix general
+→ R5).
+**SI match <30 tras R5**: presentar matriz a Luis y decidir si el techo
+restante es aceptable (el golden marca 7 unidades requiere_revision_humana).
 
-### F1.P5 — Adjudicación humana de cierre RS-golden
+### F2.P5 — Adjudicación humana de cierre RS-golden
 **ENTRADA**: R4/R5 con FP=0.
-**ACCIONES**: Luis revisa (a) las confirmaciones nuevas (muestra o todas), (b)
-los differ marcados `revisar legítimo`, (c) las 6-7 unidades
-requiere_revision_humana que V2 confirmó con URL exacta (¿match válido o
-sobre-confirmación? — decisión de oráculo pendiente del 12-jul).
+**ACCIONES**: Luis revisa (a) confirmaciones nuevas, (b) differ marcados
+`revisar legítimo`, (c) las 6-7 unidades requiere_revision_humana que V2
+confirmó con URL exacta (¿match válido o sobre-confirmación?).
 **PRUEBA**: acta escrita (doc en staging) con cada differ adjudicado.
-**SI Luis encuentra un FP**: R-T1.
+**SI aparece un FP**: R-T1.
 
-### F1.P6 — Holdout 50 (la prueba de generalización; NO ejecutar antes de P5)
+### F2.P6 — Holdout 50 (prueba de generalización; NO antes de P5)
 **ENTRADA**: acta de P5; autorización explícita de Luis.
-**ACCIONES**: seleccionar 50 municipios de los 497 NO presentes en el golden,
-estratificados por plataforma (atende/elotech/govbr/custom proporcional).
-Descubrimiento SIN curación manual: registro + Tier 1.5 + cascada → V2.
-Luis construye la verdad DESPUÉS de la corrida (a ciegas) solo para las
-unidades que V2 confirmó + una muestra de las abstenciones.
-**PRUEBA**: FP=0 en confirmadas (hard); precisión ≥95%; tasa de revisión
-(abstenciones) ≤ 30% del total.
-**SI FP>0**: R-T1 + el caso entra al fixture envenenado. **SI revisión >30%**:
-el hueco es descubrimiento → reforzar F2 (Tier 1.5/registro) antes de re-intentar.
+**ACCIONES**: 50 municipios de los 497 NO presentes en el golden,
+estratificados por plataforma. Descubrimiento SIN curación manual (registro +
+Tier 1.5 + cascada) → V2. La verdad se construye DESPUÉS de la corrida (a
+ciegas) para las confirmadas + muestra de abstenciones.
+**PRUEBA**: FP=0 en confirmadas (duro); precisión ≥95%; revisión ≤30%.
+**SI FP>0**: R-T1 + caso al fixture envenenado. **SI revisión >30%**: el
+hueco es descubrimiento → adelantar F3.P1-P2 y reintentar.
 
-### F1.P7 — Sonda de cuota + decisión free/pagado
-**ENTRADA**: cualquier momento desde F1.P4.
-**ACCIONES**: quemar ~200 llamadas en 1 día con 1 key free (corrida real o
-replay) y registrar dónde aparece `quota_429` (`approx_rpd` ya se mide).
+### F2.P7 — Sonda de cuota + decisión free/pagado
+**ENTRADA**: cualquier momento desde F2.P4.
+**ACCIONES**: quemar ~200 llamadas en 1 día con 1 key free y registrar dónde
+aparece `quota_429` (`approx_rpd` ya se mide).
 **PRUEBA**: techo real documentado (¿~125 o ~1.500 RPD?).
-**DECISIÓN**: si techo <300 RPD → producción con API pagada (~$151 todo
-Brasil, trivial); free queda solo para desarrollo.
+**DECISIÓN**: techo <300 RPD → producción con API pagada (~$151 todo Brasil,
+trivial); free queda para desarrollo.
 
-### F1.P8 — Corrida 497 RS completa
-**ENTRADA**: F1.P6 verde.
-**ACCIONES**: correr los 497 (menos golden) por lotes de ~50; auditoría
-muestral humana de 50-100 confirmaciones POR LOTE con intervalo de confianza.
+### F2.P8 — Corrida 497 RS completa
+**ENTRADA**: F2.P6 verde.
+**ACCIONES**: correr 497 (menos golden) por lotes de ~50; auditoría muestral
+humana de 50-100 confirmaciones POR LOTE con intervalo de confianza.
 **PRUEBA**: FP=0 en cada muestra; al acumular n≥300 confirmaciones auditadas
-sin FP, la cota superior al 95% baja de ~1% → recién ahí se puede DECIR
+sin FP, la cota superior al 95% baja de ~1% → recién ahí puede DECIRSE
 "cero FP" públicamente.
-**SALIDA DE FASE 1**: mapa RS completo con provenance → alimenta el Plano B.
+**SALIDA DE FASE**: mapa RS completo con provenance → habilita F5 y F8
+(sprints 1-3).
 
-# FASE 2 — Descubrimiento industrializado (el hueco)
+# FASE 3 — Descubrimiento industrializado
 
-### F2.P1 — Tier 1.5 como proponente a escala
-**ENTRADA**: F1.P4 (no requiere holdout).
-**ACCIONES**: correr las sondas por plataforma (`cascade` Tier 1.5, ya
-implementado y golden-limpio) sobre los 497 de RS; registrar % que propone
-candidata y % que coincide con el confirmado de F1.
+### F3.P1 — Tier 1.5 como proponente a escala
+**ENTRADA**: F2.P4 (no requiere holdout).
+**ACCIONES**: correr las sondas por plataforma (Tier 1.5 en cascade, ya
+implementado y golden-limpio; hoy 0/497 filas vienen de él) sobre los 497 de
+RS; registrar % que propone candidata y % que coincide con confirmados F2.
 **PRUEBA**: WRNG=0 (ninguna propuesta contradice un confirmado auditado);
-cobertura de propuesta ≥45% (la concentración de plataformas RS es ~50%).
+cobertura de propuesta ≥45% (concentración de plataformas RS ~50%).
 **SI WRNG>0**: el patrón de esa plataforma se corrige o se degrada a
-"propone-pero-marca-revisar"; jamás se parchea por municipio.
+"propone-pero-marca-revisar"; jamás parche por municipio.
 
-### F2.P2 — Registro dominio↔IBGE nacionalizable
+### F3.P2 — Registro dominio↔IBGE nacionalizable
+**ENTRADA**: ninguna (paralelo a F2).
 **ACCIONES**: tabla por código IBGE (5.570) con dominio oficial; fuentes en
-orden: registro RS existente → Wikidata P856 (dump/SPARQL) → sondeo DNS de
-convenciones por UF → verificación de vida+identidad (script, sin IA).
-Toda fila con `fuente` y `fecha`.
-**PRUEBA**: RS ≥95% cubierto automático (hoy el slug puro ya da ~95% en RS);
-muestra manual de 30 filas nacionales sin error.
+orden: registro RS existente (`scripts/fase2_municipios/v2/data/`) → Wikidata
+P856 (SPARQL/dump) → sondeo DNS de convenciones por UF → verificación de
+vida+identidad (script, sin IA). Toda fila con `fuente` y `fecha`.
+**PRUEBA**: RS ≥95% automático; muestra manual de 30 filas nacionales sin
+error.
+**SI Wikidata/DNS cubren <60% nacional**: añadir fuentes (tribunais de
+contas, asociaciones estaduales) ANTES de aceptar cola manual masiva.
 
-### F2.P3 — Goldens chicos en 2 UFs diversas
-**ACCIONES**: Luis (o revisión humana guiada) construye golden de 10-20
-municipios en 2 UFs no-sur (p.ej. BA/PA); repetir F1.P4-P6 en miniatura.
-**PRUEBA**: mismas métricas que F1. **SI fallan**: las diferencias van a
-patrones de plataforma/registro (F2.P1-P2), NUNCA a reglas por municipio.
+### F3.P3 — Agente navegador para la cola larga
+**ENTRADA**: F3.P1 medido (para conocer el tamaño real del residuo).
+**ACCIONES**: agente Playwright + modelo barato que navega el menú del sitio
+custom como humano (reutiliza Tier 4 + render V2), propone candidata con la
+evidencia de la ruta de navegación (provenance official_navigation). Solo
+para municipios sin patrón de plataforma.
+**PRUEBA**: sobre 20 municipios custom de RS ya confirmados (a ciegas),
+propone la URL correcta ≥70% y NUNCA propone con evidencia inventada.
+**SI <70%**: aceptar cola humana para custom; el agente queda como asistente
+del revisor (pre-navega y documenta), no como proponente.
 
-# FASE 3 — Señal de actividad (habilita demand-driven)
+### F3.P4 — Embudo integrado
+**ENTRADA**: F3.P1-P3.
+**ACCIONES**: orquestar registro→patrón→cascada/agente→V2 como pipeline único
+con telemetría por etapa (qué % resolvió cada una, costo, tiempo).
+**PRUEBA**: sobre una muestra de 100 unidades RS (mezcla de confirmadas y
+vírgenes), el embudo end-to-end (sin curación) reproduce ≥85% de las
+confirmadas con FP=0.
+**SALIDA DE FASE**: descubrimiento sin manos para la mayoría; residuo humano
+acotado y medido.
 
-### F3.P1 — Prototipo Querido Diário sobre RS
-**ACCIONES**: consultar la API de QD por municipio RS con términos
-("concurso público", "processo seletivo", "edital de abertura") sobre los
-últimos 60 días; cruzar con los certames reales conocidos (bancas fase 1 +
-confirmados F1).
+# FASE 4 — Señal de actividad (demand-driven)
+
+### F4.P1 — Prototipo Querido Diário sobre RS
+**ENTRADA**: ninguna (paralelo a F2/F3).
+**ACCIONES**: consultar la API de QD por municipio RS con términos ("concurso
+público", "processo seletivo", "edital de abertura") sobre los últimos 60
+días; cruzar con certames reales conocidos (bancas F1 + confirmados F2).
+Documentar cobertura de QD en RS (qué municipios tienen diário indexado).
 **PRUEBA**: recall ≥80% de los certames conocidos del período; precisión de
-la señal ≥70% (mención real de certame, no ruido).
-**SI QD no cubre suficiente RS**: complementar señal con bancas (fase 1 ya
-las monitorea) + radar Ache/PCI como descubrimiento (nunca autoridad), y
-documentar cobertura por fuente.
+señal ≥70% (mención real, no ruido).
+**SI QD no cubre suficiente RS**: complementar con bancas (F1 ya las
+monitorea) + radar Ache/PCI como señal (nunca autoridad); documentar
+cobertura por fuente y el residuo ciego.
 
-### F3.P2 — Cola demand-driven
+### F4.P2 — Clasificador de señal
+**ENTRADA**: F4.P1.
+**ACCIONES**: IA-con-citas (mismo patrón V2, 1 llamada barata) que convierte
+una mención del diário en (municipio IBGE, bucket, tipo de evento probable,
+cita literal). Golden chico: 50 menciones anotadas a mano.
+**PRUEBA**: ≥90% de clasificación correcta sobre el golden de menciones; 0
+municipios mal asignados (la cita debe contener el nombre/órgano).
+**SI <90%**: iterar prompt/contrato UNA vez; si persiste, degradar a señal
+"municipio+fecha" sin tipo (sigue siendo útil para priorizar).
+
+### F4.P3 — Cola demand-driven
+**ENTRADA**: F4.P1-P2 + F3.P4.
 **ACCIONES**: job que convierte señal→(municipio, bucket) a verificar; si no
-hay URL confirmada fresca (TTL 90 días) → dispara descubrimiento F2 + V2; si
-hay → dispara lectura de monitoreo (F4).
-**PRUEBA**: en 30 días, ≥90% de los certames RS señalados terminan con
-fuente confirmada o en cola humana con SLA <7 días.
+hay URL confirmada fresca (TTL 90 días) → dispara embudo F3 + V2; si hay →
+dispara lectura de monitoreo (F5). Telemetría: latencia señal→confirmación.
+**PRUEBA**: en 30 días, ≥90% de los certames RS señalados terminan con fuente
+confirmada o en cola humana con SLA <7 días.
+**SALIDA DE FASE**: el sistema decide SOLO qué verificar y cuándo; el costo
+pasa de "mapear Brasil" a "~10 llamadas/día".
 
-# FASE 4 — Monitoreo (Plano B del MANUAL_IMPLEMENTACION)
-Scheduler + diff de contenido normalizado + clasificación IA-con-citas de
-cambios → eventos tipificados. **PRUEBA de fase**: 30 días detectando los
-editais nuevos reales de RS (recall-check vs radar) con 0 avisos falsos.
+# FASE 5 — Monitoreo continuo (Plano B)
 
-# FASE 5 — Extracción de certames (Plano C)
-Empezar por bancas; golden de extracción de 30 editais anotados a mano;
-campos núcleo ≥90%, 0 campos inventados (sin evidencia ⇒ null+revisar).
-Resolver identidad multi-fuente (clave órgão+edital+año+banca) antes de
-mostrar nada al usuario.
+### F5.P1 — Scheduler con estado por fuente
+**ENTRADA**: mapa RS de F2.P8.
+**ACCIONES**: tabla `fuente` con frecuencia adaptativa (banca con certame
+activo=diaria; municipal con actividad=diaria/semanal; quieto=quincenal;
+señal F4 fuerza lectura inmediata). Corridas desde runner Brasil (RUNBOOK).
+**PRUEBA**: 7 días operando sobre RS sin saturar dominios (respeta waf_guard)
+y sin fuente activa >72h sin check.
 
-# FASE 6 — Producto
-Seguir `MANUAL_APP.md` (etapas 0-9). Los sprints 1-2
-(DB+API) pueden arrancar en paralelo desde el cierre de F1.P8 con el CSV
-canónico; las alertas dependen de FASE 4.
+### F5.P2 — Detección de cambio (diff)
+**ACCIONES**: snapshot normalizado del listado (texto visible del main, no
+HTML crudo) + hash; comparar contra el anterior; solo los cambiados pasan a
+clasificación. Persistir ambos snapshots (evidencia).
+**PRUEBA**: sobre 20 fuentes con cambios sintéticos inyectados (fixture),
+detecta 20/20; sobre 50 fuentes reales sin cambios, <5% de falsos cambios
+(ruido de fechas/contadores debe normalizarse).
+**SI ruido >5%**: mejorar normalización (fechas relativas, contadores,
+banners) — general, nunca por sitio.
+
+### F5.P3 — Clasificación del cambio (IA con citas)
+**ACCIONES**: para cada diff, 1 llamada barata con el patrón V2 (evidencia
+congelada, citas verificadas): ¿certame NUEVO, documento nuevo de certame
+conocido, o ruido? Salida = evento tipificado con cita.
+**PRUEBA**: golden de 40 diffs anotados (de los cambios reales del período de
+F5.P1): ≥90% correcto, 0 eventos inventados.
+
+### F5.P4 — Detector de URL rota/migrada
+**ACCIONES**: 404/redirect a home/vacío persistente (2 checks) → marcar
+fuente `rota` → re-disparar embudo F3 para ese municipio → V2 confirma la
+nueva → la vieja queda en historial con provenance.
+**PRUEBA**: simular 5 migraciones (fixture) → 5/5 re-descubiertas o en cola
+humana; ninguna fuente rota sigue "confirmada".
+
+### F5.P5 — Gate de fase (30 días en vivo)
+**PRUEBA**: 30 días sobre RS: detectar los editais nuevos reales del período
+(recall-check contra radar Ache/PCI como auditoría) con **0 avisos falsos** y
+SLA de detección 24-48h para fuentes activas.
+**SI recall <objetivo**: mapear qué certames se perdieron y POR QUÉ fuente
+debió verse (¿hueco de mapa? ¿de señal? ¿de diff?) — el hueco define qué fase
+refuerza (F2/F4/F5).
+
+# FASE 6 — Extracción y consolidación (Plano C)
+
+### F6.P1 — Golden de extracción
+**ACCIONES**: Luis (o revisión guiada) anota a mano 30 editais reales de
+bancas RS (F1): campos núcleo (órgão, nº edital, año, cargos con
+escolaridade/vagas/salário, taxa, fechas de inscripción/prueba) + offsets de
+la evidencia en el PDF/página.
+**PRUEBA**: golden versionado con hash, como el de F2.
+
+### F6.P2 — Extractor de editais (bancas primero)
+**ACCIONES**: pipeline PDF→texto (con OCR fallback) → IA con citas por página
+(patrón V2: campos + cita literal cada uno; sin evidencia ⇒ null+flag) →
+validación de tipos por código (fechas, moneda, enums de escolaridade).
+**PRUEBA**: contra el golden F6.P1: ≥90% de campos núcleo correctos; **0
+campos inventados** (todo valor sin cita anclada = fallo duro).
+**SI OCR/formatos rompen >20%**: cola humana por familia de formato,
+documentada; nunca "mejor esfuerzo" silencioso.
+
+### F6.P3 — Resolvedor de identidad multi-fuente
+**ACCIONES**: entidad Certame con clave natural (órgão normalizado, nº
+edital, año, tipo) + banca; matcher que une menciones de banca (F1),
+municipal (F2/F5) y diário (F4) SOLO con evidencia citada de la clave; en
+duda, quedan separadas con flag `posible_duplicado`.
+**PRUEBA**: sobre 50 certames RS con presencia multi-fuente conocida: ≥95%
+unificados correctamente, **0 fusiones incorrectas** (fusionar dos certames
+distintos es el FP de esta fase → R-T1).
+
+### F6.P4 — Timeline de eventos
+**ACCIONES**: tipificar cada documento/mención (abertura, retificação,
+prorrogação, resultado, convocação, homologação, nomeação) y colgarla del
+certame con fecha y fuente-que-prueba.
+**PRUEBA**: 50 certames RS con timeline completa auditada por Luis; ningún
+evento sin documento fuente.
+**SALIDA DE FASE**: el dato que el producto necesita: certames estructurados,
+completos y con provenance por campo.
+
+# FASE 7 — Expansión nacional (demand-driven)
+
+### F7.P1 — Goldens chicos en 2-3 UFs diversas
+**ENTRADA**: F2 cerrada; F3.P4 operando en RS.
+**ACCIONES**: golden de 10-20 municipios en 2-3 UFs no-sur (p.ej. BA, PA,
+GO); repetir F2.P4-P6 en miniatura por UF (los CMS y convenciones de dominio
+cambian por región).
+**PRUEBA**: por UF: FP=0, revisión ≤30%.
+**SI una UF falla**: las diferencias se corrigen en patrones de
+plataforma/registro (F3), NUNCA con reglas por municipio.
+
+### F7.P2 — Rollout por UF bajo señal
+**ACCIONES**: habilitar la cola demand-driven (F4.P3) para las UFs validadas;
+la señal nacional (QD cubre ~grandes municipios; bancas nacionales; radar)
+decide el orden. Auditoría muestral por lote (como F2.P8) hasta n≥300
+confirmaciones nacionales sin FP.
+**PRUEBA**: cobertura de certames ACTIVOS ≥ radar de referencia en las UFs
+habilitadas, con el estándar de evidencia intacto.
+**SI la cuota/costo muerde**: ya se decidió pagado en F2.P7 (~$151 el país);
+el freno realista es la cola humana → priorizar por población/actividad.
+
+# FASE 8 — Producto (portal/app)
+
+Sigue `MANUAL_APP.md` (etapas 0-9 con stack y trampas). Gates de este plan:
+
+### F8.P1 — DB + API de catálogo (arranca al cerrar F2.P8)
+**ACCIONES**: Postgres+PostGIS con el modelo canónico; loader idempotente
+CSV→DB; `GET /certames` con filtros. Solo filas `confirmado` se sirven.
+**PRUEBA**: la API devuelve los confirmados reales de RS con provenance.
+
+### F8.P2 — Web pública consultable
+**PRUEBA**: buscar "Canoas, superior, R$3.000+" devuelve certames reales con
+fuentes enlazadas; páginas server-rendered con schema.org/JobPosting.
+
+### F8.P3 — Cuentas + perfil (LGPD)
+**PRUEBA**: registro <2 min; export/borrado self-service; política publicada.
+
+### F8.P4 — Matching + alertas (requiere F5 y F6)
+**ACCIONES**: matcher por reglas explícitas (escolaridade+geo+salario);
+eventos F5/F6 → notificaciones idempotentes; email digest + web push;
+instantáneo solo para deadline/apertura que matchea.
+**PRUEBA**: usuario de prueba recibe alerta real <48h de la publicación
+real; 0 alertas falsas en el período de prueba.
+
+### F8.P5 — Beta cerrada RS
+**PRUEBA**: ~50 usuarios reales; métricas de Etapa 8 del MANUAL_APP
+(retención s4, % alertas abiertas, reportes de error/1.000 vistas). El botón
+"reportar error" alimenta la cola de revisión y el fixture envenenado.
+**SI la retención no justifica expandir**: iterar producto con RS antes de
+gastar en F7 — los datos de RS ya sostienen el aprendizaje.
 
 ---
 
 ## Decisiones pendientes registradas (dueño: Luis)
-1. Feed-tag oficial como índice válido (F1.P2) — default recomendado: SÍ.
-2. Las 6 confirmaciones con `requiere_revision_humana` (F1.P5): ¿match válido?
-3. Autorización del holdout 50 (F1.P6) y de la corrida 497 (F1.P8).
-4. Presupuesto pagado para producción tras la sonda de cuota (F1.P7).
+1. Feed-tag oficial como índice válido (F2.P2) — default recomendado: SÍ.
+2. Las 6 confirmaciones con `requiere_revision_humana` (F2.P5): ¿match válido?
+3. Autorización del holdout 50 (F2.P6) y de la corrida 497 (F2.P8).
+4. Presupuesto pagado para producción tras la sonda de cuota (F2.P7).
 
 ## Orden de ejecución recomendado (si nada bloquea)
-F1.P1 → F1.P2 → F1.P3 → F1.P4 → (paralelo: F1.P7, F2.P1) → F1.P5 → F1.P6 →
-F1.P8 → F2.P2-P3 → F3 → F4 → F5 → F6.
+F2.P1 → F2.P2 → F2.P3 → F2.P4 → (paralelo: F2.P7, F3.P1, F3.P2, F4.P1) →
+F2.P5 → F2.P6 → F2.P8 → F3.P3-P4 → F4.P2-P3 → F5 → F6 (F6.P1-P2 pueden
+adelantarse con bancas) → F7 → F8 (F8.P1-P3 arrancan tras F2.P8).

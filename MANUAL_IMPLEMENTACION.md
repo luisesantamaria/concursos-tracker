@@ -191,6 +191,12 @@ con las URLs y el registro de dominios; se extiende igual a certames y eventos.
 
 ## 5. Roadmap por fases con criterios de salida
 
+> **Numeración canónica**: la división oficial del proyecto en fases (F0-F8)
+> vive en `ROADMAP.md` y `PLAN_MAESTRO.md`. Esta sección conserva sus
+> criterios de salida; mapeo de etiquetas locales → canónicas: F2→FASE 2,
+> F3→FASE 5 (monitoreo), F4→FASE 6 (extracción), F5→FASE 6 (identidad),
+> F6→FASE 7 (expansión; la señal demand-driven es FASE 4), F7→FASE 8.
+
 Cada fase tiene un criterio de salida MEDIBLE. No se pasa a la siguiente sin
 cumplirlo (el patrón golden→holdout se repite en cada plano).
 
