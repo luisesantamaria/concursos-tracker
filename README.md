@@ -14,9 +14,9 @@ evidence**. Current pilot scope: **Rio Grande do Sul (RS)**.
 |---|---|
 | **`PLAN_MAESTRO.md`** (root) | The executable step-by-step plan: gates, exact commands, if-fails branches. **This is the plan of record.** |
 | `CLAUDE.md` (root) | Operating rules, untouchable files, phase definitions, pipeline rules. |
-| `authority_first/docs/MANUAL_IMPLEMENTACION.md` | Product vision → 4-plane architecture (discovery/monitoring/extraction/product), canonical data model, convergent discovery funnel (§6b). |
-| `authority_first/docs/MANUAL_APP.md` | How to build the portal/app itself (stack, 9 stages, LGPD, alerts). |
-| `authority_first/docs/ROADMAP.md` | Phase history + mapping to the master plan. |
+| `MANUAL_IMPLEMENTACION.md` | Product vision → 4-plane architecture (discovery/monitoring/extraction/product), canonical data model, convergent discovery funnel (§6b). |
+| `MANUAL_APP.md` | How to build the portal/app itself (stack, 9 stages, LGPD, alerts). |
+| `ROADMAP.md` | Phase history + mapping to the master plan. |
 | `authority_first/docs/ARCHITECTURE.md`, `RUNBOOK_corridas_locales.md` | Fase 2 technical detail; how to run scrapes from Brazil (geo-blocking). |
 
 ## Authority-First Model

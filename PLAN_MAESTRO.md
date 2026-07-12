@@ -7,7 +7,7 @@ ROADMAP.md (historial) y complementa CLAUDE.md (reglas operativas).
 tiene `ENTRADA` (prerrequisito verificable), `ACCIONES` (qué hacer, con
 comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
 (la rama a tomar). Ejecutar en orden; no saltar gates. Antes de tocar código,
-leer CLAUDE.md (intocables, reglas) y `authority_first/docs/MANUAL_IMPLEMENTACION.md`
+leer CLAUDE.md (intocables, reglas) y `MANUAL_IMPLEMENTACION.md`
 (la arquitectura de 4 planos y el embudo convergente §6b).
 
 ---
@@ -239,7 +239,7 @@ Resolver identidad multi-fuente (clave órgão+edital+año+banca) antes de
 mostrar nada al usuario.
 
 # FASE 6 — Producto
-Seguir `authority_first/docs/MANUAL_APP.md` (etapas 0-9). Los sprints 1-2
+Seguir `MANUAL_APP.md` (etapas 0-9). Los sprints 1-2
 (DB+API) pueden arrancar en paralelo desde el cierre de F1.P8 con el CSV
 canónico; las alertas dependen de FASE 4.
 
