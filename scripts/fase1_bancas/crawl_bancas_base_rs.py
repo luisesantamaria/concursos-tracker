@@ -36,7 +36,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts" / "shared"))
 from scope_rs import RSScopeRegistry, candidate_rs_evidence, normalize_text, normalize_slug  # noqa: E402
 
 
-OUT_CSV = PROJECT_ROOT / "authority_first" / "data" / "raw" / "bancas_base_rs_quick.csv"
+<<<<<<<< HEAD:scripts/fase1_bancas/crawl_bancas_base_rs.py
+OUT_CSV = PROJECT_ROOT / "data" / "raw" / "bancas_base_rs_quick.csv"
+========
+OUT_CSV = PROJECT_ROOT / "data" / "raw" / "bancas_base_rs_quick.csv"
+>>>>>>>> origin/main:scripts/crawlers/crawl_bancas_base_rs.py
 FIELDS = [
     "semaforo",
     "tipo",
@@ -612,7 +616,11 @@ def extract_pdf_text_prefix(url: str, args: argparse.Namespace, max_pages: int =
     if not url or PdfReader is None:
         return ""
     key = hashlib.sha1(url.encode("utf-8")).hexdigest()
-    cache_dir = PROJECT_ROOT / "authority_first" / "data" / "cache" / "pdf_text"
+<<<<<<<< HEAD:scripts/fase1_bancas/crawl_bancas_base_rs.py
+    cache_dir = PROJECT_ROOT / "data" / "cache" / "pdf_text"
+========
+    cache_dir = PROJECT_ROOT / "data" / "cache" / "pdf_text"
+>>>>>>>> origin/main:scripts/crawlers/crawl_bancas_base_rs.py
     cache_path = cache_dir / f"{key}.txt"
     if cache_path.exists() and not args.refresh_cache:
         return cache_path.read_text(encoding="utf-8", errors="replace")
@@ -1704,7 +1712,11 @@ def main() -> int:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--max-fetches-per-bank", type=int, default=120)
     parser.add_argument("--lasalle-max-fetches", type=int, default=8)
-    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "authority_first" / "data" / "cache" / "http")
+<<<<<<<< HEAD:scripts/fase1_bancas/crawl_bancas_base_rs.py
+    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "data" / "cache" / "http")
+========
+    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "data" / "cache" / "http")
+>>>>>>>> origin/main:scripts/crawlers/crawl_bancas_base_rs.py
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--pages", type=int, default=2)
     parser.add_argument("--lasalle-pages", type=int, default=1)

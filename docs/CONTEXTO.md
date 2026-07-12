@@ -43,7 +43,7 @@ O pipeline de descoberta municipal tem duas fases distintas que NAO devem ser mi
 ## Estado Atual
 
 - O piloto e apenas RS.
-- `authority_first/` e a implementacao canonica.
+- `scripts/` e a implementacao canonica.
 - Um golden set de 24 municipios foi construido a mao para medir precisao/cobertura.
 - O golden set revelou que ~20% dos municipios precisam de revisao humana — esse e o teto esperado de automacao, nao um bug.
 - Gemini Tier 3 e usado somente como seletor inteligente entre candidatas ya

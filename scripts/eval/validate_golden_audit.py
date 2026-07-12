@@ -24,7 +24,7 @@ import csv
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GOLDEN = PROJECT_ROOT / "authority_first" / "data" / "golden_set_v1.csv"
+GOLDEN = PROJECT_ROOT / "data" / "golden_set_v1.csv"
 PIPELINE_CSV = Path("/tmp/golden_as_pipeline.csv")
 AUDIT_CSV = Path("/tmp/golden_as_pipeline_auditoria.csv")
 

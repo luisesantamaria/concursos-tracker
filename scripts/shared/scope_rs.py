@@ -1,7 +1,7 @@
 """Hard RS scope guard for the authority-first pipeline.
 
 Every crawler that reads a national banca must pass candidates through this
-module before writing them to authority_first/data/raw.
+module before writing them to data/raw.
 """
 
 from __future__ import annotations

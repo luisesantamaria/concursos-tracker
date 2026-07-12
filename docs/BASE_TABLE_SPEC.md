@@ -1,6 +1,6 @@
 # Base Table Spec - RS
 
-Esta es la primera tabla util del pipeline `authority_first`.
+Esta es la primera tabla util del pipeline.
 
 Objetivo: construir una base limpia de concursos publicos y processos seletivos de RS, con la pagina oficial donde vive el certamen y el PDF directo del edital de abertura.
 

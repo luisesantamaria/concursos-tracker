@@ -20,7 +20,11 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+<<<<<<<< HEAD:scripts/fase1_bancas/quick_audit_bancas_rs.py
 CRAWLER_PATH = PROJECT_ROOT / "scripts" / "fase1_bancas" / "crawl_bancas_base_rs.py"
+========
+CRAWLER_PATH = PROJECT_ROOT / "scripts" / "crawlers" / "crawl_bancas_base_rs.py"
+>>>>>>>> origin/main:scripts/review/quick_audit_bancas_rs.py
 
 
 BASE_FIELDS = [
@@ -359,7 +363,11 @@ def main() -> int:
     parser.add_argument("--lasalle-host-delay", type=float, default=1.0)
     parser.add_argument("--max-fetches-per-bank", type=int, default=1200)
     parser.add_argument("--lasalle-max-fetches", type=int, default=220)
-    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "authority_first" / "data" / "cache" / "quick_audit")
+<<<<<<<< HEAD:scripts/fase1_bancas/quick_audit_bancas_rs.py
+    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "data" / "cache" / "quick_audit")
+========
+    parser.add_argument("--cache-dir", type=Path, default=PROJECT_ROOT / "data" / "cache" / "quick_audit")
+>>>>>>>> origin/main:scripts/review/quick_audit_bancas_rs.py
     parser.add_argument("--refresh-cache", action="store_true")
     parser.add_argument("--pdf-pages", type=int, default=2)
     parser.add_argument("--debug", action="store_true")

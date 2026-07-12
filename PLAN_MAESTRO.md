@@ -42,7 +42,7 @@ wsl.exe -e bash -lc 'cd "/mnt/c/.../concursos-tracker" && .venv/bin/python -m py
 # corrida golden V2 (patrón R3)
 wsl.exe -e bash -lc '... .venv/bin/python -m scripts.fase2_municipios.v2.eval.run_golden_live \
   --provider gemini_free --tools none --grounding off \
-  --golden authority_first/data/golden_set_v1.csv \
+  --golden data/golden_set_v1.csv \
   --url-map staging/fase2_v2/eval/url_map_golden_fixture_20260712.csv \
   --no-v1-differential --render-fallback \
   --output-dir staging/fase2_v2/eval/<RUN_NUEVO> \
