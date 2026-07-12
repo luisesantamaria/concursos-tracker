@@ -12,10 +12,11 @@ The project began as an Ache Concursos radar prototype and evolved into a source
 
 ## Where to Work
 
-- Scripts: `scripts/` (crawlers, eval, review, shared).
-- Config: `config/`.
-- Data: `data/` (golden set, pipeline outputs).
-- Docs: `docs/`.
+- Scripts: `scripts/fase1_bancas/` (banca crawlers), `scripts/fase2_municipios/` (municipality cascade + `v2/` adjudication engine), `scripts/eval/` (golden set evaluator), `scripts/shared/` (RS scope library).
+- Data: `data/` (golden set, registry CSVs, pipeline outputs). Config: `config/`.
+- Strategic docs at root: `PLAN_MAESTRO.md` (plan of record), `MANUAL_IMPLEMENTACION.md`, `MANUAL_APP.md`, `ROADMAP.md`. Technical docs: `docs/`.
+
+Do not restart from scratch unless the user explicitly asks.
 
 ## Commands
 
@@ -31,16 +32,42 @@ playwright install chromium
 Smoke checks:
 
 ```bash
-python scripts/crawlers/crawl_bancas_base_rs.py --help
-python scripts/crawlers/crawl_municipios_resources_rs.py --help
-python scripts/crawlers/grounded_deepsearch_municipios_a.py --help
-python scripts/review/ai_repair_bancas_rs.py --help
+python scripts/fase1_bancas/crawl_bancas_base_rs.py --help
+python scripts/fase1_bancas/ai_repair_bancas_rs.py --help
+python scripts/fase2_municipios/cascade_municipios.py --help
 ```
 
 Golden-set evaluation:
 
 ```bash
 python scripts/eval/medir_golden_set.py --golden data/golden_set_v1.csv --pipeline <output.csv> --detalle
+```
+
+## Local Runs (scraping from Brazil)
+
+Many `*.rs.gov.br` sites geo-block non-Brazil traffic (and use Cloudflare / 429),
+so the heavy fase 2 scraping is run from a **local environment in Brazil**, while
+code edits and commits happen in the main (web) conversation. Full guide:
+`docs/RUNBOOK_corridas_locales.md`. Non-negotiable rules:
+
+- **Always run on the corrected code.** Before any local run: `git fetch && git pull`
+  the working branch. Code changes are made and committed from the main conversation,
+  never diverged locally.
+- **Accumulate, don't re-run.** The fase 2 output CSV is cumulative. Run by letters
+  with `--append`, and add `--skip-existing` from the second batch on so already
+  *confirmed* municipalities are not re-scraped or re-sent to Gemini (saves cost).
+  Municipalities left `sin resultado`/`revisar` are still retried.
+- **Bring back three blocks** after each local run (paste into the main conversation):
+  the console `Summary`, the golden-set evaluator output, and a `sin resultado/revisar`
+  diagnosis labeling each as network block (403/429/SSL/Cloudflare/geo) vs real miss.
+
+```bash
+# first batch
+python scripts/fase2_municipios/cascade_municipios.py --all --letras ab --append \
+  --output data/fase2/municipios_rs.csv
+# later batches (skip already-confirmed, keep appending)
+python scripts/fase2_municipios/cascade_municipios.py --all --letras cd --append \
+  --skip-existing --output data/fase2/municipios_rs.csv
 ```
 
 ## Current Phase: Municipality Resource Discovery

@@ -1,0 +1,2 @@
+municipio,tipo,site_base,url_concursos,url_processos_seletivos,urls_concursos_extra,urls_processos_extra,requiere_revision_humana,notas
+Fixture Dual,synthetic_test_fixture,https://example.invalid,http://example.invalid/concursos?a=1&b=2,no_existe,,,no,synthetic only

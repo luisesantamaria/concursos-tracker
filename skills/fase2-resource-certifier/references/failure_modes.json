@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "failure_modes": [
+    {"id":"site_chrome_cultural_false_signal","fp":"Cultural words only in nav/header/footer","contrast":"Same words in H1/main/event row are material","action":"separate main_content from site_chrome"},
+    {"id":"single_result_misread_as_detail","fp":"Rejecting an index because it has one current result","contrast":"Filters/counter/table/pagination/export prove repeatable shell","action":"judge structure, not count"},
+    {"id":"many_documents_misread_as_index","fp":"One certame with many attachments treated as list","contrast":"Repeated independent certames or shell controls prove index","action":"count entities, not documents"},
+    {"id":"news_numeric_false_index","fp":"Article with dates, vacancies and edital link treated as index","contrast":"Editorial chrome/date/author/share/related-news without listing shell","action":"classify as noticia"},
+    {"id":"grounded_type_false_positive","fp":"Search evidence says multiple editais but they are licitações/nomeações","action":"verify actual rendered content and bucket; grounding never certifies"},
+    {"id":"wrong_municipality_redirect","fp":"Slug/request belongs to target but final content belongs elsewhere","action":"identity uses final URL and content"},
+    {"id":"external_portal_without_chain","fp":"Official-looking third-party portal accepted by branding","action":"require explicit official referrer/link/iframe/redirect"},
+    {"id":"soft404_http200","fp":"Generic fallback with HTTP 200 accepted","action":"inspect title/main and requested-vs-final behavior"},
+    {"id":"menu_years_without_index","fp":"Years navigation treated as stable listing","action":"revisar unless underlying aggregated list is proved"},
+    {"id":"empty_index_rejected","fp":"Valid category with zero current events treated as missing","action":"confirm when shell/controls/category are unequivocal"},
+    {"id":"second_fetch_loses_rendered_evidence","fp":"Valid browser DOM replaced by checkpoint/static shell","action":"freeze and reuse EvidenceSnapshot; never refetch at finalization"},
+    {"id":"slug_driven_bucket","fp":"URL name overrides actual rows","action":"bucket by title/H1/filters/event rows"},
+    {"id":"provider_hardcode","fp":"Rejecting raw IP/hash/unusual query because it looks unstable","action":"judge official chain and function; provider shape is only discovery context"},
+    {"id":"cultural_global_regex","fp":"Secretaria de Cultura or menu Soberanas contaminates valid index","action":"apply cultural semantics only to title/H1/main/event row with provenance"}
+  ]
+}

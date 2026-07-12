@@ -1,59 +1,112 @@
 # Concursos Tracker
 
-Concursos Tracker is a data engine for discovering and validating public contest and simplified selection process sources in Brazil. The current pilot scope is **Rio Grande do Sul (RS)**.
+Concursos Tracker is the **data engine for a matching app**: users register a
+profile (escolaridade, profession, city + travel radius, minimum salary) and
+the app shows eligible concursos públicos / processos seletivos across Brazil
+and sends lifecycle alerts (novo edital, retificação, convocação...). The
+engine discovers, verifies and monitors the official sources with a hard
+requirement: **zero false positives, every claim backed by verifiable
+evidence**. Current pilot scope: **Rio Grande do Sul (RS)**.
 
-The end goal is not a scraper — it is the **data engine for a matching app** where users register with their profile (escolaridade, profession, city + travel radius, minimum salary) and the app shows eligible concursos/PSS and sends lifecycle alerts.
+## 🗺 Where to start (humans AND agents)
 
-## Authority-First Model
+| Read this | To know |
+|---|---|
+| **`PLAN_MAESTRO.md`** (root) | The executable step-by-step plan: gates, exact commands, if-fails branches. **This is the plan of record.** |
+| `CLAUDE.md` (root) | Operating rules, untouchable files, phase definitions, pipeline rules. |
+| `MANUAL_IMPLEMENTACION.md` | Product vision → 4-plane architecture (discovery/monitoring/extraction/product), canonical data model, convergent discovery funnel (§6b). |
+| `MANUAL_APP.md` | How to build the portal/app itself (stack, 9 stages, LGPD, alerts). |
+| `ROADMAP.md` | Phase history + mapping to the master plan. |
+| `docs/ARCHITECTURE.md`, `RUNBOOK_corridas_locales.md` | Fase 2 technical detail; how to run scrapes from Brazil (geo-blocking). |
 
-The project uses an authority-first sourcing model:
+## Converging Sources of Truth (the authority model)
 
-1. **Banca organizadora** when a banca exists.
-2. **Prefeitura/official organ page** when there is no banca or for municipal follow-up.
-3. **Diario/FAMURS/publication portals** for homologation, convocacao, nomeacao and long-tail administrative events.
-4. **Radar portals** (Ache Concursos, PCI, QConcursos) only as discovery/audit, not as final authority.
+No single source is "the" authority for everything. Each source is
+authoritative for a different **slice** of a certame's life, and the engine's
+job is to make them **converge** on one entity (identity resolution) — sources
+corroborate each other; agreement raises confidence, divergence flags review:
 
-## Current Phase: Municipality Resource Discovery
+- **Banca organizadora** — the *richest* source for the active lifecycle
+  (edital → provas → resultado) of certames that use one (mostly larger
+  concursos). **Most PSS and some concursos never touch a banca.**
+- **Prefeitura/official organ** — the legal publisher; often the **only**
+  source for PSS; authoritative for convocações/nomeações and municipal
+  follow-up.
+- **Diários oficiais** (Querido Diário) — the legally binding record of
+  administrative acts.
+- **Radar portals** (Ache, PCI, QConcursos) — discovery/audit signal only,
+  never final proof.
 
-The current focus is discovering the **stable index/listing page** for concursos and processos seletivos in each RS municipality. This phase does NOT extract individual editals or PDFs.
+Authority is assigned **per fact type, not per source** (the fuente × evento
+matrix): the same certame is assembled by merging mentions from several
+sources, each fact carrying the provenance of the source that proves it.
 
-### 5-Tier Cascade Architecture
+## The two engines (current state, 2026-07-12)
+
+**Discovery cascade (V1, `scripts/fase2_municipios/cascade_municipios.py`)** —
+proposes candidate URLs, cheap→expensive:
 
 ```
-Tier 0 — Site oficial:     Find/confirm the prefeitura's base domain.
-Tier 1 — Free links:       Follow HTML menus, anchors, sitemap, transparencia.
-Tier 2 — Grounded search:  Gemini + Google (only if Tier 1 incomplete).
-Tier 3 — AI selector:      Gemini picks best index page among valid candidates.
-Tier 4 — Navigation agent: Playwright navigates menus as last resort.
+Tier 0:   Official base domain
+Tier 1:   Free link discovery (menus, sitemap, transparência)
+Tier 1.5: Platform probes (atende.net, elotech, SCPI... — implemented, golden-clean)
+Tier 2:   Grounded search (Gemini + Google, only if missing)
+Tier 3:   AI selector among valid candidates
+Tier 4:   Playwright navigation agent (last resort)
 ```
 
-Key principles:
-- **Content over slug**: a page at `/documentos` listing PSS is valid; an empty `/processos-seletivos` is not.
-- **No numeric scorers**: discrete decisions + AI selection replace point systems.
-- **Precision over coverage**: zero false positives > high coverage. ~20% of municipalities need human review.
+**Adjudication gate (V2, `scripts/fase2_municipios/v2/`)** — decides, AI-first:
+frozen evidence snapshot (with one-shot render for SPA shells) → certifier
+agent **A** with literal citations verified by code → adversarial FP
+prosecutor **B** → judge **C** on disagreement → deterministic structural
+gate (authority/identity/accessibility via evidence + official-domain
+registry + redirect-chain provenance). V1 heuristics are OUT of the decision
+path (enforced by an AST+runtime architecture test); they survive only as an
+ex-post comparison baseline (`semantic_comparison.py`).
 
-### Golden Set
+**Latest measured state** (R3, `staging/fase2_v2/eval/golden36_fable_20260712_r3/`):
+22/36 golden units match with **0 false positives** (all misses are
+abstentions, never a wrong confirmation); on identical frozen evidence V2
+adjudicates 22/23 vs 2/23 for the V1 heuristics. Suite: 419 tests green.
 
-24 municipalities verified by hand serve as independent ground truth. The evaluator (`medir_golden_set.py`) measures precision and coverage by portal type after every change.
+Key principles (non-negotiable, see CLAUDE.md):
+- **Content over slug**: a page at `/documentos` listing PSS is valid; an
+  empty `/processos-seletivos` is not.
+- **No numeric scorers**: discrete decisions + AI selection.
+- **Precision over coverage**: zero false positives > high coverage; honest
+  abstention (`revisar`) is a feature.
+- **AI adjudicates content, code verifies facts**; learned patterns enter
+  only as human-promoted, provenance-carrying facts (domain registry).
+
+## Golden Set
+
+24 municipalities verified by hand (`data/golden_set_v1.csv`)
+are the independent ground truth — never generated by the pipeline. V2 is
+evaluated against it with `run_golden_live --no-v1-differential` (see
+PLAN_MAESTRO §0 for the exact command) plus a 50-municipality holdout before
+any scale-up. Legacy evaluator: `scripts/eval/medir_golden_set.py`.
 
 ## Project Structure
 
 ```text
-scripts/
-  crawlers/       Crawlers for bancas, municipios, grounded deep search.
-  review/         AI-assisted audit/repair.
-  eval/           Golden-set evaluation (medir_golden_set.py).
-  shared/         Shared utilities (scope_rs).
-  pipeline/       Pipeline orchestration.
-config/           Authority matrix, schema, scope rules (YAML).
-data/             Golden set, pipeline outputs, seed data.
-docs/             Project documentation (architecture, roadmap, decisions).
-.github/          CI workflows.
+PLAN_MAESTRO.md               Executable master plan (plan of record).
+CLAUDE.md                     Operating rules for agents/humans.
+scripts/fase1_bancas/         Banca crawlers (RS).
+scripts/fase2_municipios/     Municipality discovery cascade (V1, frozen)
+  v2/                         V2 adjudication engine (agents, gate, eval,
+                              domain registry, snapshot/citations, render).
+scripts/eval/                 Golden evaluator + V1 verdict baseline (protected).
+scripts/shared/               RS scope lib, browser profile, waf guard.
+config/                       Authority matrix, schema, scope rules (YAML).
+data/                         Golden set, registries, pipeline outputs.
+docs/                         Technical docs (architecture, runbook, specs).
+staging/fase2_v2/eval/        Frozen evaluation runs + fixtures (gitignored).
+.github/                      CI workflows.
 ```
 
 ## Install
 
-Python 3.12 is recommended.
+Python 3.12+ (the working venv used by runs lives in WSL: `.venv/bin/python`).
 
 ```bash
 python -m venv .venv
@@ -64,34 +117,45 @@ playwright install chromium
 
 ## Environment
 
-Copy `.env.example` to `.env` and fill only the variables needed for the run.
+Copy `.env.example` to `.env`; never commit secrets (see CLAUDE.md Safety).
 
-Important variables:
-- `GEMINI_API_KEY`: used by Gemini-assisted search/audit.
-- `GEMINI_MODEL`: default recommendation is `gemini-2.5-flash`.
-
-Never commit `.env`, API keys, service-account files, model weights, generated logs, or generated exports.
+- `GEMINI_API_KEY_FREE`: free-tier key used by V2 evaluation runs
+  (`--provider gemini_free` filters paid keys structurally; paid_calls must
+  stay 0 in eval).
+- `GEMINI_API_KEY`: only for explicitly authorized paid paths.
+- Models in use: `gemini-3.1-flash-lite` (agents A/B), `gemini-3.5-flash`
+  (judge C, rare).
 
 ## Common Commands
 
 ```bash
-# Show crawler help
-python scripts/crawlers/crawl_bancas_base_rs.py --help
-python scripts/crawlers/crawl_municipios_resources_rs.py --help
-python scripts/crawlers/grounded_deepsearch_municipios_a.py --help
+# V2 test suite (from Windows, venv is Linux/WSL)
+wsl.exe -e bash -lc 'cd "<repo>" && .venv/bin/python -m pytest scripts/fase2_municipios/v2 -q'
 
-# Run grounded deep search sample
-python scripts/crawlers/grounded_deepsearch_municipios_a.py --limit 5 --offset 0
-
-# Evaluate against golden set
-python scripts/eval/medir_golden_set.py \
+# V2 golden evaluation (pattern; see PLAN_MAESTRO §0 for full flags)
+.venv/bin/python -m scripts.fase2_municipios.v2.eval.run_golden_live \
+  --provider gemini_free --tools none --grounding off \
   --golden data/golden_set_v1.csv \
+  --url-map staging/fase2_v2/eval/url_map_golden_fixture_20260712.csv \
+  --no-v1-differential --render-fallback --output-dir staging/fase2_v2/eval/<NEW> \
+  --credentials-file <env-file> --seed <YYYYMMDDNN>
+
+# Ex-post V1-vs-V2 comparison over a frozen run (no model calls)
+.venv/bin/python -m scripts.fase2_municipios.v2.eval.semantic_comparison \
+  --run-dir staging/fase2_v2/eval/<RUN> --golden data/golden_set_v1.csv \
+  --output-dir staging/fase2_v2/eval/<NEW>
+
+# Legacy golden evaluator (V1 CSV outputs)
+python scripts/eval/medir_golden_set.py --golden data/golden_set_v1.csv \
   --pipeline <output.csv> --detalle
 ```
 
-## Verification
+## Verification discipline
 
-- CLI `--help` smoke checks.
-- Small limited runs before large crawls.
-- Golden-set evaluation with `medir_golden_set.py` (precision + coverage by type).
-- Manual inspection in Google Sheets for links and status fields.
+- RED→GREEN: every fix ships with a failing-first test; full V2 suite green
+  before any run.
+- Frozen runs: no code/prompt edits mid-run; new output dir + new seed per
+  run; frozen runs are never overwritten.
+- Zero-FP stop protocol: one wrong confirmation found anywhere → stop the
+  phase, root-cause, fix generally, add the case to the poisoned fixture
+  (PLAN_MAESTRO R-T1).

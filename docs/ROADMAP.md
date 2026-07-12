@@ -34,15 +34,16 @@ Tier 2 - Busca grounded (Gemini + Google)
   So se Tier 1 nao completou ambos buckets.
   Uma chamada por municipio com google_search.
 
-Tier 3 - Gemini verificador/seletor
-  Recebe candidatas e faz decisoes discretas:
+Tier 3 - Gemini seletor
+  Recebe CandidateRecords ya adjudicados deterministicamente:
   - indice_oficial / indice_oficial_combinado
   - portal_externo_oficial
   - detalle_individual_rechazado
   - licitacao_rechazada / concurso_cultural_rechazado
   - nao_encontrado / revisar
-  Quando ha multiplas candidatas validas: ai_pick_best escolhe
-  por compreensao de conteudo, nao por pontuacao numerica.
+  Quando ha multiplas candidatas validas: ai_pick_best devuelve candidate_id
+  por compreensao de conteudo, sem classificar/confirmar dimensoes e sem
+  pontuacao numerica.
 
 Tier 4 - Agente de navegacao (Playwright)
   Ultimo recurso. Abre o site em Chromium headless e navega
@@ -67,13 +68,22 @@ Tier 4 - Agente de navegacao (Playwright)
 - Script `medir_golden_set.py` mede precisao e cobertura por tipo de portal.
 - Rodar apos QUALQUER mudanca no verificador ou seletor.
 
+### Estado atual - 2026-07-11
+
+Execucao ampla continua pausada, mas o contrato estrutural e a cauda de risco ja
+foram validados offline. O proximo passo autorizado e apenas o canario isolado de
+Barros Cassal, Boa Vista do Sul e Progresso; chunks 5-6 seguem sem execucao.
+
+Familias de FP ja detectadas: noticias individuais classificadas como indice, paginas genericas de menu sem listagem real, e sobre-conteo por resultados duplicados/inflados. Depois de mapear a cauda, corrigir cada familia no pipeline e validar contra o golden set. So entao retomar fase 2 chunks 5-6.
+
 ### Pendencias desta fase
 
-- [ ] Implementar ai_pick_best (substituir scorer numerico).
-- [ ] Headers de navegador real (corrigir 406 anti-bot).
+- [x] Implementar ai_pick_best sem scorer numerico.
+- [x] Headers de navegador real para reduzir 406 anti-bot.
 - [ ] Cache de grounding por municipio.
-- [ ] Deteccao de JS e fallback Playwright dirigido (Tier 4).
+- [x] Deteccao de JS e fallback Playwright dirigido (Tier 4), con snapshot reutilizable.
 - [ ] Escalar golden set com municipios de outras letras.
+- [x] Auditar la cola de riesgo run497 y cerrar noticia/menu/detalle; overcount ya no decide por conteo.
 
 ## Fase 3 - Scanner de Indices
 
@@ -118,3 +128,60 @@ Gate para publicar: (a) "edital"/"processo seletivo" no nome, (b) fonte oficial,
 - Matching por perfil do usuario.
 - Alertas de ciclo de vida.
 - Atualizacao incremental diaria (cron nocturno).
+
+## Contrato estructural Fase 2 — 2026-07-11
+
+La unidad de verdad es una superficie oficial, estable y reutilizable; Fase 2 no
+extrae eventos ni PDFs. El contrato ejecutable vive en
+`scripts/eval/verdict_extract.py` y separa dimensiones que antes estaban
+mezcladas:
+
+- `source_kind`: `dominio_oficial_prefeitura | portal_externo_delegado | banca | diario | desconocido`.
+- `authority` e `identity`: triestado `confirmada | rechazada | desconocida`;
+  ausencia de evidencia no equivale a rechazo y la autoridad nunca se infiere
+  por slug.
+- `page_role`: `indice_listado | indice_combinado | detalle_individual |
+  noticia | menu_sin_listado | incompleto_antibot | desconocido`.
+- `evidence_state`: `completa | incompleta_antibot | renderizada | error_fetch`.
+  `accessible=False` solo corresponde a `error_fetch`.
+- `bucket`: `concurso_publico | processo_seletivo | combinado`, decidido por
+  contenido.
+- `decision`: vocabulario canónico cerrado:
+  `indice_oficial | indice_oficial_combinado | portal_externo_oficial |
+  detalle_individual_rechazado | licitacao_rechazada |
+  concurso_cultural_rechazado | nao_encontrado | revisar`.
+
+Mapeo discreto: un índice con autoridad e identidad confirmadas se acepta; el
+portal externo requiere cadena de navegación oficial explícita; noticia deriva
+en `nao_encontrado`; menú sin listado y antibot incompleto derivan en
+`revisar`; detalle, licitación y cultural conservan sus rechazos. Un índice es
+válido con **0, 1 o múltiples resultados** si filtros, tabla/cards, paginación,
+categoría o endpoint prueban inequívocamente la estructura. `certame_unico` no
+rechaza por sí solo.
+
+`Candidate.fetchable` queda como alias operacional de `accessible`; la
+elegibilidad vive en `page_role/decision`. Una página accesible pero rechazada
+permanece con `decision+note`. Un `EvidenceSnapshot` de Playwright conserva
+`renderizada` y no provoca un segundo GET.
+
+La cadena única en memoria es `CandidateRecord -> SelectedResource ->
+FinalDecision`. Record y snapshot son profundamente inmutables; todas las
+dimensiones y la razón se adjudican una vez antes de Tier 3. La selección guarda
+la instancia exacta, y cierre/batch deriva la decisión sin refetch ni
+re-adjudicación. Legacy URL-only captura evidencia una vez y llama al mismo
+adjudicador central; toda salida, incluso no-upgrade, tiene razón.
+
+`candidate_id` v1 es `v1:` + SHA-1 de URL final normalizada (host minúsculo sin
+`www`, sin fragmento/slash final, query ordenada), source, tier, municipio,
+bucket y huella del snapshot. Es trazabilidad, no reconstrucción. Redirects
+conservan requested/final y se evalúan por URL/contenido final. El CSV mantiene
+su esquema; provenance mínima y razón van en `razao`/`notes`. Telemetría JSON por
+candidato/bucket usa `fase2.cascade` a stderr y `FASE2_LOG_LEVEL`.
+
+`pagina_generica_rechazada` era solo una constante Tier 3 sin consumidores ni
+veredictos en el corpus. Se plegó a `nao_encontrado/revisar` según estructura;
+el replay de 618 fixtures no mostró ningún flip atribuible a ese nombre.
+
+Estado: cadena única y canario Barros Cassal verdes offline, matriz contractual
+10/10, suite completa verde y replay run497 sin flips frente a 2b0dc11. Los
+chunks reales 5/6 siguen fuera de alcance de este cambio.
