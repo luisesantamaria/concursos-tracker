@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,7 +31,7 @@ RESPONSE = RawResponse(text='{"ok":true}', usage=USAGE)
 
 class StatusError(RuntimeError):
     def __init__(self, status_code: int, retry_after: float | None = None):
-        self.status_code = status_code
+        self.response = SimpleNamespace(status_code=status_code, headers={})
         self.retry_after = retry_after
         super().__init__("same text for every status")
 
@@ -157,7 +158,9 @@ def test_gemini_hard_timeout_terminates_child_without_leak() -> None:
     started = time.monotonic()
     with pytest.raises(PolicyCallError) as raised:
         transport.generate("fixture-model", [], {})
-    assert raised.value.category is ErrorCategory.TIMEOUT
+    assert raised.value.category is ErrorCategory.LOCAL_BUG
+    assert raised.value.original_type == "GlobalDeadline"
+    assert transport.telemetry.fallback_events == []
     assert time.monotonic() - started < 1.5
     assert {child.pid for child in multiprocessing.active_children()} == before
 

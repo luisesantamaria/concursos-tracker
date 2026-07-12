@@ -23,6 +23,7 @@ from scripts.fase2_municipios.v2.gemini import (
 from scripts.fase2_municipios.v2.loader import load_canonical_resources
 from scripts.fase2_municipios.v2.snapshot import (
     Citation,
+    CitationVerificationError,
     EvidenceSnapshot,
     anchor_citation,
 )
@@ -34,7 +35,7 @@ AFFIRMATIVE_CERTIFIER_DECISIONS = frozenset({
     "portal_externo_oficial",
 })
 REQUIRED_CONFIRMATION_CITATION_DIMENSIONS = frozenset({
-    "identity", "page_role", "bucket", "stability",
+    "authority", "identity", "page_role", "bucket", "stability",
 })
 
 
@@ -54,26 +55,63 @@ def _prepare_certifier_output(
     snapshot: EvidenceSnapshot, output: Mapping[str, Any]
 ) -> Mapping[str, Any]:
     prepared = copy.deepcopy(dict(output))
+    failures: list[CitationVerificationError] = []
     for item in prepared["citations"]:
-        citation = anchor_citation(snapshot, item)
+        # Politica 12-jul (aprobada por Luis): el modelo entrega source_id+quote
+        # y el codigo computa los offsets exigiendo ocurrencia literal UNICA
+        # (quote_not_found/quote_ambiguous rechazan). Los offsets que el modelo
+        # emita se DESCARTAN: son ruido demostrado (canario r1: 20/20 sin end;
+        # r2: longitudes erroneas), nunca evidencia. El gate final re-verifica
+        # slice-equality sobre los offsets computados (require_offsets=True en
+        # orchestration._strict_citations), sin cambios.
+        item.pop("start", None)
+        item.pop("end", None)
+        try:
+            citation = anchor_citation(snapshot, item, require_offsets=False)
+        except CitationVerificationError as exc:
+            # Recolectar TODOS los fallos (no solo el primero): la ronda de
+            # reparacion necesita la lista completa para corregir de una vez.
+            failures.append(exc)
+            continue
         item["start"] = citation.start
         item["end"] = citation.end
+    if failures:
+        first = failures[0]
+        first.failures = tuple(failures)
+        raise first
     return prepared
 
 
 def _certifier_invariants(output: Mapping[str, Any]) -> None:
-    if output.get("decision") not in AFFIRMATIVE_CERTIFIER_DECISIONS:
+    decision = output.get("decision")
+    if decision not in AFFIRMATIVE_CERTIFIER_DECISIONS:
         return
-    dimensions = {
-        item.get("dimension") for item in output.get("citations", ())
+    citations = [
+        item for item in output.get("citations", ())
         if isinstance(item, Mapping)
-    }
+    ]
+    dimensions = {item.get("dimension") for item in citations}
     missing = REQUIRED_CONFIRMATION_CITATION_DIMENSIONS - dimensions
     if missing:
         raise AgentOutputRejected(
             role="certifier",
             reason="missing_confirmation_citation_dimensions:" + ",".join(sorted(missing)),
         )
+    if decision == "indice_oficial_combinado":
+        # Politica 12-jul (hueco FP real): una superficie combinada exige DOS
+        # evidencias de bucket textualmente distintas -- una cita bucket sola
+        # solo prueba un tipo, no la combinacion. Cardinalidad pura: el codigo
+        # cuenta quotes distintos, no decide cuales tipos son (eso es semantica
+        # de A/B/C, fuera del alcance del codigo).
+        bucket_quotes = {
+            item.get("quote") for item in citations
+            if item.get("dimension") == "bucket"
+        }
+        if len(bucket_quotes) < 2:
+            raise AgentOutputRejected(
+                role="certifier",
+                reason="combined_requires_two_distinct_bucket_citations",
+            )
 
 
 class CertifierAgent:

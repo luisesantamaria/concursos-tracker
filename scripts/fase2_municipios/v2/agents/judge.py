@@ -110,8 +110,12 @@ class ConflictJudge:
             },
         ]
         try:
+            estimator = getattr(self.client, "estimate_request_tokens", None)
+            estimated_tokens = (
+                estimator(contents) if callable(estimator) else self.estimated_tokens
+            )
             raw = self.client.generate_structured(
-                contents, estimated_tokens=self.estimated_tokens
+                contents, estimated_tokens=estimated_tokens
             )
         except (
             TimeoutError,

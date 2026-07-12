@@ -9,13 +9,18 @@ No public API in this module accepts an API key, grounding, or native tools.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import codecs
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 import gzip
+import hashlib
 import http.client
+import re
 import socket
+import time
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 import zlib
@@ -28,6 +33,8 @@ except ImportError:  # Optional: do not advertise br when no decoder is installe
     _brotli = None
 
 from scripts.fase2_municipios import cascade_municipios as cascade
+from scripts.fase2_municipios.v2 import authority
+from scripts.shared import waf_guard
 from scripts.fase2_municipios.v2.agents import (
     ABCOrchestrator,
     AgentError,
@@ -50,6 +57,7 @@ from scripts.fase2_municipios.v2.eval.cassette_producer import (
     SourceLayer,
 )
 from scripts.fase2_municipios.v2.eval.live_model_policy import (
+    ErrorCategory,
     EvidenceInsufficientError,
     ModelPolicyTelemetry,
     PolicyTransport,
@@ -57,6 +65,7 @@ from scripts.fase2_municipios.v2.eval.live_model_policy import (
     classify_error,
 )
 from scripts.fase2_municipios.v2.eval.live_observability import StageArtifactWriter
+from scripts.fase2_municipios.v2.eval.structural_evidence import structural_candidate
 from scripts.fase2_municipios.v2.gemini import (
     GeminiClientError,
     RealGeminiTransport,
@@ -143,6 +152,146 @@ def _decompress_payload(payload: bytes, content_encoding: str) -> bytes:
     return decoded
 
 
+_DOCUMENT_CHARSET_RE = re.compile(
+    br"<meta\b[^>]*\bcharset\s*=\s*['\"]?\s*([A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
+_BOMS = (
+    (codecs.BOM_UTF32_BE, "utf-32", "utf-32-be"),
+    (codecs.BOM_UTF32_LE, "utf-32", "utf-32-le"),
+    (codecs.BOM_UTF8, "utf-8-sig", "utf-8"),
+    (codecs.BOM_UTF16_BE, "utf-16", "utf-16-be"),
+    (codecs.BOM_UTF16_LE, "utf-16", "utf-16-le"),
+)
+
+
+def _canonical_charset(value: str | None) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return codecs.lookup(value.strip()).name
+    except LookupError:
+        return None
+
+
+# Codificacion UTF-8 del bloque Latin-1 Supplement (U+00C0-U+00FF): cubre todos
+# los acentos/cedilla del portugues. Prueba binaria de utf-8 genuino en el body.
+_MOJIBAKE_UTF8_FINGERPRINT_RE = re.compile(rb"\xc3[\x80-\xbf]")
+# Umbral minimo de ocurrencias antes de asumir utf-8 genuino con byte(s) suelto(s)
+# invalido(s). Una sola coincidencia no basta: en portugues cp1252 el byte 0xC3
+# ES 'Ã' (SELEÇÃO, NÃO, CIDADÃO) y casi siempre va seguido de una letra ASCII
+# ('O'/'E'), fuera del rango de continuacion [0x80-0xBF] -- por eso 'Ã' real casi
+# nunca dispara el fingerprint. Pero un documento cp1252 grande puede chocar
+# incidentalmente 1-2 veces (un script, un comentario, un atributo) sin ser
+# utf-8; decodificar TODO el documento con errors='replace' en ese caso
+# destruiria acentos genuinos (caso Porto Alegre al reves: un doc cp1252 mal
+# etiquetado utf-8 perderia todo su acentuado). Un doc utf-8 real con acentos
+# porto-alegrenses produce cientos de matches, muy por encima de este umbral.
+_MOJIBAKE_UTF8_FINGERPRINT_MIN_MATCHES = 3
+
+
+def _decode_response_payload(
+    payload: bytes, declared_charset: str | None
+) -> tuple[str, tuple[str, ...]]:
+    """Decode HTTP bytes in the normative strict order, preserving diagnostics."""
+
+    diagnostics: list[str] = []
+    canonical_header = _canonical_charset(declared_charset)
+    if declared_charset and canonical_header is None:
+        diagnostics.append("invalid_header_charset")
+
+    for marker, decoder, bom_name in _BOMS:
+        if not payload.startswith(marker):
+            continue
+        if canonical_header and canonical_header not in {
+            bom_name, decoder, "utf-16", "utf-32"
+        }:
+            diagnostics.append(
+                f"charset_conflict:bom={bom_name},header={canonical_header}"
+            )
+        try:
+            return payload.decode(decoder), tuple((f"bom:{bom_name}", *diagnostics))
+        except UnicodeDecodeError as exc:
+            raise LiveFetchError("response_decode_failed") from exc
+
+    if canonical_header is not None:
+        try:
+            return payload.decode(canonical_header), tuple(
+                (f"header_charset:{canonical_header}", *diagnostics)
+            )
+        except UnicodeDecodeError:
+            # Charset DECLARADO que miente (comunisimo en portales municipales:
+            # header utf-8 con bytes latin-1/cp1252, caso Porto Alegre). No se
+            # falla cerrado: se registra el conflicto como diagnostico auditable
+            # y se continua la cadena determinista. El BOM corrupto (arriba)
+            # sigue siendo estricto: es evidencia binaria de payload roto.
+            diagnostics.append(
+                f"declared_charset_decode_failed:{canonical_header}"
+            )
+
+    declared_utf8 = canonical_header == "utf-8"
+    meta = _DOCUMENT_CHARSET_RE.search(payload[:8192])
+    if meta is not None:
+        raw_meta = meta.group(1).decode("ascii")
+        document_charset = _canonical_charset(raw_meta)
+        if document_charset is None:
+            diagnostics.append("invalid_document_charset")
+        else:
+            declared_utf8 = declared_utf8 or document_charset == "utf-8"
+            try:
+                return payload.decode(document_charset), tuple(
+                    (f"document_charset:{document_charset}", *diagnostics)
+                )
+            except UnicodeDecodeError:
+                diagnostics.append(
+                    f"declared_charset_decode_failed:{document_charset}"
+                )
+
+    # Caso Porto Alegre (golden36): la fuente declara utf-8 y el body ES utf-8
+    # genuino con algun byte suelto invalido. Caer a cp1252 destruiria TODO el
+    # acentuado (mojibake) y romperia las citas literales. Fingerprint
+    # ESTRUCTURAL: la secuencia 0xC3 + byte de continuacion [0x80-0xBF] es
+    # exactamente la codificacion UTF-8 del bloque Latin-1 Supplement (todos
+    # los acentos y la cedilla del portugues). Una unica coincidencia NO
+    # basta como prueba (ver comentario del umbral arriba): se exige un
+    # minimo de ocurrencias para blindar contra un choque incidental en un
+    # documento cp1252 genuino mal etiquetado utf-8. Solo aplica cuando el
+    # charset DECLARADO era utf-8 y su decode estricto fallo; el byte roto
+    # queda marcado como U+FFFD (visible), nunca oculto.
+    if (
+        declared_utf8
+        and len(_MOJIBAKE_UTF8_FINGERPRINT_RE.findall(payload))
+        >= _MOJIBAKE_UTF8_FINGERPRINT_MIN_MATCHES
+    ):
+        diagnostics.append("utf8_replace_recovered_declared_charset")
+        return payload.decode("utf-8", errors="replace"), tuple(diagnostics)
+
+    try:
+        return payload.decode("utf-8"), tuple(("fallback:utf-8", *diagnostics))
+    except UnicodeDecodeError:
+        pass
+    for fallback in ("cp1252", "latin-1"):
+        try:
+            return payload.decode(fallback), tuple((f"fallback:{fallback}", *diagnostics))
+        except UnicodeDecodeError:
+            continue
+    raise LiveFetchError("response_decode_failed")
+
+
+# Bytes crudos conservados en la anomalia (base64 de la cabeza, no el payload
+# entero) para poder auditar un decode dudoso sin persistir el body completo.
+_RAW_PAYLOAD_HEAD_BYTES = 65536
+
+
+def _decode_diagnostics_show_charset_anomaly(diagnostics: tuple[str, ...]) -> bool:
+    """True cuando el decode tuvo que apartarse del charset declarado."""
+    return any(
+        item == "utf8_replace_recovered_declared_charset"
+        or item.startswith("declared_charset_decode_failed")
+        for item in diagnostics
+    )
+
+
 def _live_request_headers() -> dict[str, str]:
     headers = dict(cascade.REQUEST_HEADERS)
     if _brotli is None:
@@ -170,6 +319,7 @@ class LiveCause:
     kind: LiveCauseKind
     code: str
     comment: str
+    revisar_por: str = ""
 
 
 @dataclass(frozen=True)
@@ -193,6 +343,9 @@ class LiveABCOutcome:
     url: str
     cause: LiveCause
     layer: ABCLayer | None
+    evidence_snapshot: EvidenceSnapshot | None = field(
+        default=None, compare=False, repr=False
+    )
     original_exception: BaseException | None = None
     audit_events: tuple[LiveAuditEvent, ...] = ()
 
@@ -206,6 +359,22 @@ class FetchedEvidence:
     content: str
     html: str
     title: str
+    decode_diagnostics: tuple[str, ...] = ()
+    # Preservacion de bytes crudos (hash SIEMPRE, blob SOLO en anomalia): el
+    # sha256 se calcula sobre el payload de bytes antes de decodificar y no
+    # cuesta nada guardarlo siempre. raw_payload_head_b64/raw_payload_truncated
+    # solo se pueblan cuando decode_diagnostics muestra una anomalia de charset
+    # (ver _decode_diagnostics_show_charset_anomaly) -- no tiene sentido cargar
+    # 64KB en base64 en memoria para cada fetch limpio.
+    raw_payload_sha256: str = ""
+    raw_payload_head_b64: str = ""
+    raw_payload_truncated: bool = False
+    # Espeja cascade.EvidenceSnapshot.evidence_state. Por defecto el fetch
+    # plano-HTTP es 'completa'; RenderFallbackFetcher devuelve 'renderizada'
+    # cuando el render-once limpio un shell SPA/challenge antibot (ver clase
+    # 3 del QA 20260712: fixture_qa.json). El gate downstream ya acepta ambos
+    # (orchestration._safety_blockers).
+    evidence_state: str = "completa"
 
     def __post_init__(self) -> None:
         if not self.requested_url or not self.final_url:
@@ -216,6 +385,8 @@ class FetchedEvidence:
             raise LiveFetchError("fetch_status_invalid")
         if not isinstance(self.content, str) or not isinstance(self.html, str):
             raise LiveFetchError("fetch_content_invalid")
+        if not isinstance(self.evidence_state, str) or not self.evidence_state:
+            raise LiveFetchError("fetch_evidence_state_invalid")
 
 
 class OrionFetcher(Protocol):
@@ -354,11 +525,17 @@ class OrionHTTPFetcher:
             raise LiveFetchError("response_not_html_or_text")
         content_encoding = str(response.getheader("content-encoding", ""))
         payload = _decompress_payload(payload, content_encoding)
-        charset = response.headers.get_content_charset() or "utf-8"
-        try:
-            response_text = payload.decode(charset)
-        except (LookupError, UnicodeDecodeError) as exc:
-            raise LiveFetchError("response_decode_failed") from exc
+        raw_payload_sha256 = hashlib.sha256(payload).hexdigest()
+        declared_charset = response.headers.get_content_charset()
+        response_text, decode_diagnostics = _decode_response_payload(
+            payload, declared_charset
+        )
+        raw_payload_head_b64 = ""
+        raw_payload_truncated = False
+        if _decode_diagnostics_show_charset_anomaly(decode_diagnostics):
+            head = payload[:_RAW_PAYLOAD_HEAD_BYTES]
+            raw_payload_head_b64 = base64.b64encode(head).decode("ascii")
+            raw_payload_truncated = len(payload) > _RAW_PAYLOAD_HEAD_BYTES
         final_url = current_url
         page = cascade._page_from_html(
             final_url,
@@ -375,6 +552,229 @@ class OrionHTTPFetcher:
             content=page.text,
             html=response_text,
             title=page.title,
+            decode_diagnostics=decode_diagnostics,
+            raw_payload_sha256=raw_payload_sha256,
+            raw_payload_head_b64=raw_payload_head_b64,
+            raw_payload_truncated=raw_payload_truncated,
+        )
+
+
+# Fixed synthetic content-type for the objective SPA/antibot revalidation that
+# RenderFallbackFetcher performs over plain-HTTP and rendered HTML alike:
+# neither carries a real HTTP header at that point, and cascade._page_from_html
+# only branches on "text/html"/"text/plain" membership, so any well-formed
+# text/html value is equivalent here.
+_RENDER_REVALIDATION_CONTENT_TYPE = "text/html; charset=UTF-8"
+
+# Shell delgado OBJETIVO (QA 12-jul): los shells client-rendered de
+# atende.net (207KB de HTML) y oxy.elotech (2.9KB, mount React con bundles)
+# sirven 45-67 chars de texto visible, pero NO llevan markers Next/Nuxt/React,
+# asi que Page.is_spa no los detecta. La firma estructural comun (no un
+# hardcode municipal): pagina OK cuyo texto visible es casi nulo pero que
+# carga bundles JS externos (<script src=...>) -- no hay nada que el
+# certificador pueda citar sin render. Una pagina estatica legitimamente
+# escueta sin bundles queda fuera; si un shell falso-positivo se renderiza,
+# la regla de mejora estricta de texto conserva la evidencia original.
+_THIN_SHELL_MIN_HTML_CHARS = 2_000
+_THIN_SHELL_MAX_TEXT_CHARS = 500
+_SCRIPT_SRC_RE = re.compile(r"<script[^>]+\bsrc\s*=", re.IGNORECASE)
+
+
+def _is_thin_shell(page: "cascade.Page") -> bool:
+    html = page.html or ""
+    return bool(
+        page.ok
+        and len(html) >= _THIN_SHELL_MIN_HTML_CHARS
+        and len((page.text or "").strip()) < _THIN_SHELL_MAX_TEXT_CHARS
+        and _SCRIPT_SRC_RE.search(html)
+    )
+
+
+def render_page_networkidle(url: str):
+    """Render-once V2: como ``cascade.render_page_sync`` pero esperando a que
+    el SPA cargue datos reales.
+
+    El render de cascade espera 2000ms fijos tras domcontentloaded; los shells
+    de atende.net terminan con title correcto y body VACIO (verificado en vivo
+    12-jul: Gramado 0 chars). Aqui: networkidle acotado + sondeo del texto del
+    body hasta ~8s. Reutiliza el browser singleton y el perfil pt-BR de
+    cascade/playwright_net (neutrales); cascade queda intocado.
+    """
+    try:
+        browser = cascade._get_browser()
+    except Exception:
+        return None
+    context = None
+    try:
+        # Contexto propio, NO cascade.new_browser_context: el perfil compartido
+        # aplica PLAYWRIGHT_EXTRA_HTTP_HEADERS (Sec-Fetch-Dest: document,
+        # Sec-Fetch-Mode: navigate, ...) a TODAS las requests, y Chromium
+        # rechaza esos overrides en subrecursos (CSS/JS/XHR) con
+        # net::ERR_INVALID_ARGUMENT -- el app JS nunca carga y el SPA queda en
+        # blanco (biseccion verificada en vivo 12-jul con gramado.atende.net:
+        # bare/opts/init_script renderizan ~1300-1600 chars; headers -> 0).
+        from scripts.shared.browser_profile import (
+            HUMAN_BROWSER_INIT_SCRIPT,
+            PLAYWRIGHT_CONTEXT_OPTIONS,
+        )
+
+        options = dict(PLAYWRIGHT_CONTEXT_OPTIONS)
+        options["ignore_https_errors"] = True
+        options["extra_http_headers"] = {
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        }
+        context = browser.new_context(**options)
+        context.add_init_script(HUMAN_BROWSER_INIT_SCRIPT)
+        browser_page = context.new_page()
+        response = browser_page.goto(
+            url, wait_until="domcontentloaded", timeout=20000,
+        )
+        try:
+            browser_page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass  # networkidle puede no llegar (polling/analytics); sondeamos.
+        body_text = ""
+        for _ in range(16):
+            body_text = browser_page.locator("body").inner_text()
+            if len(body_text.strip()) >= _THIN_SHELL_MAX_TEXT_CHARS:
+                break
+            browser_page.wait_for_timeout(500)
+        links = browser_page.eval_on_selector_all(
+            "a[href]",
+            "els => els.map(el => [el.href, (el.innerText || '').trim()])",
+        )
+        return cascade.RenderedPage(
+            html=browser_page.content(),
+            text=body_text,
+            title=browser_page.title(),
+            requested_url=url,
+            final_url=browser_page.url,
+            status=response.status if response is not None else None,
+            links=tuple((href, text) for href, text in links),
+        )
+    except Exception:
+        return None
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
+class RenderFallbackFetcher:
+    """One-shot headless-render fallback for SPA shells / anti-bot challenges.
+
+    Wraps another :class:`OrionFetcher` (``inner``, ``OrionHTTPFetcher()`` by
+    default). It changes nothing for a page that is already usable: the
+    plain-HTTP :class:`FetchedEvidence` is revalidated with
+    ``cascade._page_from_html`` (the same objective, hard-marker detector the
+    rest of the pipeline uses) and returned unchanged unless that revalidation
+    shows ``is_spa`` or the STRICT ``is_antibot`` (never the lax
+    ``cascade.is_antibot_challenge``, which false-positives on benign
+    Cloudflare banners -- see ``structural_evidence.structural_candidate``).
+
+    Only then -- and only if the URL's provider group is not already frozen
+    -- does it spend exactly one Playwright render (``render_once``,
+    ``cascade.render_page_sync`` by default) and revalidate the rendered DOM
+    the same way. Freezing (``waf.freeze``) fires only when the render itself
+    still shows the hard challenge, never for a merely-thin/empty render, so a
+    legitimately sparse page does not poison the shared per-provider freeze
+    for the next unit.
+
+    A transport-level failure from ``inner`` (``LiveFetchError``, timeouts,
+    ``ExternalAccessBlocked``) is never caught here -- it propagates
+    unchanged, fail-closed, exactly as it would without this wrapper. Any
+    failure to render (``None`` or an exception) or a render that does not
+    genuinely clear the page is likewise a no-op: the original plain-HTTP
+    evidence is returned, never a regression.
+    """
+
+    def __init__(
+        self,
+        inner: OrionFetcher | None = None,
+        render_once: Callable[[str], Any] | None = None,
+        waf: Any | None = None,
+    ) -> None:
+        self._inner: OrionFetcher = inner if inner is not None else OrionHTTPFetcher()
+        # Default V2 (networkidle + sondeo de texto), no cascade.render_page_sync:
+        # el wait fijo de 2000ms de cascade devuelve body vacio en los shells
+        # de atende.net (verificado en vivo 12-jul).
+        self._render_once: Callable[[str], Any] = (
+            render_once if render_once is not None else render_page_networkidle
+        )
+        self._waf = waf if waf is not None else waf_guard
+
+    @staticmethod
+    def _revalidate(
+        *, final_url: str, status: int | None, html: str, requested_url: str
+    ) -> cascade.Page:
+        return cascade._page_from_html(
+            final_url,
+            status,
+            _RENDER_REVALIDATION_CONTENT_TYPE,
+            html,
+            requested_url=requested_url,
+        )
+
+    def fetch(self, url: str, *, timeout_seconds: float) -> FetchedEvidence:
+        # Transport failures from `inner` are not caught: they bubble intact
+        # (fail-closed at the transport boundary, never masked by a render
+        # attempt).
+        fetched = self._inner.fetch(url, timeout_seconds=timeout_seconds)
+
+        page = self._revalidate(
+            final_url=fetched.final_url,
+            status=fetched.status,
+            html=fetched.html,
+            requested_url=fetched.requested_url,
+        )
+        if not (page.is_antibot or page.is_spa or _is_thin_shell(page)):
+            return fetched
+        if self._waf.is_frozen(url):
+            return fetched  # Provider already frozen: do not burn a pass.
+
+        try:
+            rendered = self._render_once(url)
+        except Exception:
+            rendered = None
+        if rendered is None:
+            return fetched
+
+        rendered_page = self._revalidate(
+            final_url=rendered.final_url or url,
+            status=rendered.status,
+            html=rendered.html,
+            requested_url=url,
+        )
+        if rendered_page.is_antibot:
+            self._waf.freeze(url)
+            return fetched
+        rendered_text = (rendered.text or "").strip()
+        if rendered_page.is_spa or not rendered_text:
+            return fetched
+        # El render debe MEJORAR estrictamente el texto visible: un render que
+        # no aporta mas contenido que el shell original no justifica sustituir
+        # la evidencia (fail-closed; la original queda intacta).
+        if len(rendered_text) <= len((fetched.content or "").strip()):
+            return fetched
+
+        return replace(
+            fetched,
+            final_url=rendered.final_url or fetched.final_url,
+            status=(
+                rendered.status
+                if isinstance(rendered.status, int)
+                and not isinstance(rendered.status, bool)
+                else fetched.status
+            ),
+            content=rendered.text,
+            html=rendered.html,
+            title=rendered.title or fetched.title,
+            evidence_state="renderizada",
+            decode_diagnostics=(
+                *fetched.decode_diagnostics, "render_fallback_applied",
+            ),
         )
 
 
@@ -439,7 +839,13 @@ def _stable_exception_text(exc: BaseException) -> str:
 
     message = " ".join(str(exc).split())
     name = type(exc).__name__
-    return f"{name}: {message}" if message else name
+    status_code = getattr(exc, "status_code", None)
+    status = (
+        f"; status_code={status_code}"
+        if isinstance(status_code, int) and not isinstance(status_code, bool)
+        else ""
+    )
+    return (f"{name}: {message}" if message else name) + status
 
 
 def _exception_chain(exc: BaseException) -> tuple[str, ...]:
@@ -479,6 +885,100 @@ def _proposal_layer(raw: Mapping[str, Any]) -> ProposalLayer:
         citations=tuple(_citation_layer(item) for item in checked.citations),
         reason=checked.reason,
     )
+
+
+class _FreeTelemetryTransport:
+    """Contabiliza en ModelPolicyTelemetry cada request free REAL (G4: la
+    telemetria debe reflejar requests reales; el canario r1/r2 marcaba
+    free_calls=0 con llamadas reales). No altera politica alguna: el camino
+    free no construye transporte pago ni fallback; esto es solo auditoria."""
+
+    def __init__(self, inner, telemetry: ModelPolicyTelemetry) -> None:
+        self._inner = inner
+        self._telemetry = telemetry
+
+    def generate(self, model, contents, config):
+        try:
+            response = self._inner.generate(model, contents, config)
+        except Exception as exc:
+            self._telemetry.record_call(
+                "gemini_free", None, model=model, status="error",
+                error_class=type(exc).__name__,
+            )
+            raise
+        self._telemetry.record_call("gemini_free", response, model=model)
+        return response
+
+
+# El camino free-only (from_free_environment) no tiene fallback pago -- a
+# diferencia de PolicyTransport (live_model_policy.py), que solo corre en
+# from_model_policy_environment -- asi que un 429 transitorio mataba la
+# unidad entera sin reintento (caso real: Canoas/CP B, 'ClientError: 429
+# RESOURCE_EXHAUSTED ... Please retry in 20.37s'). classify_error()/_retry_
+# after() solo leen atributos estructurados (.response.status_code,
+# .response.headers['Retry-After']) que el ClientError real del SDK no
+# expone; por eso el mensaje se parsea con una regex local como respaldo.
+_QUOTA_429_MESSAGE_RE = re.compile(r"\b429\b|RESOURCE_EXHAUSTED", re.IGNORECASE)
+_RETRY_AFTER_MESSAGE_RE = re.compile(r"retry in\s+([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+_FREE_QUOTA_RETRY_DEFAULT_SECONDS = 30.0
+_FREE_QUOTA_RETRY_MAX_SLEEP_SECONDS = 65.0
+
+
+def _is_quota_429(exc: BaseException) -> bool:
+    if classify_error(exc).category is ErrorCategory.QUOTA_429:
+        return True
+    return bool(_QUOTA_429_MESSAGE_RE.search(str(exc)))
+
+
+def _extract_retry_after_seconds(exc: BaseException) -> float:
+    classified_retry_after = classify_error(exc).retry_after
+    if classified_retry_after is not None:
+        return classified_retry_after
+    match = _RETRY_AFTER_MESSAGE_RE.search(str(exc))
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return _FREE_QUOTA_RETRY_DEFAULT_SECONDS
+
+
+class _FreeQuotaRetryTransport:
+    """Reintento local acotado ante 429/RESOURCE_EXHAUSTED en el camino free-only.
+
+    Envuelve un transporte ya telemetrado (``_inner`` es un
+    ``_FreeTelemetryTransport``), NO al reves: cada llamada real -- incluidos
+    los reintentos -- pasa por ``_inner.generate`` y por lo tanto queda
+    contabilizada en ``ModelPolicyTelemetry`` (G4: la telemetria debe
+    reflejar requests reales). Si el orden fuera inverso (telemetria por
+    fuera), solo se contaria la llamada externa y los reintentos internos
+    quedarian invisibles.
+    """
+
+    def __init__(
+        self,
+        inner,
+        *,
+        sleeper: Callable[[float], None] = time.sleep,
+        max_retries: int = 2,
+        max_sleep_seconds: float = _FREE_QUOTA_RETRY_MAX_SLEEP_SECONDS,
+    ) -> None:
+        self._inner = inner
+        self._sleeper = sleeper
+        self._max_retries = max_retries
+        self._max_sleep_seconds = max_sleep_seconds
+
+    def generate(self, model, contents, config):
+        attempt = 0
+        while True:
+            try:
+                return self._inner.generate(model, contents, config)
+            except Exception as exc:
+                if attempt >= self._max_retries or not _is_quota_429(exc):
+                    raise
+                retry_after = _extract_retry_after_seconds(exc)
+                self._sleeper(min(retry_after + 1.0, self._max_sleep_seconds))
+                attempt += 1
 
 
 class LiveABCAdapter:
@@ -527,6 +1027,13 @@ class LiveABCAdapter:
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
             raise ValueError("attempt must be a positive integer")
         self._artifact_attempt = attempt
+
+    def artifact_reference(
+        self, municipio: str, bucket: str, attempt: int
+    ) -> dict[str, str]:
+        if self.artifact_writer is None:
+            return {}
+        return self.artifact_writer.reference((municipio, bucket), attempt)
 
     @staticmethod
     def _snapshot_mapping(
@@ -584,9 +1091,18 @@ class LiveABCAdapter:
         timeout_seconds: float = 15.0,
     ) -> "LiveABCAdapter":
         free_key = resolve_free_api_key(environ)
-        transport = RealGeminiTransport(
-            free_key,
-            client_factory=sdk_client_factory,
+        telemetry = ModelPolicyTelemetry()
+        # Orden: retry POR FUERA de la telemetria (ver docstring de
+        # _FreeQuotaRetryTransport) para que cada intento real -- incluidos
+        # los reintentos ante 429 -- quede contabilizado.
+        transport = _FreeQuotaRetryTransport(
+            _FreeTelemetryTransport(
+                RealGeminiTransport(
+                    free_key,
+                    client_factory=sdk_client_factory,
+                ),
+                telemetry,
+            ),
         )
         shared_limiter = limiter or get_shared_limiter()
         models = RoleModels()
@@ -615,6 +1131,7 @@ class LiveABCAdapter:
             prosecutor=prosecutor,
             judge=judge,
             timeout_seconds=timeout_seconds,
+            telemetry=telemetry,
         )
 
     @classmethod
@@ -698,6 +1215,7 @@ class LiveABCAdapter:
         error: BaseException | None = None,
         phase: str | None = None,
         audit_events: tuple[LiveAuditEvent, ...] = (),
+        evidence_snapshot: EvidenceSnapshot | None = None,
     ) -> LiveABCOutcome:
         comments = {
             LiveCauseKind.ACCESS_FAILURE: "no se pudo acceder",
@@ -710,13 +1228,26 @@ class LiveABCAdapter:
         events = audit_events
         if error is not None:
             events += (LiveAuditEvent(phase or "unknown", _exception_chain(error)),)
+        revisar_por = {
+            LiveCauseKind.ACCESS_FAILURE: "revisar_por_adquisicion",
+            LiveCauseKind.EVIDENCE_FAILURE: "revisar_por_adquisicion",
+            LiveCauseKind.DISAGREEMENT_UNRESOLVED: "revisar_por_C",
+            LiveCauseKind.CONFIGURATION_FAILURE: "revisar_por_gate",
+            LiveCauseKind.INTERNAL_FAILURE: "revisar_por_gate",
+        }.get(kind, "")
+        if kind is LiveCauseKind.MODEL_FAILURE:
+            revisar_por = "revisar_por_B" if phase == "B" else "revisar_por_A"
+        diagnostic_code = code
+        if isinstance(error, LiveFetchError) and error.status_code is not None:
+            diagnostic_code = f"{str(error)}:{error.status_code}"
         return LiveABCOutcome(
             municipio=municipio,
             bucket=bucket,
             decision="revisar",
             url="",
-            cause=LiveCause(kind, code, comments[kind]),
+            cause=LiveCause(kind, diagnostic_code, comments[kind], revisar_por),
             layer=None,
+            evidence_snapshot=evidence_snapshot,
             original_exception=error,
             audit_events=events,
         )
@@ -740,7 +1271,7 @@ class LiveABCAdapter:
             requested_url=fetched.requested_url,
             status=fetched.status,
             source="orion_http",
-            evidence_state="completa",
+            evidence_state=fetched.evidence_state,
         )
         return model_snapshot, candidate_snapshot
 
@@ -752,14 +1283,26 @@ class LiveABCAdapter:
         fetched: FetchedEvidence,
         snapshot: cascade.EvidenceSnapshot,
     ) -> cascade.CandidateRecord:
-        short_bucket = "concursos" if bucket == "concurso_publico" else "processos"
-        return cascade.build_candidate_record(
+        # Independencia V1 (12-jul): SOLO evidencia estructural (autoridad,
+        # identidad, accesibilidad, challenge). El clasificador semantico V1
+        # (verdict via build_candidate_record) ya no corre en el runtime V2:
+        # la semantica la adjudican los agentes A/B/C.
+        # Provenance de autoridad general: si el fetcher siguio un redirect
+        # real (301/302/...) desde un host oficial *.rs.gov.br confirmado
+        # hasta otro host (caso Porto Alegre: smap/... -> prefeitura.poa.br),
+        # eso es evidencia estructural de origen oficial aunque el destino no
+        # sea *.rs.gov.br. Ver scripts/fase2_municipios/v2/authority.py.
+        provenance = authority.redirect_provenance(
+            fetched.requested_url, fetched.final_url, municipio
+        )
+        return structural_candidate(
             requested_url=fetched.requested_url,
             source="orion_http",
             tier="live",
             municipio=municipio,
-            bucket_hint=short_bucket,
+            bucket=bucket,
             evidence=snapshot,
+            provenance=provenance,
         )
 
     @staticmethod
@@ -851,14 +1394,23 @@ class LiveABCAdapter:
                 != cascade._normalized_candidate_url(source.url)
             ):
                 raise SnapshotError("candidate_url_does_not_match_snapshot_origin")
+            fetch_raw = {
+                "requested_url": fetched.requested_url,
+                "final_url": fetched.final_url,
+                "status": fetched.status,
+                "title": fetched.title,
+                "decode_diagnostics": list(fetched.decode_diagnostics),
+                # Hash siempre presente (barato); el blob de bytes crudos solo
+                # se adjunta cuando el decode tuvo que apartarse del charset
+                # declarado -- ver _decode_diagnostics_show_charset_anomaly.
+                "raw_payload_sha256": fetched.raw_payload_sha256,
+            }
+            if _decode_diagnostics_show_charset_anomaly(fetched.decode_diagnostics):
+                fetch_raw["raw_payload_b64_head"] = fetched.raw_payload_head_b64
+                fetch_raw["raw_payload_truncated"] = fetched.raw_payload_truncated
             self._record_stage(
                 municipio, bucket, "fetch", "raw_received", snapshot=snapshot,
-                raw={
-                    "requested_url": fetched.requested_url,
-                    "final_url": fetched.final_url,
-                    "status": fetched.status,
-                    "title": fetched.title,
-                }, raw_exists=True,
+                raw=fetch_raw, raw_exists=True,
             )
         except Exception as exc:
             self._record_stage(
@@ -900,7 +1452,7 @@ class LiveABCAdapter:
             )
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE, code=type(exc).__name__,
-                error=exc, phase="model_response",
+                error=exc, phase="A", evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -919,6 +1471,7 @@ class LiveABCAdapter:
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
                 code=type(exc).__name__, error=exc, phase="A",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -929,6 +1482,17 @@ class LiveABCAdapter:
                 municipio, bucket, "A", "validation_failed", snapshot=snapshot,
                 raw=certified_raw, raw_exists=certified_raw is not None,
                 error=certified_result.original_exception,
+            )
+            original = certified_result.original_exception
+            self._emit(
+                stage="A", model=models.certifier_model,
+                provider="gemini_policy", status="error",
+                error_class=classify_error(
+                    original or SemanticModelError()
+                ).category.value,
+                error_message=(
+                    type(original).__name__ if original else certified_result.code
+                ),
             )
         else:
             certified_raw = getattr(certified_result, "output", certified_result)
@@ -941,13 +1505,17 @@ class LiveABCAdapter:
         except ModelResponseValidationError as exc:
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
-                code=type(exc).__name__, error=exc, phase="model_response",
+                code=type(exc).__name__, error=exc, phase="A",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
         try:
             proposal_a = ABCOrchestrator._proposal_from_certifier(
                 certified, (candidate,)
+            )
+            proposal_a = ABCOrchestrator._normalize_combined_bucket(
+                proposal_a, bucket
             )
             proposal_a_layer = _proposal_layer(proposal_a)
         except ProposalValidationError as exc:
@@ -957,7 +1525,8 @@ class LiveABCAdapter:
             )
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
-                code=type(exc).__name__, error=exc, phase="model_response",
+                code=type(exc).__name__, error=exc, phase="A",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -969,6 +1538,7 @@ class LiveABCAdapter:
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.INTERNAL_FAILURE,
                 code=type(exc).__name__, error=exc, phase="abc_internal",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -977,16 +1547,33 @@ class LiveABCAdapter:
             provider="gemini_policy", status="ok",
         )
 
-        self._bind_stage("B", municipio, bucket)
-        self._emit(
-            stage="B", model=models.prosecutor_model,
-            provider="gemini_policy", status="start",
-        )
-        try:
-            prosecuted_result = self.prosecutor.audit(
-                snapshot=snapshot,
-                certifier_output=certified,
+        run_b = certified.get("decision") in {
+            "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial"
+        }
+        if run_b:
+            self._bind_stage("B", municipio, bucket)
+            self._emit(
+                stage="B", model=models.prosecutor_model,
+                provider="gemini_policy", status="start",
             )
+        else:
+            self._emit(
+                stage="B", model=models.prosecutor_model,
+                provider="gemini_policy", status="skipped",
+            )
+        try:
+            if run_b:
+                prosecuted_result = self.prosecutor.audit(
+                    snapshot=snapshot,
+                    certifier_output=proposal_a,
+                )
+            else:
+                prosecuted_result = {
+                    "result": "review",
+                    "reason": "skipped_nonaffirmative_A",
+                    "citations": [],
+                    "accusations": [],
+                }
         except ValidationError as exc:
             self._record_stage(
                 municipio, bucket, "B", "validation_failed",
@@ -1001,7 +1588,7 @@ class LiveABCAdapter:
             )
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE, code=type(exc).__name__,
-                error=exc, phase="model_response",
+                error=exc, phase="B", evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -1020,6 +1607,7 @@ class LiveABCAdapter:
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
                 code=type(exc).__name__, error=exc, phase="B",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -1031,10 +1619,21 @@ class LiveABCAdapter:
                 raw=prosecuted_raw, raw_exists=prosecuted_raw is not None,
                 error=prosecuted_result.original_exception,
             )
+            original = prosecuted_result.original_exception
+            self._emit(
+                stage="B", model=models.prosecutor_model,
+                provider="gemini_policy", status="error",
+                error_class=classify_error(
+                    original or SemanticModelError()
+                ).category.value,
+                error_message=(
+                    type(original).__name__ if original else prosecuted_result.code
+                ),
+            )
         else:
             prosecuted_raw = getattr(prosecuted_result, "output", prosecuted_result)
             self._record_stage(
-                municipio, bucket, "B", "raw_received", snapshot=snapshot,
+                municipio, bucket, "B", "raw_received" if run_b else "skipped", snapshot=snapshot,
                 raw=prosecuted_raw, raw_exists=True,
             )
         try:
@@ -1042,7 +1641,8 @@ class LiveABCAdapter:
         except ModelResponseValidationError as exc:
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
-                code=type(exc).__name__, error=exc, phase="model_response",
+                code=type(exc).__name__, error=exc, phase="B",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -1058,7 +1658,8 @@ class LiveABCAdapter:
             )
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.MODEL_FAILURE,
-                code=type(exc).__name__, error=exc, phase="model_response",
+                code=type(exc).__name__, error=exc, phase="B",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -1070,13 +1671,15 @@ class LiveABCAdapter:
             outcome = self._failure(
                 municipio, bucket, kind=LiveCauseKind.INTERNAL_FAILURE,
                 code=type(exc).__name__, error=exc, phase="abc_internal",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
-        self._emit(
-            stage="B", model=models.prosecutor_model,
-            provider="gemini_policy", status="ok",
-        )
+        if run_b:
+            self._emit(
+                stage="B", model=models.prosecutor_model,
+                provider="gemini_policy", status="ok",
+            )
 
         self._bind_stage("juez", municipio, bucket)
         recording_judge = _RecordingJudge(
@@ -1088,6 +1691,8 @@ class LiveABCAdapter:
                 candidates=(candidate,),
                 proposal_a=proposal_a,
                 proposal_b=proposal_b,
+                requested_bucket=bucket,
+                prosecutor_result=str(prosecuted.get("result", "")),
             )
         except Exception as exc:
             self._record_stage(
@@ -1101,6 +1706,7 @@ class LiveABCAdapter:
                 code=type(exc).__name__,
                 error=exc,
                 phase="judge",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -1115,7 +1721,7 @@ class LiveABCAdapter:
                 "reason": "not_invoked_consensus",
             }
             self._record_stage(
-                municipio, bucket, "C", "raw_received", snapshot=snapshot,
+                municipio, bucket, "C", "skipped", snapshot=snapshot,
                 raw=judge_response, raw_exists=True,
             )
         elif judge_outcome.decision is None:
@@ -1131,6 +1737,7 @@ class LiveABCAdapter:
                 code=judge_outcome.error_code or "judge_unresolved",
                 error=judge_outcome.original_exception,
                 phase="judge_response",
+                evidence_snapshot=snapshot,
             )
             self._outcomes[unit] = outcome
             return outcome
@@ -1184,7 +1791,9 @@ class LiveABCAdapter:
         if result.final_decision.status == "confirmado":
             kind = LiveCauseKind.SUCCESS
             comment = "A/B/C y gate determinista confirmaron"
-        elif candidate.decision == "nao_encontrado":
+        elif proposal_a_layer is not None and proposal_a_layer.decision == "nao_encontrado":
+            # Independencia V1: la ausencia legitima la adjudica el agente A
+            # (autoridad semantica), no la etiqueta del clasificador V1.
             kind = LiveCauseKind.LEGITIMATE_ABSENCE
             comment = "acceso exitoso sin evidencia de concurso para el bucket"
         elif result.judge_invoked:
@@ -1193,13 +1802,22 @@ class LiveABCAdapter:
         else:
             kind = LiveCauseKind.EVIDENCE_FAILURE
             comment = "evidencia o cita rechazada"
+        revisar_por = ""
+        if result.final_decision.status != "confirmado":
+            if result.reason_code == "prosecutor_review":
+                revisar_por = "revisar_por_B"
+            elif result.judge_invoked or result.reason_code.startswith("judge_"):
+                revisar_por = "revisar_por_C"
+            else:
+                revisar_por = "revisar_por_gate"
         outcome = LiveABCOutcome(
             municipio=municipio,
             bucket=bucket,
             decision=result.final_decision.decision,
             url=result.final_decision.url,
-            cause=LiveCause(kind, result.reason_code, comment),
+            cause=LiveCause(kind, result.reason_code, comment, revisar_por),
             layer=layer,
+            evidence_snapshot=snapshot,
         )
         self._outcomes[unit] = outcome
         return outcome
@@ -1221,4 +1839,5 @@ __all__ = [
     "ModelResponseValidationError",
     "OrionFetcher",
     "OrionHTTPFetcher",
+    "RenderFallbackFetcher",
 ]

@@ -11,6 +11,7 @@ from scripts.fase2_municipios.v2.snapshot import (
     anchor_citation,
     Citation,
     CitationBatchVerificationError,
+    CitationFailure,
     CitationVerificationError,
     DuplicateSourceError,
     EvidenceSource,
@@ -225,6 +226,64 @@ def test_repeated_quote_without_offsets_fails_closed_but_explicit_offsets_disamb
         {"source_id": "main", "start": 9, "end": 15, "quote": "Edital"},
     )
     verify_citation(snapshot, citation)
+
+
+def test_ambiguous_citation_reports_real_non_overlapping_occurrence_count() -> None:
+    """Ambiguedad hoy solo era binaria (find(quote, position+1) >= 0). El
+    conteo real deja de ser 'aparece mas de una vez' para decir cuantas."""
+    snapshot = build_snapshot([source("main", "Edital / Edital / Edital")])
+    with pytest.raises(CitationVerificationError) as raised:
+        anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
+    assert raised.value.reason == "quote_ambiguous"
+    assert raised.value.occurrence_count == 3
+
+
+def test_two_occurrences_are_counted_exactly_as_two() -> None:
+    snapshot = build_snapshot([source("main", "Concurso 01 aberto / Concurso 01 fim")])
+    with pytest.raises(CitationVerificationError) as raised:
+        anchor_citation(snapshot, {"source_id": "main", "quote": "Concurso 01"})
+    assert raised.value.occurrence_count == 2
+
+
+def test_non_ambiguous_failure_reasons_leave_occurrence_count_none() -> None:
+    """occurrence_count solo tiene sentido para quote_ambiguous: los demas
+    fallos (quote_not_found, empty_source, etc.) no deben inventar un conteo."""
+    snapshot = build_snapshot([source("main", "unico texto sin repetir")])
+    with pytest.raises(CitationVerificationError) as not_found:
+        anchor_citation(snapshot, {"source_id": "main", "quote": "no existe"})
+    assert not_found.value.reason == "quote_not_found"
+    assert not_found.value.occurrence_count is None
+
+    empty_snapshot = build_snapshot([source("empty", "")])
+    with pytest.raises(CitationVerificationError) as empty:
+        anchor_citation(empty_snapshot, {"source_id": "main", "quote": "x"})
+    assert empty.value.reason == "empty_source"
+    assert empty.value.occurrence_count is None
+
+
+def test_existing_reason_and_quote_preview_reader_code_is_unaffected() -> None:
+    """Compatibilidad: codigo existente que solo lee .reason/.quote_preview
+    (sin conocer occurrence_count) sigue funcionando igual."""
+    snapshot = build_snapshot([source("main", "Edital / Edital")])
+    with pytest.raises(CitationVerificationError) as raised:
+        anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
+    assert raised.value.reason == "quote_ambiguous"
+    assert raised.value.quote_preview == "Edital"
+    assert "reason=quote_ambiguous" in str(raised.value)
+
+
+def test_verify_all_forwards_occurrence_count_into_citation_failure_when_present() -> None:
+    """verify_all/CitationFailure no rompe el batch: cuando el fallo subyacente
+    trae occurrence_count, se propaga; sin el, se mantiene None (default)."""
+    failure_with_count = CitationFailure(
+        index=0, source_id="main", reason="quote_ambiguous",
+        quote_preview="Edital", occurrence_count=3,
+    )
+    failure_without_count = CitationFailure(
+        index=1, source_id="main", reason="quote_not_found", quote_preview="x",
+    )
+    assert failure_with_count.occurrence_count == 3
+    assert failure_without_count.occurrence_count is None
 
 
 def test_unknown_citation_fields_are_ignored() -> None:

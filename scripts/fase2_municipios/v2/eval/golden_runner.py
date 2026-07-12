@@ -509,6 +509,7 @@ class GoldenDifferentialRunner:
             candidates=(candidate,) if candidate else (),
             proposal_a=proposal_a,
             proposal_b=proposal_b,
+            requested_bucket=bucket,
         )
         return {
             "decision": result.final_decision.decision,

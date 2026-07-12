@@ -18,6 +18,7 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
 from scripts.fase2_municipios.v2.agents.base import SnapshotInvalidOutput
 from scripts.fase2_municipios.v2.eval.run_golden_live import (
     FINAL_FILENAMES,
+    GoldenLiveIncompleteError,
     run_golden_live,
 )
 
@@ -113,8 +114,14 @@ def test_incomplete_tracker_schema_and_consumer_rejects_partial(tmp_path: Path) 
         ("Pending", "concurso_publico"),
     )
     tracker = tracker_type(tmp_path, units)
-    tracker.record_terminal(units[0], status="complete")
-    tracker.record_terminal(units[1], status="error")
+    tracker.record_terminal(
+        units[0], status="complete", decision="indice_oficial",
+    )
+    tracker.record_terminal(
+        units[1], status="error", decision="revisar",
+        revisar_por="revisar_por_B", stage="B",
+        error_class="SnapshotInvalidOutput",
+    )
     try:
         raise KeyboardInterrupt("offline interruption")
     except BaseException as exc:
@@ -128,6 +135,22 @@ def test_incomplete_tracker_schema_and_consumer_rejects_partial(tmp_path: Path) 
     assert partial["failed_units"] == [{"municipio": "Failed", "bucket": "processo_seletivo"}]
     assert partial["pending_units"] == [{"municipio": "Pending", "bucket": "concurso_publico"}]
     assert partial["cause"]["code"] == "KeyboardInterrupt"
+    assert partial["completed"] == [{
+        "municipio": "Complete",
+        "bucket": "concurso_publico",
+        "decision": "indice_oficial",
+        "revisar_por": "",
+    }]
+    assert partial["failed"] == [{
+        "municipio": "Failed",
+        "bucket": "processo_seletivo",
+        "stage": "B",
+        "error_class": "SnapshotInvalidOutput",
+        "revisar_por": "revisar_por_B",
+    }]
+    assert partial["pending"] == [{
+        "municipio": "Pending", "bucket": "concurso_publico",
+    }]
 
     assert live_observability.is_publishable_artifact(partial) is False
     assert not any((tmp_path / name).exists() for name in (
@@ -164,8 +187,68 @@ def test_real_adapter_persists_snapshot_and_raw_at_each_reached_stage(tmp_path: 
     assert artifact["evidence_snapshot"]["sources"][0]["source_id"] == "main"
     assert artifact["stages"]["A"]["state"] == "raw_received"
     assert artifact["stages"]["B"]["state"] == "raw_received"
-    assert artifact["stages"]["C"]["state"] == "raw_received"
+    assert artifact["stages"]["C"]["state"] == "skipped"
     assert artifact["stages"]["A"]["raw"]["decision"] == "indice_oficial"
+
+
+def test_runner_links_failed_model_snapshot_and_raw_artifact_by_hash(
+    tmp_path: Path,
+    network_guard_spy,
+) -> None:
+    from scripts.fase2_municipios.v2.eval.tests import test_live_abc_adapter as live_fx
+    from scripts.fase2_municipios.v2.eval.tests import test_run_golden_live as run_fx
+
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    golden = inputs / "golden.csv"
+    url_map = inputs / "urls.csv"
+    v1_dir = inputs / "v1"
+    run_fx._write_golden(golden)
+    run_fx._write_url_map(url_map)
+    run_fx._write_v1_corpus(v1_dir)
+    staging_root = tmp_path / "staging"
+    output_dir = staging_root / "failed-model-observability"
+    unit = (run_fx.MUNICIPIOS[0], run_fx.BUCKETS[0])
+
+    def adapter_factory(**kwargs):
+        return LiveABCAdapter(
+            fetcher=live_fx.FakeFetcher(),
+            target_urls=kwargs["target_urls"],
+            certifier=live_fx.FakeCertifier(outcome=SnapshotInvalidOutput(
+                role="certifier",
+                code="citation_verification_failed",
+                raw={"decision": "indice_oficial", "citations": []},
+                original_exception=ValueError("offline invalid citation"),
+            )),
+            prosecutor=live_fx.FakeProsecutor(),
+            judge=live_fx.FakeJudge(),
+        )
+
+    network_guard_spy.reset()
+    with pytest.raises(GoldenLiveIncompleteError):
+        run_golden_live(
+            golden_path=golden,
+            url_map_path=url_map,
+            v1_corpus_dir=v1_dir,
+            output_dir=output_dir,
+            environ={"GEMINI_API_KEY_FREE": "offline-free"},
+            staging_root=staging_root,
+            unit_allowlist=(unit,),
+            fetcher_factory=lambda: object(),
+            adapter_factory=adapter_factory,
+        )
+
+    checkpoint = json.loads(
+        (output_dir / "checkpoint.json").read_text(encoding="utf-8")
+    )
+    record = next(iter(checkpoint["units"].values()))
+    assert record["snapshot_hash"]
+    snapshot_path = output_dir / record["snapshot_path"]
+    assert snapshot_path.is_file()
+    assert record["result"]["observability_hash"]
+    observability_path = output_dir / record["result"]["observability_path"]
+    assert observability_path.is_file()
+    assert network_guard_spy.blocked_attempts == 0
 
 
 def test_typed_invocation_error_is_mapped_by_adapter_gate_only() -> None:
@@ -214,6 +297,7 @@ def test_runner_finally_writes_partial_and_never_publishes_it(tmp_path: Path) ->
                         LiveCauseKind.MODEL_FAILURE,
                         "SnapshotInvalidOutput",
                         "fallo de Gemini free-only",
+                        "revisar_por_A",
                     ),
                     layer=None,
                     original_exception=RuntimeError("offline invalid output"),
@@ -253,4 +337,12 @@ def test_runner_finally_writes_partial_and_never_publishes_it(tmp_path: Path) ->
         {"municipio": unit[0], "bucket": unit[1]} for unit in targets[2:]
     ]
     assert partial["cause"]["code"] == "KeyboardInterrupt"
+    assert partial["completed"][0]["decision"] == "indice_oficial"
+    assert partial["failed"] == [{
+        "municipio": targets[1][0],
+        "bucket": targets[1][1],
+        "stage": "final",
+        "error_class": "RuntimeError",
+        "revisar_por": "revisar_por_A",
+    }]
     assert not any((output_dir / filename).exists() for filename in FINAL_FILENAMES)

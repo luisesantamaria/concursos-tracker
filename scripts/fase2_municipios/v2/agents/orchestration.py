@@ -190,23 +190,77 @@ class ABCOrchestrator:
         certifier: Any,
         prosecutor: Any,
         capture_sink: CaptureSink | None = None,
+        requested_bucket: str | None = None,
     ) -> OrchestrationResult:
-        """Execute A then B; C remains conditional inside ``resolve``."""
+        """Execute A, then B only for an affirmative A; C stays conditional."""
         candidate_tuple = tuple(candidates)
         certified = certifier.certify(snapshot=snapshot, task=task)
+        certified_output = getattr(certified, "output", certified)
+        if not isinstance(certified_output, Mapping):
+            return OrchestrationResult(
+                self._review(requested_bucket or "combinado", "proposal_invalid"),
+                "proposal_invalid",
+                False,
+            )
+        proposal_a = self._proposal_from_certifier(
+            certified_output, candidate_tuple
+        )
+        if certified_output.get("decision") not in AFFIRMATIVE_CERTIFIER_DECISIONS:
+            return self.resolve(
+                snapshot=snapshot,
+                candidates=candidate_tuple,
+                proposal_a=proposal_a,
+                proposal_b=proposal_a,
+                capture_sink=capture_sink,
+                requested_bucket=requested_bucket,
+            )
         prosecuted = prosecutor.audit(
             snapshot=snapshot,
-            certifier_output=certified.output,
+            certifier_output=self._normalize_combined_bucket(
+                proposal_a, requested_bucket
+            ),
         )
-        proposal_a = self._proposal_from_certifier(certified.output, candidate_tuple)
-        proposal_b = self._proposal_from_prosecutor(prosecuted.output, proposal_a)
+        prosecuted_output = getattr(prosecuted, "output", prosecuted)
+        if not isinstance(prosecuted_output, Mapping):
+            return OrchestrationResult(
+                self._review(requested_bucket or "combinado", "proposal_invalid"),
+                "proposal_invalid",
+                False,
+            )
+        proposal_b = self._proposal_from_prosecutor(prosecuted_output, proposal_a)
         return self.resolve(
             snapshot=snapshot,
             candidates=candidate_tuple,
             proposal_a=proposal_a,
             proposal_b=proposal_b,
             capture_sink=capture_sink,
+            requested_bucket=requested_bucket,
+            prosecutor_result=str(prosecuted_output.get("result", "")),
         )
+
+    @staticmethod
+    def _normalize_combined_bucket(
+        proposal: Mapping[str, Any], requested_bucket: str | None
+    ) -> dict[str, Any]:
+        normalized = dict(proposal)
+        canonical_requested = (
+            cascade._canonical_bucket(requested_bucket)
+            if isinstance(requested_bucket, str) else ""
+        )
+        if (
+            canonical_requested in {"concurso_publico", "processo_seletivo"}
+            and normalized.get("decision") == "indice_oficial_combinado"
+            and cascade._canonical_bucket(str(normalized.get("bucket", "")))
+            == "combinado"
+        ):
+            normalized["bucket"] = canonical_requested
+        elif (
+            canonical_requested in {"concurso_publico", "processo_seletivo"}
+            and normalized.get("decision") == "revisar"
+            and normalized.get("bucket") == "desconocido"
+        ):
+            normalized["bucket"] = canonical_requested
+        return normalized
 
     @staticmethod
     def _review(bucket: str, code: str, candidate_id: str = "") -> cascade.FinalDecision:
@@ -253,23 +307,75 @@ class ABCOrchestrator:
         citations = self._strict_citations(snapshot, proposal)
         if not citations:
             raise _FinalGateFailure("affirmative_without_citations", invalid_citation=True)
-        selected = cascade.resolve_selector_pick(
-            list(candidates), proposal.bucket, proposal.candidate_id
-        )
-        if not isinstance(selected, cascade.SelectedResource):
-            raise _FinalGateFailure("selector_rejected_proposal")
-        record = selected.candidate
-        if record.decision != proposal.decision:
-            raise _FinalGateFailure("proposal_decision_mismatch")
+
+        # Independencia total V1/V2 (directiva 12-jul): la autoridad SEMANTICA
+        # es exclusiva de los agentes A/B/C. El codigo solo verifica hechos
+        # objetivos: candidato existente, URL final identica, seguridad
+        # estructural (autoridad/identidad/accesibilidad/estado de evidencia,
+        # computadas deterministicamente por evidencia, jamas por regex de
+        # contenido) y el pin de bucket fijado aguas arriba. La clasificacion
+        # V1 (record.decision/page_role) NO se lee ni participa.
+        record = self._proposal_record(candidates, proposal)
+        if record is None:
+            raise _FinalGateFailure("candidate_not_found")
         if (
             cascade._normalized_candidate_url(record.final_url)
             != cascade._normalized_candidate_url(proposal.resource_url)
         ):
             raise _FinalGateFailure("proposal_resource_mismatch")
-        final = cascade.derive_final_decision(selected)
-        if final.status != "confirmado":
-            raise _FinalGateFailure("existing_final_gate_rejected")
-        return final
+        blockers = self._safety_blockers(record)
+        if blockers:
+            raise _FinalGateFailure(
+                "structural_safety_rejected:" + ";".join(blockers)
+            )
+        canonical = cascade._canonical_bucket(proposal.bucket)
+        if canonical not in {"concurso_publico", "processo_seletivo"}:
+            raise _FinalGateFailure("bucket_invalid")
+        return cascade.FinalDecision(
+            bucket=canonical,
+            status="confirmado",
+            decision=proposal.decision,
+            url=record.final_url,
+            candidate_id=record.candidate_id,
+            reason=(
+                "v2_semantic_authority: consenso A/B con citas literales "
+                f"verificadas; authority={record.authority}; "
+                f"identity={record.identity}; "
+                f"evidence_state={record.evidence_state}; "
+                f"candidate_id={record.candidate_id}; "
+                f"final_url={record.final_url}; snapshot preservado sin refetch"
+            ),
+        )
+
+    @staticmethod
+    def _proposal_record(
+        candidates: tuple[cascade.CandidateRecord, ...],
+        proposal: DecisionProposal,
+    ) -> cascade.CandidateRecord | None:
+        """Record de la propuesta por candidate_id, SIN el filtro de
+        elegibilidad del selector (que exige decision V1 afirmativa: cuando la
+        clasificacion semantica V1 esta equivocada, ese filtro vaciaria el
+        pool y ocultaria el desacuerdo que la cola debe capturar)."""
+        for record in candidates:
+            if record.candidate_id == proposal.candidate_id:
+                return record
+        return None
+
+    @staticmethod
+    def _safety_blockers(record: cascade.CandidateRecord) -> list[str]:
+        """Bloqueadores ESTRUCTURALES de derive_final_decision, sin el veto
+        semantico (record.decision). Espejo exacto de cascade: autoridad,
+        identidad y accesibilidad/estado de evidencia."""
+        blockers: list[str] = []
+        if record.authority != "confirmada":
+            blockers.append(f"authority={record.authority}")
+        if record.identity != "confirmada":
+            blockers.append(f"identity={record.identity}")
+        if not record.accessible or record.evidence_state not in {
+            "completa", "renderizada",
+        }:
+            blockers.append(f"evidence_state={record.evidence_state}")
+        return blockers
 
     def resolve(
         self,
@@ -279,12 +385,16 @@ class ABCOrchestrator:
         proposal_a: Mapping[str, Any],
         proposal_b: Mapping[str, Any],
         capture_sink: CaptureSink | None = None,
+        requested_bucket: str | None = None,
+        prosecutor_result: str | None = None,
     ) -> OrchestrationResult:
         result = self._resolve_without_capture(
             snapshot=snapshot,
             candidates=candidates,
             proposal_a=proposal_a,
             proposal_b=proposal_b,
+            requested_bucket=requested_bucket,
+            prosecutor_result=prosecutor_result,
         )
         if capture_sink is None:
             return result
@@ -305,8 +415,22 @@ class ABCOrchestrator:
         candidates: Iterable[cascade.CandidateRecord],
         proposal_a: Mapping[str, Any],
         proposal_b: Mapping[str, Any],
+        requested_bucket: str | None = None,
+        prosecutor_result: str | None = None,
     ) -> OrchestrationResult:
         candidate_tuple = tuple(candidates)
+        canonical_requested = (
+            cascade._canonical_bucket(requested_bucket)
+            if isinstance(requested_bucket, str) else ""
+        )
+        if requested_bucket is not None and canonical_requested not in {
+            "concurso_publico", "processo_seletivo"
+        }:
+            return OrchestrationResult(
+                self._review("combinado", "input_invalid"),
+                "input_invalid",
+                False,
+            )
         if (
             not isinstance(snapshot, EvidenceSnapshot)
             or any(
@@ -320,12 +444,64 @@ class ABCOrchestrator:
                 False,
             )
         try:
-            a = DecisionProposal.from_mapping(proposal_a)
-            b = DecisionProposal.from_mapping(proposal_b)
+            a = DecisionProposal.from_mapping(
+                self._normalize_combined_bucket(proposal_a, requested_bucket)
+            )
+            b = DecisionProposal.from_mapping(
+                self._normalize_combined_bucket(proposal_b, requested_bucket)
+            )
         except ProposalValidationError:
             return OrchestrationResult(
                 self._review("combinado", "proposal_invalid"),
                 "proposal_invalid",
+                False,
+            )
+
+        review_bucket = canonical_requested or a.bucket
+        if (
+            canonical_requested
+            and a.decision in AFFIRMATIVE_CERTIFIER_DECISIONS
+            and a.bucket != canonical_requested
+        ):
+            return OrchestrationResult(
+                self._review(review_bucket, "bucket_mismatch", a.candidate_id),
+                "bucket_mismatch",
+                False,
+            )
+        if a.decision not in AFFIRMATIVE_CERTIFIER_DECISIONS:
+            code = (
+                "agreement_review"
+                if a.decision == "revisar" else "proposal_a_not_affirmative"
+            )
+            return OrchestrationResult(
+                self._review(
+                    review_bucket, code, a.candidate_id
+                ),
+                code,
+                False,
+            )
+        if prosecutor_result not in {None, "sustain", "block", "review"}:
+            return OrchestrationResult(
+                self._review(review_bucket, "prosecutor_invalid", a.candidate_id),
+                "prosecutor_invalid",
+                False,
+            )
+        if prosecutor_result == "review":
+            return OrchestrationResult(
+                self._review(review_bucket, "prosecutor_review", a.candidate_id),
+                "prosecutor_review",
+                False,
+            )
+        if prosecutor_result == "sustain" and not self._agree(a, b):
+            return OrchestrationResult(
+                self._review(review_bucket, "prosecutor_invalid", a.candidate_id),
+                "prosecutor_invalid",
+                False,
+            )
+        if prosecutor_result == "block" and b.decision != "revisar":
+            return OrchestrationResult(
+                self._review(review_bucket, "prosecutor_invalid", a.candidate_id),
+                "prosecutor_invalid",
                 False,
             )
 
@@ -343,18 +519,27 @@ class ABCOrchestrator:
             code = "agreement_review" if final.status == "revisar" else "consensus"
             return OrchestrationResult(final, code, False)
 
+        # With an explicit direct-mode result, only a proved block reaches C.
+        if prosecutor_result is not None and prosecutor_result != "block":
+            return OrchestrationResult(
+                self._review(review_bucket, "prosecutor_review", a.candidate_id),
+                "prosecutor_review",
+                False,
+            )
+
         judged = self.judge.choose(
             snapshot=snapshot,
+            # Higiene de independencia (directiva 12-jul): decision/bucket/
+            # reason son marcadores tecnicos V1 (no_adjudicado_v1 /
+            # structural_evidence_only_v2) o narrativa sin autoridad semantica.
+            # Solo hechos objetivos de evidencia cruzan hacia C.
             candidates=(
                 {
                     "candidate_id": candidate.candidate_id,
                     "final_url": candidate.final_url,
-                    "decision": candidate.decision,
-                    "bucket": candidate.bucket,
                     "authority": candidate.authority,
                     "identity": candidate.identity,
                     "evidence_state": candidate.evidence_state,
-                    "reason": candidate.reason,
                 }
                 for candidate in candidate_tuple
             ),

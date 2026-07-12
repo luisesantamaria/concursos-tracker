@@ -192,7 +192,7 @@ def test_model_response_validation_error_is_model_failure_with_evidence() -> Non
     assert outcome.decision == "revisar"
     assert outcome.cause.kind is LiveCauseKind.MODEL_FAILURE
     assert outcome.layer is None
-    assert outcome.audit_events[0].phase == "model_response"
+    assert outcome.audit_events[0].phase == "A"
     assert outcome.audit_events[0].errors[0].startswith("ValidationError:")
     assert "Field required" in outcome.audit_events[0].errors[0]
 

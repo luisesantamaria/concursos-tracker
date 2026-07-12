@@ -120,30 +120,49 @@ def certifier_output(*, quote: str = "Official index", citations: bool = True, d
         "bucket": "concurso_publico",
         "decision": decision,
         "confidence": "high",
+        "insufficiency": "none",
         "citations": ([
+            {
+                "dimension": "authority",
+                "quote": "Official index",
+                "source_field": "main_content",
+                "source_id": "main_content",
+                "start": 0,
+                "end": len("Official index"),
+            },
             {
                 "dimension": "identity",
                 "quote": "Official index",
                 "source_field": "main_content",
                 "source_id": "main_content",
+                "start": 0,
+                "end": len("Official index"),
             },
             {
                 "dimension": "page_role",
                 "quote": quote,
                 "source_field": "main_content",
                 "source_id": "main_content",
+                **({
+                    "start": 0,
+                    "end": len("Official index"),
+                } if quote == "Official index" else {}),
             },
             {
                 "dimension": "bucket",
                 "quote": "Concursos Públicos",
                 "source_field": "title",
                 "source_id": "title",
+                "start": 0,
+                "end": len("Concursos Públicos"),
             },
             {
                 "dimension": "stability",
                 "quote": "Buscar",
                 "source_field": "main_content",
                 "source_id": "main_content",
+                "start": len("Official index\n"),
+                "end": len("Official index\nBuscar"),
             },
         ] if citations else []),
         "reason": "fixture decision",
@@ -173,6 +192,8 @@ def prosecutor_output(*, result: str = "sustain"):
     return {
         "result": result,
         "reason": "independent audit complete",
+        "confidence": "high",
+        "insufficiency": "none",
         "accusations": [
             {"code": code, "outcome": "discarded", "citations": []}
             for code in accusation_codes
@@ -398,7 +419,7 @@ def test_certifier_and_prosecutor_happy_citations_are_hydrated_and_anchored() ->
 
     fiscal_output = prosecutor_output()
     fiscal_output["citations"] = [
-        {"source_id": "main_content", "quote": "Official index", "extra": "ignored"}
+        {"source_id": "main_content", "quote": "Official index"}
     ]
     transport = FakeTransport([{"action": "final", "output": fiscal_output}])
     limiter, _clock = limiter_with_fake_clock()
@@ -408,7 +429,9 @@ def test_certifier_and_prosecutor_happy_citations_are_hydrated_and_anchored() ->
     prosecuted = prosecutor.audit(snapshot=snapshot, certifier_output=certified.output)
     assert prosecuted.output["citations"][0]["start"] == 0
     assert prosecuted.output["citations"][0]["end"] == len("Official index")
-    assert prosecuted.output["citations"][0]["extra"] == "ignored"
+    assert set(prosecuted.output["citations"][0]) == {
+        "source_id", "quote", "start", "end",
+    }
 
 
 def test_citations_are_verified_at_parse_and_preconsumption_gates(monkeypatch) -> None:
@@ -432,13 +455,46 @@ def test_citations_are_verified_at_parse_and_preconsumption_gates(monkeypatch) -
     assert calls[0] == calls[1]
 
 
-def test_prosecutor_citation_cannot_anchor_to_certifier_output() -> None:
+def test_prosecutor_top_level_citation_that_cannot_anchor_is_dropped_when_sustain() -> None:
+    """Fallo real Aratiba/CP (politica 12-jul): las citas top-level son
+    OPCIONALES salvo result='block'. Copiar el 'reason' del certificador
+    (texto ausente del snapshot) no puede tumbar un sustain valido: la cita
+    puntual se descarta y se registra en dropped_optional_citations, el
+    veredicto sustain se mantiene."""
     snapshot = snapshot_with_marker()
     certifier, _transport, _clock = make_certifier([
         {"action": "final", "output": certifier_output()},
     ])
     certified = certifier.certify(snapshot=snapshot, task="Certify.")
-    fiscal_output = prosecutor_output()
+    fiscal_output = prosecutor_output()  # result="sustain"
+    fiscal_output["citations"] = [
+        {"source_id": "main_content", "quote": certified.output["reason"]}
+    ]
+    transport = FakeTransport([{"action": "final", "output": fiscal_output}])
+    limiter, _clock = limiter_with_fake_clock()
+    prosecutor = build_prosecutor_agent(
+        transport=transport, limiter=limiter, repo_root=REPO_ROOT
+    )
+
+    prosecuted = prosecutor.audit(snapshot=snapshot, certifier_output=certified.output)
+
+    assert prosecuted.output["result"] == "sustain"
+    assert prosecuted.output["citations"] == []
+    dropped = prosecuted.output["dropped_optional_citations"]
+    assert len(dropped) == 1
+    assert dropped[0]["location"] == "top_level"
+    assert dropped[0]["source_id"] == "main_content"
+
+
+def test_prosecutor_top_level_citation_that_cannot_anchor_hard_fails_when_block() -> None:
+    """El resultado 'block' NUNCA se relaja: una cita top-level no-anclable
+    sigue rechazando duro el output entero bajo la nueva politica selectiva."""
+    snapshot = snapshot_with_marker()
+    certifier, _transport, _clock = make_certifier([
+        {"action": "final", "output": certifier_output()},
+    ])
+    certified = certifier.certify(snapshot=snapshot, task="Certify.")
+    fiscal_output = prosecutor_output(result="block")
     fiscal_output["citations"] = [
         {"source_id": "main_content", "quote": certified.output["reason"]}
     ]

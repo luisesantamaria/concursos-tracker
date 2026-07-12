@@ -31,6 +31,7 @@ from scripts.fase2_municipios.v2.snapshot import (
 
 
 LOGGER = logging.getLogger(__name__)
+MAX_DIRECT_SNAPSHOT_CHARS = 200_000
 PROTOCOL_INSTRUCTION = """APPLICATION AGENTSTEP PROTOCOL (no native function calling):
 Return exactly one JSON object per turn with action=tool or action=final.
 For action=tool provide tool and args, and omit output.
@@ -116,14 +117,27 @@ OutputInvariant = Callable[[Mapping[str, Any]], None]
 OutputPreparer = Callable[[EvidenceSnapshot, Mapping[str, Any]], Mapping[str, Any]]
 
 
+_API_UNSUPPORTED_SCHEMA_KEYS = frozenset({
+    # Marcador de dialecto (SDK google-genai 2.11 lo rechaza en response_schema).
+    "$schema",
+    # Limites de cardinalidad de arrays: la API Gemini respondio 400
+    # INVALID_ARGUMENT ante minItems/maxItems en response_json_schema (canario
+    # r4, primer ejercicio live del schema del fiscal). Se retiran SOLO del
+    # schema API-facing: la validacion LOCAL (validate_json_schema) y los
+    # invariantes Python siguen exigiendo la cardinalidad exacta fail-closed.
+    "minItems",
+    "maxItems",
+})
+
+
 def sanitized_response_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
-    """Copy a JSON Schema for ``response_json_schema`` without dialect markers."""
+    """Copy a JSON Schema for ``response_json_schema`` without unsupported keys."""
 
     def clean(value: Any) -> Any:
         if isinstance(value, Mapping):
             return {
                 str(key): clean(item) for key, item in value.items()
-                if key != "$schema"
+                if key not in _API_UNSUPPORTED_SCHEMA_KEYS
             }
         if isinstance(value, (list, tuple)):
             return [clean(item) for item in value]
@@ -186,17 +200,22 @@ class AgentRunner:
         self.tools = tools
 
     def _direct_contents(self, snapshot: EvidenceSnapshot, task: str) -> list[dict[str, Any]]:
+        remaining = MAX_DIRECT_SNAPSHOT_CHARS
+        sources = []
+        for source in snapshot.sources:
+            bounded = source.content[:remaining]
+            remaining = max(0, remaining - len(bounded))
+            sources.append({
+                "source_id": source.source_id,
+                "url": source.url,
+                "retrieved_at": source.retrieved_at.isoformat(),
+                "content": bounded,
+                "original_length": len(source.content),
+                "content_truncated": len(bounded) < len(source.content),
+            })
         evidence = {
             "snapshot_sha256": snapshot.snapshot_sha256,
-            "sources": [
-                {
-                    "source_id": source.source_id,
-                    "url": source.url,
-                    "retrieved_at": source.retrieved_at.isoformat(),
-                    "content": source.content,
-                }
-                for source in snapshot.sources
-            ],
+            "sources": sources,
         }
         return [
             {"role": "system", "parts": [{"text": self.system_prompt}]},
@@ -255,8 +274,10 @@ class AgentRunner:
         try:
             prepared = self.prepare_output(snapshot, output)
         except CitationVerificationError as exc:
+            failure_count = len(getattr(exc, "failures", ())) or 1
             raise AgentOutputRejected(
-                role=self.role, reason="citation_verification_failed:1"
+                role=self.role,
+                reason=f"citation_verification_failed:{failure_count}",
             ) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise AgentOutputRejected(
@@ -297,28 +318,112 @@ class AgentRunner:
                 role=self.role, reason=f"citation_verification_failed:{failure_count}"
             ) from exc
 
+    @staticmethod
+    def _citation_repair_instruction(exc: BaseException) -> str:
+        cause = exc.__cause__
+        failures = getattr(cause, "failures", None) or (
+            (cause,) if cause is not None else ()
+        )
+        lines = []
+        has_occurrence_detail = False
+        for failure in failures:
+            occurrence_count = getattr(failure, "occurrence_count", None)
+            line = (
+                f"- source_id={getattr(failure, 'source_id', '?')} "
+                f"reason={getattr(failure, 'reason', '?')} "
+                f"quote_preview={getattr(failure, 'quote_preview', '')!r}"
+            )
+            if occurrence_count is not None:
+                has_occurrence_detail = True
+                line += f" (la cita aparece {occurrence_count} veces)"
+            lines.append(line)
+        detail = "\n".join(lines) or str(cause or exc)
+        # Motivado por Pelotas/CP (12-jul): r1 y r2 citaron el mismo chrome
+        # duplicado ('Prefeitura Municipal de Pelotas' en header Y footer) y
+        # la unica ronda de reparacion repitio la misma cita ambigua. Cuando
+        # hay conteo real de ocurrencias, se agrega la estrategia correcta en
+        # vez de solo repetir "hazla unica" sin decir como. Sin conteo
+        # disponible el mensaje se mantiene identico al original.
+        strategy = (
+            " Estrategia recomendada: extiende la quote con contexto vecino "
+            "UNICO del contenido principal, o cita una linea "
+            "estructuralmente unica (titulo/fila del evento) en vez de "
+            "texto de menu/footer repetido."
+            if has_occurrence_detail else ""
+        )
+        return (
+            "CITATION_REPAIR (unica oportunidad): tu respuesta fue rechazada por "
+            "el validador determinista de citas. Fallas exactas:\n" + detail + "\n"
+            "Reenvia el JSON COMPLETO con el mismo schema corrigiendo SOLO las "
+            "citas fallidas: cada quote debe ser copia LITERAL del snapshot y "
+            "ocurrir EXACTAMENTE UNA VEZ en su fuente; si un texto se repite, "
+            "EXTIENDE la quote con el contexto vecino hasta hacerla unica. No "
+            "cambies tu decision, no inventes contenido y no emitas start/end."
+            + strategy
+        )
+
     def _run_direct(
         self, *, snapshot: EvidenceSnapshot, task: str
     ) -> AgentRunResult | SnapshotInvalidOutput:
+        # Politica 12-jul (aprobada por Luis): ante rechazo del anclaje de citas
+        # (quote_ambiguous/quote_not_found/formato), UNA sola re-invocacion con
+        # el detalle exacto del fallo. El validador determinista re-verifica
+        # completo; si la reparacion tambien falla, fail-closed tipado. Los
+        # rechazos NO relacionados con citas jamas se reparan ni reintentan.
+        contents = self._direct_contents(snapshot, task)
         raw: Any | None = None
-        try:
-            raw = self.client.generate_structured(
-                self._direct_contents(snapshot, task),
-                estimated_tokens=self.estimated_tokens,
-            )
-            if not isinstance(raw, Mapping):
-                raise AgentOutputRejected(role=self.role, reason="direct_output_not_object")
-            parsed_output = self._validate_final(snapshot, raw)
-            return AgentRunResult(
-                role=self.role, output=parsed_output, steps=1, tool_calls=0
-            )
-        except (SchemaValidationError, AgentOutputRejected) as exc:
-            return SnapshotInvalidOutput(
-                role=self.role,
-                code=type(exc).__name__,
-                raw=raw,
-                original_exception=exc,
-            )
+        repair_used = False
+        while True:
+            try:
+                estimator = getattr(self.client, "estimate_request_tokens", None)
+                estimated_tokens = (
+                    estimator(contents) if callable(estimator) else self.estimated_tokens
+                )
+                raw = self.client.generate_structured(
+                    contents,
+                    estimated_tokens=estimated_tokens,
+                )
+                if not isinstance(raw, Mapping):
+                    raise AgentOutputRejected(role=self.role, reason="direct_output_not_object")
+                if (
+                    sum(len(source.content) for source in snapshot.sources)
+                    > MAX_DIRECT_SNAPSHOT_CHARS
+                    and self.requires_citations(raw)
+                ):
+                    raise AgentOutputRejected(
+                        role=self.role,
+                        reason="truncated_snapshot_cannot_support_affirmative_output",
+                    )
+                parsed_output = self._validate_final(snapshot, raw)
+                return AgentRunResult(
+                    role=self.role, output=parsed_output,
+                    steps=2 if repair_used else 1, tool_calls=0,
+                )
+            except (SchemaValidationError, AgentOutputRejected) as exc:
+                reason = getattr(exc, "reason", "") or ""
+                if (
+                    not repair_used
+                    and isinstance(exc, AgentOutputRejected)
+                    and reason.startswith("citation_")
+                    and isinstance(raw, Mapping)
+                ):
+                    repair_used = True
+                    contents = list(contents) + [
+                        {"role": "model", "parts": [{
+                            "text": json.dumps(raw, ensure_ascii=False),
+                        }]},
+                        {"role": "user", "parts": [{
+                            "text": self._citation_repair_instruction(exc),
+                        }]},
+                    ]
+                    raw = None
+                    continue
+                return SnapshotInvalidOutput(
+                    role=self.role,
+                    code=type(exc).__name__,
+                    raw=(exc.raw if isinstance(exc, SchemaValidationError) else raw),
+                    original_exception=exc,
+                )
 
     def _run_tool_loop(self, *, snapshot: EvidenceSnapshot, task: str) -> AgentRunResult:
         tools = LocalSnapshotTools(snapshot, self.tool_limits)

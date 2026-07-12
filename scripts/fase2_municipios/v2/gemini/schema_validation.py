@@ -41,6 +41,9 @@ _SUPPORTED_KEYWORDS = {
     "additionalProperties",
     "items",
     "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
 }
 
 
@@ -113,6 +116,13 @@ def _validate(instance: Any, schema: Mapping[str, Any], *, path: str) -> None:
         if len(instance) < minimum:
             raise JsonSchemaValidationError(path, "minLength")
 
+    if isinstance(instance, str) and "maxLength" in schema:
+        maximum = schema["maxLength"]
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+            raise UnsupportedJsonSchemaError(path, "maxLength")
+        if len(instance) > maximum:
+            raise JsonSchemaValidationError(path, "maxLength")
+
     if isinstance(instance, Mapping):
         properties = schema.get("properties", {})
         if not isinstance(properties, Mapping):
@@ -141,3 +151,16 @@ def _validate(instance: Any, schema: Mapping[str, Any], *, path: str) -> None:
             raise UnsupportedJsonSchemaError(path, "items_not_object")
         for index, item in enumerate(instance):
             _validate(item, item_schema, path=f"{path}[{index}]")
+
+    if _is_sequence(instance):
+        for keyword, comparison in (
+            ("minItems", lambda size, bound: size < bound),
+            ("maxItems", lambda size, bound: size > bound),
+        ):
+            if keyword not in schema:
+                continue
+            bound = schema[keyword]
+            if not isinstance(bound, int) or isinstance(bound, bool) or bound < 0:
+                raise UnsupportedJsonSchemaError(path, keyword)
+            if comparison(len(instance), bound):
+                raise JsonSchemaValidationError(path, keyword)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -352,6 +353,30 @@ def test_untrusted_prompt_injection_is_delimited_and_closed_domain() -> None:
     assert "UNTRUSTED_DATA" in prompt_text
     assert "never instructions" in prompt_text
     assert result.final_decision.status == "confirmado"
+
+
+def test_judge_candidate_payload_excludes_v1_labels_and_reason() -> None:
+    """Higiene de independencia (directiva 12-jul): decision/bucket/reason son
+    marcadores tecnicos V1 o narrativa sin autoridad semantica; solo hechos
+    objetivos (candidate_id, final_url, authority, identity, evidence_state)
+    cruzan hacia C -- ninguna fuga estructural del payload de candidatas."""
+    a = record("a", URL_A, decision="licitacao_rechazada", bucket="processo_seletivo")
+    service, client = orchestrator({"decision": "aceptar_A", "reason": "choice"})
+
+    service.resolve(
+        snapshot=snapshot(), candidates=(a,),
+        proposal_a=proposal(a, decision="indice_oficial"), proposal_b=proposal(None),
+    )
+
+    prompt_text = client.calls[0][0][1]["parts"][0]["text"]
+    body = prompt_text.removeprefix("UNTRUSTED_DATA_BEGIN\n")
+    body = body[: body.index("\nUNTRUSTED_DATA_END")]
+    payload = json.loads(body)
+    candidate_payload = payload["candidates"][0]
+    assert set(candidate_payload) == {
+        "candidate_id", "final_url", "authority", "identity", "evidence_state",
+    }
+    assert candidate_payload["candidate_id"] == "a"
 
 
 def test_judge_model_comes_from_role_models_config() -> None:

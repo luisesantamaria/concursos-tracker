@@ -3,7 +3,7 @@
   "title": "Fase2CertifierOutput",
   "type": "object",
   "additionalProperties": false,
-  "required": ["candidate_id", "source_kind", "authority", "identity", "page_role", "evidence_state", "bucket", "decision", "confidence", "citations", "reason", "tool_request", "learning_proposal"],
+  "required": ["candidate_id", "source_kind", "authority", "identity", "page_role", "evidence_state", "bucket", "decision", "confidence", "insufficiency", "citations", "reason", "tool_request", "learning_proposal"],
   "properties": {
     "candidate_id": {"type": "string"},
     "source_kind": {"enum": ["dominio_oficial_prefeitura", "portal_externo_delegado", "banca", "diario", "desconocido"]},
@@ -14,10 +14,12 @@
     "bucket": {"enum": ["concurso_publico", "processo_seletivo", "combinado", "desconocido"]},
     "decision": {"enum": ["indice_oficial", "indice_oficial_combinado", "portal_externo_oficial", "detalle_individual_rechazado", "licitacao_rechazada", "concurso_cultural_rechazado", "nao_encontrado", "revisar"]},
     "confidence": {"enum": ["high", "medium", "low"]},
+    "insufficiency": {"enum": ["none", "snapshot_incompleto", "antibot", "render_requerido", "senal_contradictoria"]},
     "citations": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["dimension", "quote", "source_field", "source_id"],
         "properties": {
           "dimension": {"enum": ["authority", "identity", "page_role", "bucket", "stability", "rejection"]},
@@ -29,22 +31,8 @@
         }
       }
     },
-    "reason": {"type": "string", "minLength": 1},
-    "tool_request": {
-      "anyOf": [
-        {"type": "null"},
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["tool", "args", "question"],
-          "properties": {
-            "tool": {"enum": ["fetch_http", "render_browser", "extract_main_content", "inspect_navigation", "inspect_links", "inspect_sitemap", "search_internal", "verify_identity", "verify_official_chain", "compare_candidates", "lookup_case_memory"]},
-            "args": {"type": "object"},
-            "question": {"type": "string", "minLength": 1}
-          }
-        }
-      ]
-    },
-    "learning_proposal": {"type": ["object", "null"]}
+    "reason": {"type": "string", "minLength": 1, "maxLength": 400},
+    "tool_request": {"type": "null"},
+    "learning_proposal": {"type": "null"}
   }
 }

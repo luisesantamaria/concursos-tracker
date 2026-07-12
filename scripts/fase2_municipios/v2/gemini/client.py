@@ -46,6 +46,7 @@ SAFE_CONFIG_KEYS = frozenset({
     "stop_sequences",
     "seed",
 })
+MAX_RAW_RESPONSE_CHARS = 100_000
 
 
 class GeminiClientError(RuntimeError):
@@ -78,9 +79,12 @@ class UnsafeConfigurationError(GeminiClientError):
 
 
 class SchemaValidationError(GeminiClientError):
-    def __init__(self, *, reason: str, location: str = "$") -> None:
+    def __init__(
+        self, *, reason: str, location: str = "$", raw: str | None = None
+    ) -> None:
         self.reason = reason
         self.location = location
+        self.raw = raw[:MAX_RAW_RESPONSE_CHARS] if isinstance(raw, str) else None
         super().__init__(f"structured response rejected: reason={reason}, location={location}")
 
 
@@ -109,6 +113,12 @@ class TokenUsage:
     prompt_tokens: int
     candidate_tokens: int
     total_tokens: int
+    # Campos opcionales de usage_metadata que Gemini 3.x ('thinking') reporta
+    # ademas de prompt/candidates/total. Default 0 preserva la compatibilidad
+    # posicional con llamadas existentes que solo pasan los primeros 3 campos.
+    thoughts_tokens: int = 0
+    cached_tokens: int = 0
+    tool_use_prompt_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -240,8 +250,26 @@ class RealGeminiTransport:
                 prompt_tokens=getattr(metadata, "prompt_token_count", -1),
                 candidate_tokens=getattr(metadata, "candidates_token_count", -1),
                 total_tokens=getattr(metadata, "total_token_count", -1),
+                thoughts_tokens=_optional_usage_field(metadata, "thoughts_token_count"),
+                cached_tokens=_optional_usage_field(metadata, "cached_content_token_count"),
+                tool_use_prompt_tokens=_optional_usage_field(
+                    metadata, "tool_use_prompt_token_count"
+                ),
             )
         return RawResponse(text=getattr(response, "text", ""), usage=usage)
+
+
+def _optional_usage_field(metadata: Any, name: str) -> Any:
+    """Read a non-billed usage_metadata field, tolerant to absence or None.
+
+    ``thoughts_token_count``/``cached_content_token_count``/
+    ``tool_use_prompt_token_count`` are newer SDK fields that may be entirely
+    absent (older SDK/model) or explicitly ``None``; both collapse to 0 so a
+    perfectly valid 'thinking' response is not rejected for missing metadata
+    the caller never asked to be mandatory.
+    """
+    value = getattr(metadata, name, 0)
+    return 0 if value is None else value
 
 
 def _normalized_key(key: Any) -> str:
@@ -285,12 +313,32 @@ def _guard_grounding(value: Any, *, path: str = "$", seen: set[int] | None = Non
 def _validate_usage(usage: TokenUsage | None) -> TokenUsage:
     if usage is None:
         raise UsageInconsistencyError("missing")
-    values = (usage.prompt_tokens, usage.candidate_tokens, usage.total_tokens)
+    values = (
+        usage.prompt_tokens,
+        usage.candidate_tokens,
+        usage.total_tokens,
+        usage.thoughts_tokens,
+        usage.cached_tokens,
+        usage.tool_use_prompt_tokens,
+    )
     if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
         raise UsageInconsistencyError("non_integer")
     if any(value < 0 for value in values):
         raise UsageInconsistencyError("negative")
-    if usage.total_tokens != usage.prompt_tokens + usage.candidate_tokens:
+    # Gemini 3.x 'thinking' reports total = prompt + candidates + thoughts (and
+    # may also add cached_content/tool_use_prompt tokens), so strict equality
+    # against prompt+candidates alone rejects valid responses (Aratiba/PS live
+    # failure, 12-jul). Still fail closed: an undercount below the billed
+    # prompt+candidates floor is real corruption, and any excess beyond the
+    # sum of every known component is unexplained, not "generously accepted".
+    billed_floor = usage.prompt_tokens + usage.candidate_tokens
+    known_ceiling = (
+        billed_floor
+        + usage.thoughts_tokens
+        + usage.cached_tokens
+        + usage.tool_use_prompt_tokens
+    )
+    if usage.total_tokens < billed_floor or usage.total_tokens > known_ceiling:
         raise UsageInconsistencyError("total_mismatch")
     return usage
 
@@ -330,6 +378,27 @@ class StructuredGeminiClient:
         _guard_grounding(config)
         return config
 
+    @staticmethod
+    def serialize_request_payload(contents: Any, config: Mapping[str, Any]) -> str:
+        """Serialize exactly the context-bearing request body, deterministically."""
+
+        return json.dumps(
+            {"contents": contents, "config": dict(config)},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def estimate_request_tokens(
+        self, contents: Any, config: Mapping[str, Any] | None = None
+    ) -> int:
+        """Conservative offline estimator over the exact serialized request body."""
+
+        checked_config = self._build_config(None) if config is None else dict(config)
+        serialized = self.serialize_request_payload(contents, checked_config)
+        return max(1, (len(serialized) + 3) // 4)
+
     def _attempt(
         self, *, contents: Any, config: Mapping[str, Any], estimated_tokens: int
     ) -> RawResponse:
@@ -368,17 +437,21 @@ class StructuredGeminiClient:
         self,
         contents: Any,
         *,
-        estimated_tokens: int,
+        estimated_tokens: int | None = None,
         config_overrides: Mapping[str, Any] | None = None,
     ) -> Any:
         config = self._build_config(config_overrides)
+        checked_estimate = (
+            self.estimate_request_tokens(contents, config)
+            if estimated_tokens is None else estimated_tokens
+        )
         response: RawResponse | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
                 response = self._attempt(
                     contents=contents,
                     config=config,
-                    estimated_tokens=estimated_tokens,
+                    estimated_tokens=checked_estimate,
                 )
                 break
             except TransientTransportError as exc:
@@ -399,16 +472,18 @@ class StructuredGeminiClient:
         try:
             parsed = json.loads(response.text)
         except (json.JSONDecodeError, TypeError) as exc:
-            raise SchemaValidationError(reason="invalid_json") from exc
+            raise SchemaValidationError(
+                reason="invalid_json", raw=response.text
+            ) from exc
         try:
             validate_json_schema(parsed, self.response_schema)
         except JsonSchemaValidationError as exc:
             raise SchemaValidationError(
-                reason="schema_mismatch", location=exc.path
+                reason="schema_mismatch", location=exc.path, raw=response.text
             ) from exc
         except UnsupportedJsonSchemaError as exc:
             raise SchemaValidationError(
-                reason="unsupported_schema", location=exc.path
+                reason="unsupported_schema", location=exc.path, raw=response.text
             ) from exc
         return parsed
 

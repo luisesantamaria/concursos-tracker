@@ -39,6 +39,7 @@ from scripts.fase2_municipios.v2.snapshot import CitationVerificationError, Snap
 
 
 AUTHORIZED_CREDENTIAL_NAMES = ("GEMINI_API_KEY_FREE", "GEMINI_API_KEY")
+MIN_PROVIDER_ATTEMPT_SECONDS = 0.1
 
 
 class ErrorCategory(str, Enum):
@@ -113,16 +114,15 @@ class ClassifiedError:
 
 
 def _status_code(exc: BaseException) -> int | None:
-    for owner in (exc, getattr(exc, "response", None)):
-        if owner is None:
-            continue
+    # Only a concrete HTTP response may supply protocol status. Generic
+    # exception ``.code``/``.status`` attributes are local and never authorize
+    # paid fallback.
+    response = getattr(exc, "response", None)
+    if response is not None:
         for name in ("status_code", "status"):
-            value = getattr(owner, name, None)
+            value = getattr(response, name, None)
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
-        code = getattr(owner, "code", None)
-        if isinstance(code, int) and not isinstance(code, bool):
-            return code
     return None
 
 
@@ -234,6 +234,7 @@ class ModelPolicyTelemetry:
         self.fallback_events: list[dict[str, Any]] = []
         self.backoff_events: list[dict[str, Any]] = []
         self._calls: deque[tuple[float, int]] = deque()
+        self._model_usage: dict[str, Counter[str]] = {}
 
     def set_observer(self, observer: Callable[[Mapping[str, Any]], None] | None) -> None:
         self.observer = observer
@@ -242,7 +243,19 @@ class ModelPolicyTelemetry:
         if self.observer is not None:
             self.observer(dict(event))
 
-    def record_call(self, provider: str, response: RawResponse | None = None) -> None:
+    def record_call(
+        self,
+        provider: str,
+        response: RawResponse | None = None,
+        *,
+        municipio: str = "",
+        bucket: str = "",
+        stage: str = "",
+        model: str = "",
+        attempt: int = 0,
+        status: str = "ok",
+        error_class: str = "",
+    ) -> None:
         if provider == "gemini_free":
             self.free_calls += 1
         else:
@@ -256,6 +269,22 @@ class ModelPolicyTelemetry:
             self.cost += float(cost)
             self.cost_reported = True
         self._calls.append((time.monotonic(), tokens))
+        if model:
+            usage = self._model_usage.setdefault(model, Counter())
+            usage["free_calls" if provider == "gemini_free" else "paid_calls"] += 1
+            usage["tokens"] += tokens
+        self._emit({
+            "event": "model_call",
+            "municipio": municipio,
+            "bucket": bucket,
+            "stage": stage,
+            "model": model,
+            "provider": provider,
+            "attempt": attempt,
+            "status": status,
+            "error_class": error_class,
+            "tokens": tokens,
+        })
 
     def record_error(self, category: ErrorCategory) -> None:
         if category is ErrorCategory.QUOTA_429:
@@ -285,6 +314,14 @@ class ModelPolicyTelemetry:
             "approx_rpm": len(self._calls),
             "approx_tpm": sum(tokens for _, tokens in self._calls),
             "approx_rpd": self.free_calls + self.paid_calls,
+            "models": {
+                model: {
+                    "free_calls": usage["free_calls"],
+                    "paid_calls": usage["paid_calls"],
+                    "tokens": usage["tokens"],
+                }
+                for model, usage in sorted(self._model_usage.items())
+            },
         }
         if self.cost_reported:
             summary["cost"] = self.cost
@@ -383,7 +420,7 @@ class PolicyTransport:
 
     def _call(self, transport: Any, model: str, contents: Any, config: Mapping[str, Any], remaining: float) -> RawResponse:
         if remaining <= 0:
-            raise PolicyCallError(ErrorCategory.TIMEOUT, original_type="GlobalDeadline")
+            raise PolicyCallError(ErrorCategory.LOCAL_BUG, original_type="GlobalDeadline")
         if self.isolate_calls:
             return _invoke_isolated(transport, model, contents, config, remaining)
         return transport.generate(model, contents, config)
@@ -403,13 +440,27 @@ class PolicyTransport:
         last: ClassifiedError | None = None
         for attempt in (1, 2):
             context = self._context(provider="gemini_free", attempt=attempt)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PolicyCallError(
+                    ErrorCategory.LOCAL_BUG, original_type="GlobalDeadline"
+                )
             try:
                 response = self._call(
-                    self.free_transport, model, contents, config, deadline - time.monotonic()
+                    self.free_transport, model, contents, config, remaining
                 )
             except BaseException as exc:
-                self.telemetry.record_call("gemini_free")
                 last = classify_error(exc)
+                self.telemetry.record_call(
+                    "gemini_free",
+                    municipio=self.municipio,
+                    bucket=self.bucket,
+                    stage=self.stage,
+                    model=self.model,
+                    attempt=attempt,
+                    status="error",
+                    error_class=last.category.value,
+                )
                 self.telemetry.record_error(last.category)
                 if not last.fallback_eligible:
                     raise PolicyCallError(
@@ -421,7 +472,10 @@ class PolicyTransport:
                 if attempt == 1:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise PolicyCallError(ErrorCategory.TIMEOUT, original_type="GlobalDeadline") from exc
+                        raise PolicyCallError(
+                            ErrorCategory.LOCAL_BUG,
+                            original_type="GlobalDeadline",
+                        ) from exc
                     exponential = 1.0 + max(0.0, min(1.0, float(self.jitter())))
                     delay = max(exponential, last.retry_after or 0.0)
                     delay = min(delay, remaining)
@@ -430,19 +484,42 @@ class PolicyTransport:
                     continue
                 break
             else:
-                self.telemetry.record_call("gemini_free", response)
+                self.telemetry.record_call(
+                    "gemini_free",
+                    response,
+                    municipio=self.municipio,
+                    bucket=self.bucket,
+                    stage=self.stage,
+                    model=self.model,
+                    attempt=attempt,
+                    status="ok",
+                )
                 return response
 
         assert last is not None and last.fallback_eligible
+        remaining = deadline - time.monotonic()
+        if remaining < MIN_PROVIDER_ATTEMPT_SECONDS:
+            raise PolicyCallError(
+                ErrorCategory.LOCAL_BUG, original_type="GlobalDeadline"
+            )
         paid_context = self._context(provider="gemini_paid", attempt=3)
         self.telemetry.record_fallback(category=last.category, **paid_context)
         try:
             response = self._call(
-                self.paid_transport, model, contents, config, deadline - time.monotonic()
+                self.paid_transport, model, contents, config, remaining
             )
         except BaseException as exc:
-            self.telemetry.record_call("gemini_paid")
             classified = classify_error(exc)
+            self.telemetry.record_call(
+                "gemini_paid",
+                municipio=self.municipio,
+                bucket=self.bucket,
+                stage=self.stage,
+                model=self.model,
+                attempt=3,
+                status="error",
+                error_class=classified.category.value,
+            )
             self.telemetry.record_error(classified.category)
             raise PolicyCallError(
                 classified.category,
@@ -450,7 +527,16 @@ class PolicyTransport:
                 retry_after=classified.retry_after,
                 original_type=type(exc).__name__,
             ) from exc
-        self.telemetry.record_call("gemini_paid", response)
+        self.telemetry.record_call(
+            "gemini_paid",
+            response,
+            municipio=self.municipio,
+            bucket=self.bucket,
+            stage=self.stage,
+            model=self.model,
+            attempt=3,
+            status="ok",
+        )
         return response
 
 
@@ -459,5 +545,5 @@ __all__ = [
     "ErrorCategory", "EvidenceInsufficientError", "LocalBugError",
     "ModelPolicyTelemetry", "PolicyCallError", "PolicyTransport",
     "QuoteInvalidError", "SemanticModelError", "classify_error",
-    "load_model_credentials",
+    "load_model_credentials", "MIN_PROVIDER_ATTEMPT_SECONDS",
 ]

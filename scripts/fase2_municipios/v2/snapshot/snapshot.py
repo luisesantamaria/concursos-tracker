@@ -51,13 +51,29 @@ def _quote_preview(quote: str) -> str:
 class CitationVerificationError(SnapshotError):
     """One citation failed without exposing source content."""
 
-    def __init__(self, *, source_id: str, reason: str, quote: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        source_id: str,
+        reason: str,
+        quote: str = "",
+        occurrence_count: int | None = None,
+    ) -> None:
         self.source_id = source_id
         self.reason = reason
         self.quote_preview = _quote_preview(quote)
+        # Only populated for reason=quote_ambiguous today: the real count of
+        # non-overlapping literal occurrences of ``quote`` in the source, so
+        # repair guidance can be specific instead of a binary "it repeats".
+        self.occurrence_count = occurrence_count
         preview = f", quote_preview={self.quote_preview!r}" if quote else ""
+        occurrence = (
+            f", occurrence_count={occurrence_count}"
+            if occurrence_count is not None else ""
+        )
         super().__init__(
-            f"citation rejected: source_id={source_id}, reason={reason}{preview}"
+            f"citation rejected: source_id={source_id}, reason={reason}"
+            f"{preview}{occurrence}"
         )
 
 
@@ -67,6 +83,7 @@ class CitationFailure:
     source_id: str
     reason: str
     quote_preview: str
+    occurrence_count: int | None = None
 
 
 class CitationBatchVerificationError(CitationVerificationError):
@@ -278,8 +295,14 @@ def anchor_citation(
             source_id=source_id, reason="quote_not_found", quote=quote
         )
     if text.find(quote, position + 1) >= 0:
+        # str.count matches text.find's left-to-right, non-overlapping scan,
+        # so this is the exact number of ambiguous anchor candidates a repair
+        # attempt is choosing between (not just "more than one").
         raise CitationVerificationError(
-            source_id=source_id, reason="quote_ambiguous", quote=quote
+            source_id=source_id,
+            reason="quote_ambiguous",
+            quote=quote,
+            occurrence_count=text.count(quote),
         )
     citation = Citation(source_id, position, position + len(quote), quote)
     verify_citation(snapshot, citation)
@@ -342,6 +365,7 @@ def verify_all(
                 source_id=exc.source_id,
                 reason=exc.reason,
                 quote_preview=exc.quote_preview,
+                occurrence_count=getattr(exc, "occurrence_count", None),
             ))
         else:
             verified.append(index)

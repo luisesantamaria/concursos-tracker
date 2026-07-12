@@ -17,6 +17,7 @@ from scripts.fase2_municipios.v2.gemini import (
     MissingFreeApiKeyError,
     UnauthorizedCredentialError,
     RawResponse,
+    RealGeminiTransport,
     RetryExhaustedError,
     SchemaValidationError,
     StructuredGeminiClient,
@@ -50,6 +51,7 @@ def valid_certifier_output() -> dict[str, Any]:
         "bucket": "concurso_publico",
         "decision": "indice_oficial",
         "confidence": "high",
+        "insufficiency": "none",
         "citations": [],
         "reason": "fixture valid reason",
         "tool_request": None,
@@ -235,6 +237,94 @@ def test_real_client_factory_uses_explicit_free_key_and_disables_vertex_adc() ->
     assert calls == [{"api_key": " explicit-free-key ", "vertexai": False}]
 
 
+class _FakeUsageMetadata:
+    """Duck-types google.genai's usage_metadata with only the given fields set."""
+
+    def __init__(self, **fields: Any) -> None:
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+
+class _FakeSdkResponse:
+    def __init__(self, *, text: str, usage_metadata: Any) -> None:
+        self.text = text
+        self.usage_metadata = usage_metadata
+
+
+class _FakeSdkModels:
+    def __init__(self, response: _FakeSdkResponse) -> None:
+        self.response = response
+        self.calls: list[dict[str, Any]] = []
+
+    def generate_content(self, *, model: str, contents: Any, config: Any) -> _FakeSdkResponse:
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        return self.response
+
+
+class _FakeSdkClient:
+    def __init__(self, response: _FakeSdkResponse) -> None:
+        self.models = _FakeSdkModels(response)
+
+
+def test_real_transport_extracts_thinking_usage_fields_from_metadata() -> None:
+    metadata = _FakeUsageMetadata(
+        prompt_token_count=40,
+        candidates_token_count=20,
+        total_token_count=75,
+        thoughts_token_count=15,
+        cached_content_token_count=3,
+        tool_use_prompt_token_count=2,
+    )
+    sdk_client = _FakeSdkClient(_FakeSdkResponse(text="{}", usage_metadata=metadata))
+    transport = RealGeminiTransport(
+        "free-key", client_factory=lambda **kwargs: sdk_client
+    )
+
+    raw = transport.generate("fixture-model", [], {})
+
+    assert raw.usage == TokenUsage(
+        prompt_tokens=40,
+        candidate_tokens=20,
+        total_tokens=75,
+        thoughts_tokens=15,
+        cached_tokens=3,
+        tool_use_prompt_tokens=2,
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        # Campos ausentes por completo (SDK/modelo mas viejo sin 'thinking').
+        _FakeUsageMetadata(
+            prompt_token_count=40, candidates_token_count=20, total_token_count=60
+        ),
+        # Campos presentes pero explicitamente None.
+        _FakeUsageMetadata(
+            prompt_token_count=40,
+            candidates_token_count=20,
+            total_token_count=60,
+            thoughts_token_count=None,
+            cached_content_token_count=None,
+            tool_use_prompt_token_count=None,
+        ),
+    ],
+)
+def test_real_transport_defaults_missing_or_none_optional_usage_fields_to_zero(
+    metadata: _FakeUsageMetadata,
+) -> None:
+    sdk_client = _FakeSdkClient(_FakeSdkResponse(text="{}", usage_metadata=metadata))
+    transport = RealGeminiTransport(
+        "free-key", client_factory=lambda **kwargs: sdk_client
+    )
+
+    raw = transport.generate("fixture-model", [], {})
+
+    assert raw.usage.thoughts_tokens == 0
+    assert raw.usage.cached_tokens == 0
+    assert raw.usage.tool_use_prompt_tokens == 0
+
+
 def test_nested_grounding_is_rejected_before_limiter_or_transport() -> None:
     transport = FakeTransport([response({"ok": True})])
     limiter = RecordingLimiter()
@@ -358,6 +448,20 @@ def test_quota_error_is_not_retried_and_transport_is_not_called() -> None:
         (None, "missing"),
         (TokenUsage(-1, 2, 1), "negative"),
         (TokenUsage(2, 3, 6), "total_mismatch"),
+        # Undercount real: total por debajo del piso facturado prompt+candidates,
+        # incluso con thoughts positivos, sigue siendo corrupcion.
+        (TokenUsage(10, 5, 12, thoughts_tokens=5), "total_mismatch"),
+        # thoughts negativo: fail-closed igual que cualquier otro campo negativo.
+        (TokenUsage(10, 5, 15, thoughts_tokens=-1), "negative"),
+        # Excedente mayor a la suma de TODOS los componentes conocidos
+        # (prompt+candidates+thoughts+cached+tool_use): no laxo, se rechaza.
+        (
+            TokenUsage(
+                10, 5, 20,
+                thoughts_tokens=3, cached_tokens=1, tool_use_prompt_tokens=0,
+            ),
+            "total_mismatch",
+        ),
     ],
 )
 def test_anomalous_usage_fails_safe_without_assuming_zero(
@@ -373,6 +477,30 @@ def test_anomalous_usage_fails_safe_without_assuming_zero(
     assert raised.value.reason == reason
     assert limiter.events == [("acquire", 25)]
     assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        # Caso real Aratiba/PS (12-jul): total = prompt + candidates + thoughts,
+        # como reportan los modelos Gemini 3.x con 'thinking' activo.
+        TokenUsage(40, 20, 75, thoughts_tokens=15),
+        # thoughts + cached + tool_use combinados hasta el techo exacto.
+        TokenUsage(40, 20, 90, thoughts_tokens=15, cached_tokens=10, tool_use_prompt_tokens=5),
+        # total en algun punto intermedio del rango [piso, techo] tambien es valido.
+        TokenUsage(40, 20, 65, thoughts_tokens=15),
+        # Comportamiento historico preservado: sin componentes extra, total
+        # debe seguir igualando exactamente prompt+candidates.
+        TokenUsage(40, 20, 60),
+    ],
+)
+def test_thinking_usage_with_extra_components_is_accepted(usage: TokenUsage) -> None:
+    transport = FakeTransport([response({"ok": True}, usage=usage)])
+    limiter = RecordingLimiter()
+    client = generic_client(transport, limiter)
+
+    assert client.generate_structured("offline", estimated_tokens=25) == {"ok": True}
+    assert limiter.events == [("acquire", 25), ("reconcile", usage.total_tokens)]
 
 
 def test_logging_contains_audit_fields_but_no_key_prompt_contents_or_exception(

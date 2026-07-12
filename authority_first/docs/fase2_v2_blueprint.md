@@ -763,6 +763,40 @@ python -m scripts.fase2_municipios.v2.eval.stratified_selector \
 `staging/fase2_v2/eval/` ya está ignorado por Git. El selector no importa red,
 cliente Gemini ni credenciales y no modifica V1, skills, golden o CSV canónico.
 
+## Integración P0 direct/fail-closed (2026-07-11)
+
+El runtime direct usa los schemas cerrados de cada rol. A exige
+`insufficiency`, razón de hasta 400 puntos de código Unicode y citas afirmativas
+con offsets explícitos para `authority`, `identity`, `page_role`, `bucket` y
+`stability`. B recibe solamente el claim normalizado (sin `reason` ni
+`confidence` de A), emite exactamente los 15 códigos canónicos y deriva de
+forma determinista `block`, `sustain` o `review`; `needs_tool` no pertenece al
+modo direct. C solo se invoca para A afirmativa más B=`block`; A no afirmativa
+omite B y B=`review` termina en revisión sin C.
+
+El bucket de la unidad se pasa explícitamente al gate en live y replay. Una
+superficie combinada conserva `candidate.bucket=combinado`, pero normaliza el
+bucket publicable al solicitado; cualquier otra divergencia termina en
+`bucket_mismatch`. La entrada direct se serializa de forma determinista con
+`contents+config` y esa representación exacta alimenta la estimación TPM. El
+snapshot inline se limita a 200.000 caracteres como prefijo exacto con longitud
+original y marca de truncamiento; una afirmativa sobre entrada truncada se
+rechaza cerrada.
+
+La adquisición aplica BOM, charset HTTP válido, meta charset y fallback
+estricto UTF-8/cp1252/latin-1, en ese orden normativo. No usa `replace` ni
+`ignore`; los conflictos BOM/header quedan diagnosticados. Observabilidad
+preserva raw de respuesta acotado, status HTTP, etapas `skipped`, y la taxonomía
+`revisar_por_adquisicion|A|B|C|gate`. La redacción elimina credenciales, claves,
+cookies y parámetros sensibles sin destruir query strings públicas, y es
+idempotente. El fallback pago solo se registra cuando queda al menos 100 ms y
+la llamada puede iniciarse; `GlobalDeadline` y códigos genéricos de excepción
+no son elegibles.
+
+Si la corrida queda interrumpida, el artefacto `incomplete` conserva además la
+decisión y `revisar_por` de cada unidad completa, y etapa, clase de error y
+`revisar_por` de cada unidad fallida; continúa siendo diagnóstico no publicable.
+
 ## Decisiones abiertas para el CEREBRO
 
 - Revisar periódicamente la disponibilidad free de los modelos fijados en ronda

@@ -18,20 +18,20 @@ import unicodedata
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 LOGGER = logging.getLogger(__name__)
 PARTIAL_FILENAME = "golden_live.partial.schema1.json"
 DEFAULT_MAX_SNAPSHOT_CHARS = 200_000
 STAGE_STATES = frozenset({
-    "not_started", "request_failed", "raw_received", "validation_failed"
+    "not_started", "request_failed", "raw_received", "validation_failed", "skipped"
 })
 _MISSING = object()
 _SENSITIVE_KEYS = frozenset({
-    "authorization", "proxy-authorization", "x-api-key", "api-key", "apikey",
-    "api_key", "token", "access_token", "password", "passwd", "secret",
-    "proxy", "http_proxy", "https_proxy",
+    "authorization", "proxyauthorization", "xapikey", "apikey", "token",
+    "accesstoken", "refreshtoken", "password", "passwd", "secret",
+    "clientsecret", "cookie", "setcookie", "proxy", "httpproxy", "httpsproxy",
 })
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
@@ -68,8 +68,15 @@ def _safe_url(value: str) -> str:
         return "<redacted-url>"
     if port is not None:
         host = f"{host}:{port}"
-    query = "<redacted>" if parsed.query else ""
-    return urlunsplit((parsed.scheme, host, parsed.path, query, ""))
+    query_items = []
+    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized = re.sub(r"[^a-z0-9]+", "", key.casefold())
+        query_items.append((
+            key,
+            "<redacted>" if normalized in _SENSITIVE_KEYS else item,
+        ))
+    query = urlencode(query_items, doseq=True)
+    return urlunsplit((parsed.scheme, host, parsed.path, query, parsed.fragment))
 
 
 def _redact_text(value: str, redactions: tuple[str, ...]) -> str:
@@ -89,7 +96,8 @@ def redact_recursive(value: Any, *, redactions: Iterable[str] = ()) -> Any:
         result = {}
         for key, item in value.items():
             key_text = str(key)
-            if key_text.casefold() in _SENSITIVE_KEYS:
+            normalized_key = re.sub(r"[^a-z0-9]+", "", key_text.casefold())
+            if normalized_key in _SENSITIVE_KEYS:
                 result[key_text] = "<redacted>"
             else:
                 result[key_text] = redact_recursive(item, redactions=checked)
@@ -197,6 +205,18 @@ class StageArtifactWriter:
         name = f"{_slug(unit[0])}--{_slug(unit[1])}--{suffix}--attempt-{attempt:03d}.json"
         return self.output_dir / "observability" / name
 
+    def reference(self, unit: tuple[str, str], attempt: int) -> dict[str, str]:
+        path = self._path(unit, attempt)
+        try:
+            payload = path.read_bytes()
+            relative = path.relative_to(self.output_dir)
+        except (OSError, ValueError):
+            return {}
+        return {
+            "observability_path": relative.as_posix(),
+            "observability_hash": hashlib.sha256(payload).hexdigest(),
+        }
+
     def record_stage(
         self, *, unit: tuple[str, str], attempt: int, stage: str, state: str,
         snapshot: Mapping[str, Any] | None = None, raw: Any = _MISSING,
@@ -226,6 +246,9 @@ class StageArtifactWriter:
                     "code": type(error).__name__,
                     "message": " ".join(str(error).split()),
                 }
+                status_code = getattr(error, "status_code", None)
+                if isinstance(status_code, int) and not isinstance(status_code, bool):
+                    stage_record["error"]["status_code"] = status_code
             artifact["stages"][stage] = stage_record
             if snapshot is not None:
                 artifact["evidence_snapshot"] = _bounded_snapshot(
@@ -255,17 +278,24 @@ class IncompleteRunTracker:
     ) -> None:
         self.output_dir = Path(output_dir)
         self.units = tuple(units)
-        self._terminal: dict[tuple[str, str], str] = {}
+        self._terminal: dict[tuple[str, str], dict[str, str]] = {}
         self.redactions = tuple(
             item for item in redactions if isinstance(item, str) and item
         )
 
     def record_terminal(
-        self, unit: tuple[str, str], *, status: str, decision: str | None = None
+        self, unit: tuple[str, str], *, status: str, decision: str | None = None,
+        revisar_por: str = "", stage: str = "", error_class: str = "",
     ) -> None:
         if unit not in self.units or status not in {"complete", "error"}:
             raise ValueError("invalid terminal unit result")
-        self._terminal[unit] = status
+        self._terminal[unit] = {
+            "status": status,
+            "decision": decision if isinstance(decision, str) else "",
+            "revisar_por": revisar_por if isinstance(revisar_por, str) else "",
+            "stage": stage if isinstance(stage, str) else "",
+            "error_class": error_class if isinstance(error_class, str) else "",
+        }
 
     @property
     def incomplete(self) -> bool:
@@ -274,19 +304,45 @@ class IncompleteRunTracker:
     def write_from_finally(self, cause: BaseException | None) -> Path | None:
         if not self.incomplete:
             return None
-        completed = [unit for unit in self.units if self._terminal.get(unit) == "complete"]
-        failed = [unit for unit in self.units if self._terminal.get(unit) == "error"]
+        completed = [
+            unit for unit in self.units
+            if self._terminal.get(unit, {}).get("status") == "complete"
+        ]
+        failed = [
+            unit for unit in self.units
+            if self._terminal.get(unit, {}).get("status") == "error"
+        ]
         pending = [unit for unit in self.units if unit not in self._terminal]
+        cause_record = {
+            "code": type(cause).__name__ if cause is not None else "runner_incomplete",
+            "message": " ".join(str(cause).split()) if cause is not None else "terminal result missing",
+        }
         artifact = {
             "schema_version": 1,
             "incomplete": True,
             "completed_units": [_unit_mapping(unit) for unit in completed],
             "failed_units": [_unit_mapping(unit) for unit in failed],
             "pending_units": [_unit_mapping(unit) for unit in pending],
-            "cause": {
-                "code": type(cause).__name__ if cause is not None else "runner_incomplete",
-                "message": " ".join(str(cause).split()) if cause is not None else "terminal result missing",
-            },
+            "completed": [
+                {
+                    **_unit_mapping(unit),
+                    "decision": self._terminal[unit]["decision"],
+                    "revisar_por": self._terminal[unit]["revisar_por"],
+                }
+                for unit in completed
+            ],
+            "failed": [
+                {
+                    **_unit_mapping(unit),
+                    "stage": self._terminal[unit]["stage"],
+                    "error_class": self._terminal[unit]["error_class"],
+                    "revisar_por": self._terminal[unit]["revisar_por"],
+                }
+                for unit in failed
+            ],
+            "pending": [_unit_mapping(unit) for unit in pending],
+            "cause": cause_record,
+            "cause_global": cause_record,
         }
         path = self.output_dir / PARTIAL_FILENAME
         try:

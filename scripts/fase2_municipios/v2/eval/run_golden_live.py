@@ -12,12 +12,13 @@ import argparse
 import csv
 import hashlib
 import inspect
+import io
 import json
 import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,7 +45,9 @@ from scripts.fase2_municipios.v2.eval.golden_runner import (
     BUCKET_COLUMNS,
     GoldenDifferentialRunner,
     LiveContract,
+    _golden_expectation,
     canonical_json_bytes,
+    compare_to_golden,
     derived_csv_bytes,
     run_live,
 )
@@ -55,6 +58,7 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
     LiveCause,
     LiveCauseKind,
     OrionHTTPFetcher,
+    RenderFallbackFetcher,
 )
 from scripts.fase2_municipios.v2.eval.live_model_policy import (
     CredentialConfigError,
@@ -93,6 +97,23 @@ FINAL_FILENAMES = (
     "flips.json",
 )
 AUDIT_FILENAME = "live_audit.json"
+# --no-v1-differential output: deliberately NOT named/shaped like the schema-1
+# cassette (FINAL_FILENAMES) -- this mode never produces a V1-justified cassette.
+V2_ONLY_FILENAMES = (
+    "v2_only_differential.json",
+    "v2_only_differential.csv",
+)
+V2_ONLY_MODE = "v2_only_no_v1_differential"
+V1_DIFFERENTIAL_MODE = "v1_differential"
+# In --no-v1-differential the url_map IS the scope fixture: golden units with
+# no url_map row are excluded the same way sin_cobertura_v1 excludes them, but
+# coverage_schema.py is frozen (motivo can only be "sin_cobertura_v1"), so this
+# mode reuses that exact label and documents the reinterpretation in the audit.
+FUERA_DE_URL_MAP_NOTE = (
+    "en modo v2_only_no_v1_differential, motivo=sin_cobertura_v1 significa "
+    "'fuera del fixture url_map' (el golden no tiene fila en --url-map), no "
+    "ausencia de V1"
+)
 
 
 class GoldenLiveError(RuntimeError):
@@ -110,14 +131,19 @@ class GoldenLiveIncompleteError(GoldenLiveError):
 @dataclass(frozen=True)
 class GoldenLiveArtifacts:
     output_dir: Path
-    cassette: Path
-    differential_json: Path
-    differential_csv: Path
-    flips: Path
+    # None in --no-v1-differential: FINAL_FILENAMES (schema-1 cassette,
+    # V1/V2 differential, flips) are never written without a real V1 corpus.
+    cassette: Path | None
+    differential_json: Path | None
+    differential_csv: Path | None
+    flips: Path | None
     audit: Path
     coverage: Mapping[str, int]
     sin_cobertura_v1: tuple[SinCoberturaV1Unit, ...]
     telemetry: Mapping[str, Any]
+    # Populated only in --no-v1-differential.
+    v2_only_differential_json: Path | None = None
+    v2_only_differential_csv: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -145,13 +171,17 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 
 def _checked_output_dir(
-    output_dir: Path, staging_root: Path, *, resume: bool = False
+    output_dir: Path,
+    staging_root: Path,
+    *,
+    resume: bool = False,
+    final_filenames: tuple[str, ...] = FINAL_FILENAMES,
 ) -> Path:
     root = Path(staging_root).resolve()
     destination = Path(output_dir).resolve()
     if not _is_relative_to(destination, root):
         raise GoldenLiveInputError("output_dir_must_be_inside_staging_root")
-    protected = FINAL_FILENAMES if resume else (*FINAL_FILENAMES, AUDIT_FILENAME)
+    protected = final_filenames if resume else (*final_filenames, AUDIT_FILENAME)
     for filename in protected:
         if (destination / filename).exists():
             raise GoldenLiveInputError(f"output_artifact_already_exists:{filename}")
@@ -357,6 +387,7 @@ def _outcome_audit(outcome: LiveABCOutcome) -> dict[str, Any]:
             "kind": outcome.cause.kind.value,
             "code": outcome.cause.code,
             "comment": outcome.cause.comment,
+            "revisar_por": outcome.cause.revisar_por,
         },
         "layer_complete": outcome.layer is not None,
         "exception_type": (
@@ -479,6 +510,7 @@ def _persisted_outcome(outcome: LiveABCOutcome) -> dict[str, Any]:
             "kind": outcome.cause.kind.value,
             "code": outcome.cause.code,
             "comment": outcome.cause.comment,
+            "revisar_por": outcome.cause.revisar_por,
         },
         "layer": _layer_mapping(outcome.layer),
         "events": [
@@ -495,7 +527,10 @@ def _outcome_from_persisted(raw: Mapping[str, Any]) -> LiveABCOutcome:
         bucket=raw["bucket"],
         decision=raw["decision"],
         url=raw["url"],
-        cause=LiveCause(LiveCauseKind(cause["kind"]), cause["code"], cause["comment"]),
+        cause=LiveCause(
+            LiveCauseKind(cause["kind"]), cause["code"], cause["comment"],
+            str(cause.get("revisar_por", "")),
+        ),
         layer=_layer_from_mapping(raw.get("layer")),
         audit_events=tuple(
             LiveAuditEvent(item["phase"], tuple(item.get("errors", ())))
@@ -505,13 +540,9 @@ def _outcome_from_persisted(raw: Mapping[str, Any]) -> LiveABCOutcome:
 
 
 def _snapshot_from_outcome(outcome: LiveABCOutcome) -> dict[str, Any] | None:
-    if outcome.layer is None or not outcome.layer.sources:
-        return None
     municipio, bucket = normalize_unit(outcome.municipio, outcome.bucket)
-    return {
-        "schema_version": 1,
-        "unit": {"municipio": municipio, "bucket": bucket},
-        "sources": [
+    if outcome.layer is not None and outcome.layer.sources:
+        sources = [
             {
                 "source_id": source.source_id,
                 "url": source.url,
@@ -519,7 +550,23 @@ def _snapshot_from_outcome(outcome: LiveABCOutcome) -> dict[str, Any] | None:
                 "content": source.content,
             }
             for source in outcome.layer.sources
-        ],
+        ]
+    elif outcome.evidence_snapshot is not None:
+        sources = [
+            {
+                "source_id": source.source_id,
+                "url": source.url,
+                "retrieved_at": source.retrieved_at.isoformat(),
+                "content": source.content,
+            }
+            for source in outcome.evidence_snapshot.sources
+        ]
+    else:
+        return None
+    return {
+        "schema_version": 1,
+        "unit": {"municipio": municipio, "bucket": bucket},
+        "sources": sources,
     }
 
 
@@ -618,11 +665,124 @@ def _flips_view(differential: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+V2_ONLY_CSV_FIELDS = (
+    "municipio",
+    "bucket",
+    "golden_expectation",
+    "golden_urls",
+    "v2_decision",
+    "v2_url",
+    "v2_vs_golden",
+    "cause_kind",
+    "cause_code",
+    "revisar_por",
+)
+
+
+def _golden_main_extra_by_unit(
+    golden_path: Path,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """municipio/bucket -> (golden_main, golden_extra); ex-post reporting read.
+
+    Mirrors the per-bucket lookup ``golden_targets`` builds, without deriving
+    any target or decision from it -- this feeds golden columns into the V2
+    reporting differential only.
+    """
+    rows = golden_evaluator.read_csv(Path(golden_path))
+    lookup: dict[tuple[str, str], tuple[str, str]] = {}
+    municipality_names: dict[str, str] = {}
+    for row in rows:
+        municipio = golden_evaluator.get(row, "municipio")
+        if not municipio:
+            raise GoldenLiveInputError("golden_row_without_municipio")
+        normalized_municipio = golden_evaluator.muni_key(municipio)
+        previous_name = municipality_names.get(normalized_municipio)
+        if previous_name is not None and previous_name != municipio:
+            raise GoldenLiveInputError(f"muni_key_collision:{normalized_municipio}")
+        municipality_names[normalized_municipio] = municipio
+        for bucket, main_column, extra_column in BUCKET_COLUMNS:
+            lookup[(normalized_municipio, bucket)] = (
+                golden_evaluator.get(row, main_column),
+                golden_evaluator.get(row, extra_column),
+            )
+    return lookup
+
+
+def write_v2_only_differential(
+    *,
+    targets: tuple[tuple[str, str], ...],
+    outcomes: Iterable[LiveABCOutcome],
+    coverage: GoldenTargetCoverage,
+    golden_path: Path,
+    output_dir: Path,
+) -> tuple[Path, Path]:
+    """Write the V2-only-vs-golden differential for ``--no-v1-differential``.
+
+    Pure and additive to the schema-1 cassette/differential contract: reuses
+    only :func:`golden_runner.compare_to_golden` and
+    :func:`golden_runner._golden_expectation`, both ex-post reporting reads
+    over already-decided V2 outcomes -- never a decision input. No
+    verdict_extract, no V1 coupling, no gating on V1 coverage.
+    """
+    outcomes_by_unit = {
+        normalize_unit(outcome.municipio, outcome.bucket): outcome
+        for outcome in outcomes
+    }
+    golden_lookup = _golden_main_extra_by_unit(golden_path)
+    rows: list[dict[str, Any]] = []
+    for municipio, bucket in targets:
+        key = normalize_unit(municipio, bucket)
+        outcome = outcomes_by_unit.get(key)
+        if outcome is None:
+            raise GoldenLiveInputError(
+                f"missing_outcome_for_target:{municipio}:{bucket}"
+            )
+        golden_main, golden_extra = golden_lookup.get(key, ("", ""))
+        expectation, golden_urls = _golden_expectation(golden_main, golden_extra)
+        rows.append({
+            "municipio": municipio,
+            "bucket": bucket,
+            "golden_expectation": expectation,
+            "golden_urls": golden_urls,
+            "v2_decision": outcome.decision,
+            "v2_url": outcome.url,
+            "v2_vs_golden": compare_to_golden(
+                decision=outcome.decision,
+                url=outcome.url,
+                golden_main=golden_main,
+                golden_extra=golden_extra,
+            ),
+            "cause_kind": outcome.cause.kind.value,
+            "cause_code": outcome.cause.code,
+            "revisar_por": outcome.cause.revisar_por,
+        })
+    rows.sort(key=lambda row: (golden_evaluator.muni_key(row["municipio"]), row["bucket"]))
+    document = {
+        "schema_version": 1,
+        "mode": V2_ONLY_MODE,
+        "coverage": coverage.summary,
+        "sin_cobertura_v1": [unit.as_mapping() for unit in coverage.sin_cobertura_v1],
+        "sin_cobertura_v1_note": FUERA_DE_URL_MAP_NOTE,
+        "rows": rows,
+    }
+    destination = Path(output_dir)
+    json_path = destination / V2_ONLY_FILENAMES[0]
+    csv_path = destination / V2_ONLY_FILENAMES[1]
+    _atomic_write(json_path, canonical_json_bytes(document))
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=V2_ONLY_CSV_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({**row, "golden_urls": " | ".join(row["golden_urls"])})
+    _atomic_write(csv_path, buffer.getvalue().encode("utf-8"))
+    return json_path, csv_path
+
+
 def run_golden_live(
     *,
     golden_path: Path,
     url_map_path: Path,
-    v1_corpus_dir: Path,
+    v1_corpus_dir: Path | None = None,
     output_dir: Path,
     environ: Mapping[str, str],
     staging_root: Path = CANONICAL_STAGING_ROOT,
@@ -635,6 +795,8 @@ def run_golden_live(
     resume: bool = False,
     heartbeat_seconds: float = 30.0,
     isolate_model_calls: bool = True,
+    no_v1_differential: bool = False,
+    render_fallback: bool = False,
     fetcher_factory: Callable[[], Any] = OrionHTTPFetcher,
     adapter_factory: Callable[..., Any] = LiveABCAdapter.from_model_policy_environment,
     differential_runner_factory: Callable[..., GoldenDifferentialRunner] = GoldenDifferentialRunner,
@@ -645,23 +807,42 @@ def run_golden_live(
     if isinstance(environ.get("GEMINI_API_KEY_FREE"), str):
         free_contract_environment["GEMINI_API_KEY_FREE"] = environ["GEMINI_API_KEY_FREE"]
     resolve_free_api_key(free_contract_environment)
-    destination = _checked_output_dir(output_dir, staging_root, resume=resume)
+    destination = _checked_output_dir(
+        output_dir,
+        staging_root,
+        resume=resume,
+        final_filenames=(V2_ONLY_FILENAMES if no_v1_differential else FINAL_FILENAMES),
+    )
     golden = Path(golden_path)
     url_map = Path(url_map_path)
-    v1_dir = Path(v1_corpus_dir)
     if not golden.is_file():
         raise GoldenLiveInputError("golden_path_not_file")
     if not url_map.is_file():
         raise GoldenLiveInputError("url_map_path_not_file")
-    if not v1_dir.is_dir():
-        raise GoldenLiveInputError("v1_corpus_dir_not_directory")
+    # --no-v1-differential opts out of V1 entirely: v1_corpus_dir (if supplied
+    # anyway) is never read, never validated, never turned into a source.
+    v1_dir: Path | None = None
+    if not no_v1_differential:
+        if v1_corpus_dir is None:
+            raise GoldenLiveInputError(
+                "v1_corpus_dir_required_without_no_v1_differential"
+            )
+        v1_dir = Path(v1_corpus_dir)
+        if not v1_dir.is_dir():
+            raise GoldenLiveInputError("v1_corpus_dir_not_directory")
 
     all_targets = golden_targets(golden)
     expected_targets = filter_golden_targets(all_targets, unit_allowlist)
+    # In --no-v1-differential the url_map defines scope: golden units missing
+    # a url_map row are excluded (sin_cobertura_v1), never an abort, so this
+    # mode never needs --allow-sin-cobertura-v1 to reach that outcome.
+    effective_allow_sin_cobertura_v1 = (
+        True if no_v1_differential else allow_sin_cobertura_v1
+    )
     coverage = load_url_map(
         url_map,
         expected_targets,
-        allow_sin_cobertura_v1=allow_sin_cobertura_v1,
+        allow_sin_cobertura_v1=effective_allow_sin_cobertura_v1,
         universe_targets=(all_targets if unit_allowlist else None),
     )
     if unit_allowlist and coverage.sin_cobertura_v1:
@@ -685,6 +866,13 @@ def run_golden_live(
         "connect_timeout_seconds": http_connect_timeout,
         "read_timeout_seconds": http_read_timeout,
     }))
+    # Opt-in, additive: --render-fallback wraps whatever fetcher_factory built
+    # (OrionHTTPFetcher by default, a fake in offline tests) with a single
+    # headless-render pass for SPA shells / anti-bot challenges. Off by
+    # default, so existing callers/tests that never pass this flag are
+    # byte-for-byte unaffected.
+    if render_fallback:
+        fetcher = RenderFallbackFetcher(fetcher)
     adapter_arguments = {
         "fetcher": fetcher,
         "target_urls": coverage.target_urls,
@@ -804,6 +992,15 @@ def run_golden_live(
                     duration_s=time.monotonic() - start_monotonic,
                     attempt=attempt,
                 )
+                artifact_reference = getattr(adapter, "artifact_reference", None)
+                if callable(artifact_reference):
+                    reference = artifact_reference(municipio, bucket, attempt)
+                    if isinstance(reference, Mapping):
+                        unit_result.update({
+                            key: value for key, value in reference.items()
+                            if key in {"observability_path", "observability_hash"}
+                            and isinstance(value, str)
+                        })
                 state.record_unit(
                     municipio=municipio,
                     bucket=bucket,
@@ -831,6 +1028,16 @@ def run_golden_live(
                     else "complete"
                 ),
                 decision=outcome.decision,
+                revisar_por=outcome.cause.revisar_por,
+                stage=(
+                    outcome.audit_events[-1].phase
+                    if outcome.audit_events else "final"
+                ),
+                error_class=(
+                    type(outcome.original_exception).__name__
+                    if outcome.original_exception is not None
+                    else outcome.cause.code
+                ),
             )
             now = time.monotonic()
             if now - last_heartbeat >= heartbeat_seconds or index == len(targets):
@@ -844,14 +1051,6 @@ def run_golden_live(
                 )
                 last_heartbeat = now
 
-        producer = CassetteProducer(
-            v1_source=Run497V1Source(v1_dir),
-            abc_provider=provider,
-        )
-        result = producer.produce(
-            targets,
-            sin_cobertura_v1=coverage.sin_cobertura_v1,
-        )
         telemetry = (
             adapter.telemetry.summary()
             if getattr(adapter, "telemetry", None) is not None
@@ -863,9 +1062,42 @@ def run_golden_live(
             }
         )
         audit_path = destination / AUDIT_FILENAME
+
+        if no_v1_differential:
+            # No Run497V1Source, no CassetteProducer: this mode never builds a
+            # V1-gated cassette. "complete" is whether every scoped unit ran
+            # exactly once -- V1 coverage/justification is not the criterion.
+            producer = None
+            result = None
+            complete = len(outcomes) == len(targets)
+            producer_diagnostics_view: list[dict[str, Any]] = []
+            v1_manifest_sha256 = None
+            incomplete_reason = f"units_missing={len(targets) - len(outcomes)}"
+        else:
+            producer = CassetteProducer(
+                v1_source=Run497V1Source(v1_dir),
+                abc_provider=provider,
+            )
+            result = producer.produce(
+                targets,
+                sin_cobertura_v1=coverage.sin_cobertura_v1,
+            )
+            complete = result.complete
+            producer_diagnostics_view = [
+                {
+                    "municipio": diagnostic.unit[0],
+                    "bucket": diagnostic.unit[1],
+                    "code": diagnostic.code.value,
+                }
+                for diagnostic in result.diagnostics
+            ]
+            v1_manifest_sha256 = _directory_manifest_sha256(v1_dir)
+            incomplete_reason = f"diagnostics={len(result.diagnostics)}"
+
         audit = {
             "schema_version": 1,
-            "complete": result.complete,
+            "mode": V2_ONLY_MODE if no_v1_differential else V1_DIFFERENTIAL_MODE,
+            "complete": complete,
             "coverage": coverage.summary,
             "sin_cobertura_v1": [
                 unit.as_mapping() for unit in coverage.sin_cobertura_v1
@@ -873,28 +1105,46 @@ def run_golden_live(
             "inputs": {
                 "golden_sha256": _file_sha256(golden),
                 "url_map_sha256": _file_sha256(url_map),
-                "v1_manifest_sha256": _directory_manifest_sha256(v1_dir),
+                "v1_manifest_sha256": v1_manifest_sha256,
+                "render_fallback": render_fallback,
             },
             "units": [_outcome_audit(outcome) for outcome in outcomes],
-            "producer_diagnostics": [
-                {
-                    "municipio": diagnostic.unit[0],
-                    "bucket": diagnostic.unit[1],
-                    "code": diagnostic.code.value,
-                }
-                for diagnostic in result.diagnostics
-            ],
+            "producer_diagnostics": producer_diagnostics_view,
             "telemetry": telemetry,
         }
+        if no_v1_differential:
+            audit["sin_cobertura_v1_note"] = FUERA_DE_URL_MAP_NOTE
         _atomic_write(audit_path, canonical_json_bytes(audit))
         logger.emit(
             municipio=targets[-1][0], bucket=targets[-1][1], stage="summary",
-            model="", provider="local", status="ok" if result.complete else "error",
+            model="", provider="local", status="ok" if complete else "error",
             **telemetry,
         )
-        if not result.complete:
+        if not complete:
             raise GoldenLiveIncompleteError(
-                f"live_corpus_incomplete:diagnostics={len(result.diagnostics)}"
+                f"live_corpus_incomplete:{incomplete_reason}"
+            )
+
+        if no_v1_differential:
+            v2_only_json, v2_only_csv = write_v2_only_differential(
+                targets=targets,
+                outcomes=outcomes,
+                coverage=coverage,
+                golden_path=golden,
+                output_dir=destination,
+            )
+            return GoldenLiveArtifacts(
+                output_dir=destination,
+                cassette=None,
+                differential_json=None,
+                differential_csv=None,
+                flips=None,
+                audit=audit_path,
+                coverage=coverage.summary,
+                sin_cobertura_v1=coverage.sin_cobertura_v1,
+                telemetry=telemetry,
+                v2_only_differential_json=v2_only_json,
+                v2_only_differential_csv=v2_only_csv,
             )
 
         cassette_path = destination / FINAL_FILENAMES[0]
@@ -943,7 +1193,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--grounding", choices=("off",), required=True)
     parser.add_argument("--golden", type=Path, required=True)
     parser.add_argument("--url-map", type=Path, required=True)
-    parser.add_argument("--v1-corpus-dir", type=Path, required=True)
+    parser.add_argument(
+        "--v1-corpus-dir",
+        type=Path,
+        default=None,
+        help=(
+            "required unless --no-v1-differential is set (that mode never "
+            "reads a V1 corpus)"
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--http-connect-timeout", type=float,
@@ -973,12 +1231,30 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--allow-sin-cobertura-v1", action="store_true")
     parser.add_argument(
+        "--no-v1-differential",
+        action="store_true",
+        help=(
+            "pure V2-vs-golden evaluation: --v1-corpus-dir becomes optional "
+            "and unread, no schema-1 cassette/differential/flips are "
+            "written; writes v2_only_differential.json/.csv instead"
+        ),
+    )
+    parser.add_argument(
         "--units",
         action="append",
         metavar="MUNICIPIO:BUCKET",
         help=(
             "repeatable exact unit allowlist; bucket is concurso_publico or "
             "processo_seletivo"
+        ),
+    )
+    parser.add_argument(
+        "--render-fallback",
+        action="store_true",
+        help=(
+            "opt-in single headless-render pass for SPA shells / anti-bot "
+            "challenges (RenderFallbackFetcher wrapping the transport "
+            "fetcher); off by default, never a second HTTP fetch"
         ),
     )
     return parser
@@ -990,10 +1266,26 @@ def main(
     environ: Mapping[str, str] | None = None,
     staging_root: Path = CANONICAL_STAGING_ROOT,
     fetcher_factory: Callable[[], Any] = OrionHTTPFetcher,
-    adapter_factory: Callable[..., Any] = LiveABCAdapter.from_model_policy_environment,
+    adapter_factory: Callable[..., Any] | None = None,
     differential_runner_factory: Callable[..., GoldenDifferentialRunner] = GoldenDifferentialRunner,
 ) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if not args.no_v1_differential and args.v1_corpus_dir is None:
+        parser.error(
+            "--v1-corpus-dir is required unless --no-v1-differential is set"
+        )
+    if args.no_v1_differential and args.allow_sin_cobertura_v1:
+        print(
+            "golden_live=warning --allow-sin-cobertura-v1 is ignored with "
+            "--no-v1-differential (the url_map already defines scope)",
+            file=sys.stderr,
+        )
+    if adapter_factory is None:
+        adapter_factory = {
+            "gemini_free": LiveABCAdapter.from_free_environment,
+            "gemini_policy": LiveABCAdapter.from_model_policy_environment,
+        }[args.provider]
     os.environ["PYTHONUNBUFFERED"] = "1"
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -1004,6 +1296,14 @@ def main(
             load_model_credentials(args.credentials_file)
             if environ is None else dict(environ)
         )
+        if args.provider == "gemini_free":
+            # Free-only estructural (canario): las credenciales pagas/prohibidas
+            # se descartan en la frontera CLI, antes de tocar el adapter free
+            # (from_free_environment rechaza su sola presencia). El archivo de
+            # credenciales exige ambas keys por contrato de gemini_policy; aqui
+            # la paga se vuelve inalcanzable. gemini_policy conserva el environ
+            # completo.
+            environment = gentle_free_only_environment(environment)
         artifacts = run_golden_live(
             golden_path=args.golden,
             url_map_path=args.url_map,
@@ -1020,6 +1320,8 @@ def main(
             resume=args.resume,
             heartbeat_seconds=args.heartbeat_seconds,
             isolate_model_calls=not args.no_model_subprocess,
+            no_v1_differential=args.no_v1_differential,
+            render_fallback=args.render_fallback,
             fetcher_factory=fetcher_factory,
             adapter_factory=adapter_factory,
             differential_runner_factory=differential_runner_factory,
@@ -1051,11 +1353,12 @@ def main(
             if "cost" in artifacts.telemetry else ""
         )
     )
+    excluded_motivo = "fuera_de_url_map" if args.no_v1_differential else "sin_cobertura_v1"
     for unit in artifacts.sin_cobertura_v1:
         print(
             "golden_live=excluded "
             f"municipio={unit.municipio!r} bucket={unit.bucket} "
-            "executed=false motivo=sin_cobertura_v1"
+            f"executed=false motivo={excluded_motivo}"
         )
     return 0
 

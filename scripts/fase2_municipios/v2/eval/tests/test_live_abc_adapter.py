@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,6 +25,7 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
     LiveCauseKind,
     OrionHTTPFetcher,
 )
+from scripts.fase2_municipios.v2.eval.live_observability import StageArtifactWriter
 from scripts.fase2_municipios.v2.gemini import UnauthorizedCredentialError
 from scripts.fase2_municipios.v2.gemini import RoleModels
 
@@ -46,10 +49,18 @@ HAPPY_TEXT = (
 
 
 class FakeFetcher:
-    def __init__(self, *, content=HAPPY_TEXT, html=HAPPY_HTML, error=None) -> None:
+    def __init__(
+        self, *, content=HAPPY_TEXT, html=HAPPY_HTML, error=None,
+        decode_diagnostics=(), raw_payload_sha256="", raw_payload_head_b64="",
+        raw_payload_truncated=False,
+    ) -> None:
         self.content = content
         self.html = html
         self.error = error
+        self.decode_diagnostics = decode_diagnostics
+        self.raw_payload_sha256 = raw_payload_sha256
+        self.raw_payload_head_b64 = raw_payload_head_b64
+        self.raw_payload_truncated = raw_payload_truncated
         self.calls = []
 
     def fetch(self, url: str, *, timeout_seconds: float) -> FetchedEvidence:
@@ -64,6 +75,10 @@ class FakeFetcher:
             content=self.content,
             html=self.html,
             title="Prefeitura Municipal de Fixture - Concursos Públicos",
+            decode_diagnostics=self.decode_diagnostics,
+            raw_payload_sha256=self.raw_payload_sha256,
+            raw_payload_head_b64=self.raw_payload_head_b64,
+            raw_payload_truncated=self.raw_payload_truncated,
         )
 
 
@@ -234,11 +249,15 @@ def test_low_level_http_boundary_propagates_external_access_blocked(
 
 
 def test_legitimate_absence_is_distinct_from_access_failure() -> None:
+    """Independencia V1 (12-jul): la ausencia legitima la adjudica el agente A
+    (decision nao_encontrado), no el clasificador de contenido V1. Acceso
+    exitoso + A dictamina que no hay superficie del bucket => ausencia
+    legitima, distinta de un fallo de acceso."""
     content = "Prefeitura Municipal de Fixture. Portal institucional. Atendimento."
     html = f"<html><title>Prefeitura Municipal de Fixture</title><body>{content}</body></html>"
     outcome = _adapter(
         fetcher=FakeFetcher(content=content, html=html),
-        certifier=FakeCertifier(decision="revisar"),
+        certifier=FakeCertifier(decision="nao_encontrado"),
     ).request(MUNICIPIO, BUCKET)
 
     assert outcome.decision == "revisar"
@@ -246,6 +265,31 @@ def test_legitimate_absence_is_distinct_from_access_failure() -> None:
     assert outcome.layer is not None
     assert outcome.cause.kind is LiveCauseKind.LEGITIMATE_ABSENCE
     assert outcome.cause.comment != "no se pudo acceder"
+    assert outcome.original_exception is None
+
+
+def test_insufficient_review_with_unknown_bucket_completes_conservatively() -> None:
+    class InsufficientCertifier:
+        def certify(self, *, snapshot, task):
+            return {
+                "decision": "revisar",
+                "bucket": "desconocido",
+                "candidate_id": _candidate_id(task),
+                "citations": [],
+                "reason": "snapshot insuficiente",
+            }
+
+    prosecutor = FakeProsecutor(result=AssertionError("B must be skipped"))
+    outcome = _adapter(
+        certifier=InsufficientCertifier(),
+        prosecutor=prosecutor,
+    ).request(MUNICIPIO, BUCKET)
+
+    assert prosecutor.calls == []
+    assert outcome.decision == "revisar"
+    assert outcome.layer is not None
+    assert outcome.layer.proposal_a.bucket == BUCKET
+    assert outcome.layer.proposal_b.bucket == BUCKET
     assert outcome.original_exception is None
 
 
@@ -382,9 +426,19 @@ def test_public_signatures_and_model_invocations_exclude_keys_grounding_and_tool
     for call in factory_calls[1:]:
         assert forbidden.isdisjoint(call)
     role_calls = {call["factory"]: call for call in factory_calls}
-    assert role_calls["A"]["transport"] is fake_transport
-    assert role_calls["B"]["transport"] is fake_transport
-    assert role_calls["C-client"]["transport"] is fake_transport
+    # Los tres roles comparten el MISMO transporte free real, envuelto por la
+    # capa de telemetria auditable y, por fuera, el reintento acotado ante
+    # 429/RESOURCE_EXHAUSTED (sin credenciales ni politica paga adicional).
+    from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
+        _FreeQuotaRetryTransport,
+        _FreeTelemetryTransport,
+    )
+
+    for role in ("A", "B", "C-client"):
+        wrapped = role_calls[role]["transport"]
+        assert isinstance(wrapped, _FreeQuotaRetryTransport)
+        assert isinstance(wrapped._inner, _FreeTelemetryTransport)
+        assert wrapped._inner._inner is fake_transport
     assert role_calls["A"]["limiter"] is limiter
     assert role_calls["B"]["limiter"] is limiter
     assert role_calls["C-client"]["limiter"] is limiter
@@ -441,3 +495,143 @@ def test_run_live_opt_in_is_explicit_and_mutually_exclusive() -> None:
             municipio=MUNICIPIO,
             bucket=BUCKET,
         )
+
+
+def test_benign_cloudflare_cdn_mention_in_complete_page_is_not_antibot() -> None:
+    """Passo Fundo real: 200 OK, contenido integro, solo carga un banner de
+    cookies desde cdnjs.cloudflare.com. cascade.is_antibot_challenge() (laxo)
+    marcaba esto 'incompleta_antibot' y bloqueaba la unidad; page.is_antibot
+    (hard markers) no dispara aqui, asi que debe llegar a completa/SUCCESS."""
+    filler = " Informação institucional adicional." * 60
+    html = HAPPY_HTML.replace(
+        "</head>",
+        '<script src="https://cdnjs.cloudflare.com/ajax/libs/cookieconsent/'
+        '3.1.0/cookieconsent.min.js"></script></head>',
+    ).replace("</body>", f"<p>{filler}</p></body>")
+    assert len(filler) > 1500
+
+    outcome = _adapter(fetcher=FakeFetcher(html=html)).request(MUNICIPIO, BUCKET)
+
+    assert outcome.cause.kind is LiveCauseKind.SUCCESS
+    assert outcome.decision == "indice_oficial"
+    assert outcome.layer.candidate.evidence_state == "completa"
+
+
+def test_hard_antibot_marker_sets_incompleta_antibot_and_blocks_gate() -> None:
+    """Un marcador duro real (challenge-platform) SI debe seguir bloqueando:
+    esto no es una relajacion general del detector, solo la eliminacion del
+    falso positivo de menciones benignas de 'cloudflare'."""
+    html = HAPPY_HTML.replace(
+        "</head>",
+        '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1">'
+        "</script></head>",
+    )
+
+    outcome = _adapter(fetcher=FakeFetcher(html=html)).request(MUNICIPIO, BUCKET)
+
+    assert outcome.layer is not None
+    assert outcome.layer.candidate.evidence_state == "incompleta_antibot"
+    assert outcome.decision == "revisar"
+    assert outcome.cause.kind is LiveCauseKind.EVIDENCE_FAILURE
+    assert outcome.cause.code == "consensus_failed_final_gate"
+
+
+def _load_fetch_stage_raw(root: Path) -> dict:
+    paths = list((root / "observability").glob("*.json"))
+    assert len(paths) == 1
+    artifact = json.loads(paths[0].read_text(encoding="utf-8"))
+    return artifact["stages"]["fetch"]["raw"]
+
+
+def test_fetch_stage_artifact_always_carries_raw_payload_sha256(tmp_path: Path) -> None:
+    fetcher = FakeFetcher(raw_payload_sha256="deadbeef" * 8)
+    adapter = _adapter(fetcher=fetcher)
+    adapter.set_artifact_writer(StageArtifactWriter(tmp_path))
+
+    adapter.request(MUNICIPIO, BUCKET)
+
+    raw = _load_fetch_stage_raw(tmp_path)
+    assert raw["raw_payload_sha256"] == "deadbeef" * 8
+    assert "raw_payload_b64_head" not in raw
+    assert "raw_payload_truncated" not in raw
+
+
+def test_fetch_stage_artifact_carries_b64_head_only_on_charset_anomaly(
+    tmp_path: Path,
+) -> None:
+    fetcher = FakeFetcher(
+        decode_diagnostics=("declared_charset_decode_failed:utf-8", "fallback:cp1252"),
+        raw_payload_sha256="cafebabe" * 8,
+        raw_payload_head_b64="Zm9vYmFy",
+        raw_payload_truncated=False,
+    )
+    adapter = _adapter(fetcher=fetcher)
+    adapter.set_artifact_writer(StageArtifactWriter(tmp_path))
+
+    adapter.request(MUNICIPIO, BUCKET)
+
+    raw = _load_fetch_stage_raw(tmp_path)
+    assert raw["raw_payload_sha256"] == "cafebabe" * 8
+    assert raw["raw_payload_b64_head"] == "Zm9vYmFy"
+    assert raw["raw_payload_truncated"] is False
+
+
+class _FlakyFreeTransport:
+    def __init__(self, exceptions: list[BaseException]) -> None:
+        self._exceptions = list(exceptions)
+        self.calls = 0
+
+    def generate(self, model, contents, config):
+        self.calls += 1
+        if self._exceptions:
+            raise self._exceptions.pop(0)
+        return "ok-response"
+
+
+def test_free_quota_retry_transport_retries_once_then_succeeds() -> None:
+    from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
+        _FreeQuotaRetryTransport,
+    )
+
+    inner = _FlakyFreeTransport(
+        [RuntimeError("429 RESOURCE_EXHAUSTED. Please retry in 2.5s.")]
+    )
+    sleeps: list[float] = []
+    transport = _FreeQuotaRetryTransport(inner, sleeper=sleeps.append)
+
+    result = transport.generate("model", [], {})
+
+    assert result == "ok-response"
+    assert inner.calls == 2
+    assert sleeps == pytest.approx([3.5])
+
+
+def test_free_quota_retry_transport_propagates_after_third_429() -> None:
+    from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
+        _FreeQuotaRetryTransport,
+    )
+
+    exc = lambda: RuntimeError("429 RESOURCE_EXHAUSTED. Please retry in 1s.")
+    inner = _FlakyFreeTransport([exc(), exc(), exc()])
+    transport = _FreeQuotaRetryTransport(inner, sleeper=lambda seconds: None)
+
+    with pytest.raises(RuntimeError):
+        transport.generate("model", [], {})
+
+    assert inner.calls == 3
+
+
+def test_free_quota_retry_transport_does_not_retry_non_quota_errors() -> None:
+    from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
+        _FreeQuotaRetryTransport,
+    )
+
+    inner = _FlakyFreeTransport([RuntimeError("500 internal error")])
+    sleeps: list[float] = []
+    transport = _FreeQuotaRetryTransport(inner, sleeper=sleeps.append)
+
+    with pytest.raises(RuntimeError, match="500 internal error"):
+        transport.generate("model", [], {})
+
+    assert inner.calls == 1
+    assert sleeps == []
