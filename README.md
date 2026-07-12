@@ -3,8 +3,8 @@
 [![CI](https://github.com/luisesantamaria/concursos-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/luisesantamaria/concursos-tracker/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![Fase](https://img.shields.io/badge/fase-2%20de%208%20·%20RS-orange)
-![Golden](https://img.shields.io/badge/golden%20RS-30%2F36%20·%20união%2031-yellow)
-![Precisão](https://img.shields.io/badge/falsos%20positivos-0%20em%2022%20auditadas-brightgreen)
+![Golden](https://img.shields.io/badge/golden%20RS-30%2F36%20ratificado-brightgreen)
+![Precisão](https://img.shields.io/badge/falsos%20positivos-0%20em%2030%20auditadas-brightgreen)
 ![Tests](https://img.shields.io/badge/tests%20V2-438%20verdes-brightgreen)
 ![Atualizado](https://img.shields.io/badge/estado%20verificado-2026--07--12-blue)
 
@@ -62,7 +62,7 @@ flowchart LR
 | Fase | Escopo | Estado | Resultado-chave |
 |---|---|---|---|
 | F0-F1 | Modelo de autoridade · crawlers de bancas RS | ✅ | Base de certames de bancas |
-| **F2** | **Descoberta municipal RS (motor V2)** | 🔄 | F2.P1-P4 concluídos; passo atual F2.P5 (adjudicação humana). Gate R4: **30/36, 0 FP**; união R4∪R5: **31/36 demonstradas** (variância do modelo free documentada). Fixture adversarial 0 FP/15; 438 testes verdes. |
+| **F2** | **Descoberta municipal RS (motor V2)** | 🔄 | F2.P1-P5 concluídos; passo atual F2.P6 (holdout cego de 50). **30/36 ratificado por Luis com auditoria manual, 0 FP**; 6 abstenções legítimas. Fixture adversarial 0 FP/15; 438 testes verdes. |
 | F3-F4 | Descoberta industrializada · sinal demand-driven | ⬜ | — |
 | F5-F6 | Monitoramento · extração + identidade | ⬜ | — |
 | F7-F8 | Expansão nacional · portal/app | ⬜ | — |
