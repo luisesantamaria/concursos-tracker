@@ -806,6 +806,7 @@ def run_golden_live(
     isolate_model_calls: bool = True,
     no_v1_differential: bool = False,
     render_fallback: bool = False,
+    abc_mode: str = "slim",
     fetcher_factory: Callable[[], Any] = OrionHTTPFetcher,
     adapter_factory: Callable[..., Any] = LiveABCAdapter.from_model_policy_environment,
     differential_runner_factory: Callable[..., GoldenDifferentialRunner] = GoldenDifferentialRunner,
@@ -891,6 +892,8 @@ def run_golden_live(
     adapter_arguments.update(explicit_kwargs(adapter_factory, {
         "gemini_timeout": gemini_timeout,
         "isolate_model_calls": isolate_model_calls,
+        "abc_mode": abc_mode,
+        "seed": seed,
     }))
     adapter = adapter_factory(**adapter_arguments)
     provider = _ResumeAwareProvider(adapter)
@@ -1232,6 +1235,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-model-subprocess", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--abc-mode", choices=("slim", "full"), default="slim")
     parser.add_argument("--allow-sin-cobertura-v1", action="store_true")
     parser.add_argument(
         "--no-v1-differential",
@@ -1318,6 +1322,7 @@ def main(
             http_read_timeout=args.http_read_timeout,
             gemini_timeout=args.gemini_timeout,
             seed=args.seed,
+            abc_mode=args.abc_mode,
             allow_sin_cobertura_v1=args.allow_sin_cobertura_v1,
             unit_allowlist=parse_unit_specs(args.units),
             resume=args.resume,

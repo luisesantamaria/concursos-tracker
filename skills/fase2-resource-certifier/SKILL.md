@@ -110,7 +110,7 @@ Confirme (`indice_oficial` / `indice_oficial_combinado` / `portal_externo_oficia
 - Snapshot truncado/challenge Cloudflare ⇒ `revisar`, `insuficiencia=antibot` ou `snapshot_incompleto`.
 - Citação literal "Prefeitura Municipal" no footer não prova `identity` da página avaliada.
 - Repositório oficial "Documentos/Editais" misturando leilões, chamamentos e PSS, com linhas de PSS citáveis, avaliado para `processo_seletivo` ⇒ índice válido do bucket (cite as linhas de PSS, não o contêiner).
-- Feed/tag oficial "processo seletivo" agregando as publicações do bucket ao longo do tempo ⇒ listagem válida; um artigo individual DENTRO do feed continua sendo notícia, não índice.
+- Feed/tag oficial "processo seletivo" agregando as publicações do bucket ao longo do tempo ⇒ listagem válida. Cards com data, resumo e botão **LER MAIS não transforma o AGREGADOR em notícia individual**: rejeite somente a URL de um artigo isolado; confirme a URL do feed/tag quando ela reúne múltiplas publicações do bucket com estrutura repetível.
 - Repositório misto avaliado para um bucket SEM nenhum item citável desse bucket ⇒ nunca afirmativa (`revisar` ou `nao_encontrado` conforme o critério operativo).
 - Site oficial acessível, `evidence_state=completa`, menu e busca examinados por inteiro, nenhuma seção/link de concursos nem de PSS em lugar algum ⇒ `nao_encontrado` (ausência comprovada, não `revisar`).
 - Site com challenge Cloudflare que impede ver o menu completo, sem sinal do recurso no que foi capturado ⇒ NÃO é `nao_encontrado` (a ausência não foi comprovada, só não foi vista): `revisar`, `insuficiencia=antibot`.

@@ -986,6 +986,13 @@ class _FreeQuotaRetryTransport:
                 attempt += 1
 
 
+def _sample_prosecutor(municipio: str, bucket: str, *, seed: int) -> bool:
+    """Stable 10% audit sample; this is sampling, never candidate scoring."""
+
+    material = f"{int(seed)}\0{municipio}\0{bucket}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % 10 == 0
+
+
 class LiveABCAdapter:
     """Real/live implementation of the cassette producer's ``ABCProvider``."""
 
@@ -1002,6 +1009,8 @@ class LiveABCAdapter:
         stage_transports: Mapping[str, PolicyTransport] | None = None,
         telemetry: ModelPolicyTelemetry | None = None,
         artifact_writer: StageArtifactWriter | None = None,
+        abc_mode: str = "full",
+        seed: int = 0,
     ) -> None:
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
             raise LiveABCConfigurationError("timeout_seconds_must_be_positive")
@@ -1015,6 +1024,10 @@ class LiveABCAdapter:
         self.stage_transports = dict(stage_transports or {})
         self.telemetry = telemetry
         self.artifact_writer = artifact_writer
+        if abc_mode not in {"slim", "full"}:
+            raise LiveABCConfigurationError("abc_mode_invalid")
+        self.abc_mode = abc_mode
+        self.seed = int(seed)
         self._artifact_attempt = 1
         self._outcomes: dict[tuple[str, str], LiveABCOutcome] = {}
 
@@ -1099,6 +1112,8 @@ class LiveABCAdapter:
         limiter=None,
         sdk_client_factory=None,
         timeout_seconds: float = 15.0,
+        abc_mode: str = "full",
+        seed: int = 0,
     ) -> "LiveABCAdapter":
         free_key = resolve_free_api_key(environ)
         telemetry = ModelPolicyTelemetry()
@@ -1142,6 +1157,8 @@ class LiveABCAdapter:
             judge=judge,
             timeout_seconds=timeout_seconds,
             telemetry=telemetry,
+            abc_mode=abc_mode,
+            seed=seed,
         )
 
     @classmethod
@@ -1156,6 +1173,8 @@ class LiveABCAdapter:
         timeout_seconds: float = 30.0,
         gemini_timeout: float = 60.0,
         isolate_model_calls: bool = True,
+        abc_mode: str = "full",
+        seed: int = 0,
     ) -> "LiveABCAdapter":
         free_key = environ.get("GEMINI_API_KEY_FREE")
         paid_key = environ.get("GEMINI_API_KEY")
@@ -1213,6 +1232,8 @@ class LiveABCAdapter:
             timeout_seconds=timeout_seconds,
             stage_transports=policies,
             telemetry=telemetry,
+            abc_mode=abc_mode,
+            seed=seed,
         )
 
     @staticmethod
@@ -1557,9 +1578,12 @@ class LiveABCAdapter:
             provider="gemini_policy", status="ok",
         )
 
-        run_b = certified.get("decision") in {
+        affirmative_a = certified.get("decision") in {
             "indice_oficial", "indice_oficial_combinado", "portal_externo_oficial"
         }
+        run_b = affirmative_a and (
+            self.abc_mode == "full" or _sample_prosecutor(municipio, bucket, seed=self.seed)
+        )
         if run_b:
             self._bind_stage("B", municipio, bucket)
             self._emit(
@@ -1577,6 +1601,13 @@ class LiveABCAdapter:
                     snapshot=snapshot,
                     certifier_output=proposal_a,
                 )
+            elif affirmative_a:
+                prosecuted_result = {
+                    "result": "sustain",
+                    "reason": "slim_unsampled_sustain",
+                    "citations": [],
+                    "accusations": [],
+                }
             else:
                 prosecuted_result = {
                     "result": "review",

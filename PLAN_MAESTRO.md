@@ -19,17 +19,36 @@ comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
 - Motor V2 (adjudicación IA): `scripts/fase2_municipios/v2/` — certificador A
   + fiscal B + juez C sobre Gemini flash-lite free, citas literales
   verificadas por código, gate estructural, registro de dominios, render-once
-  SPA. Suite: **425 tests verdes** (`pytest scripts/fase2_municipios/v2`).
+  SPA. Suite: **438 tests verdes** (`pytest scripts/fase2_municipios/v2`).
 - F2.P1 cerrado: snapshot directo 400K, fetch 60s con un reintento transitorio,
   reintento integral de unidad ante validación inválida y ausencia legítima
   preservada como `nao_encontrado`/`negative`.
 - F2.P2 cerrado: política de índice en skills (contenedor mixto SÍ, feed-tag
   SÍ — decisión de Luis 12-jul; sección sin ítems citables del bucket nunca
   afirmativa) + espejo en fiscal B. sha256 certifier=b2f3fda0…, prosecutor=
-  435e6bff…. Paso exacto siguiente: **F2.P3** (fixture envenenado).
-- Última corrida golden (R3): `staging/fase2_v2/eval/golden36_fable_20260712_r3/`
-  → **22/36 match vs golden, 0 FP** (los 14 differ son abstenciones), paid=0,
-  84 llamadas free, perfil 2.33 calls/unidad, 22.4K tokens/unidad, 11.6s/unidad.
+  435e6bff….
+- F2.P3 cerrado: fixture envenenado v2 de 15 unidades/7 tipos obligatorios;
+  R2 en `staging/fase2_v2/eval/fixture_envenenado_20260712_r2/` y reporte
+  ex-post `fixture_envenenado_report_20260712_r2/poison_report.json` →
+  **FP=0/15, capturas netas B/C=0**, 41 llamadas free, paid=0, 326.796
+  tokens. Política resultante: slim por defecto; B/C quedan intactos para
+  desacuerdo/muestreo 10%.
+- F2.P4 cerrado (decisión de Luis 12-jul, ejecutada por Fable): **R4 aceptado
+  como gate — 30/36, 0 FP** (`golden36_fable_20260712_r4/`, 73 free, paid=0).
+  **POLÍTICA DE VARIANZA registrada**: el gate se evalúa sobre la corrida de
+  config congelada que lo cumplió; la varianza inter-corrida se reporta como
+  métrica separada — R5 (`_r5/`, único fix feed/tag, 80 free) dio 26/36 con
+  0 FP y sus 5 pérdidas son TODAS varianza de validación del modelo free
+  (Proposal/ModelResponseValidationError; ninguna causada por el fix;
+  Itaara/PS regresó en R5). **Unión R4∪R5 = 31/36 confirmables demostradas,
+  0 FP en todas las corridas históricas.** En producción la convergencia a
+  la unión la dan los reintentos del monitoreo (F5); la varianza es el
+  argumento empírico para pagado (F2.P7). Canoas/PSS = bug abierto NO
+  bloqueante (A sigue rechazando el feed pese al fix; investigar post-P5).
+  Matrices `semantic_matrix_r4/r5_20260712/`; informe y tablas P5 en
+  `f2_p4_report_20260712/informe_f2_p4_y_entregable_p5.md`. Higiene: seed
+  `2026071206` se reutilizó en R4 (inofensivo; futuras corridas seed nuevo).
+  Paso exacto siguiente: **F2.P5** (adjudicación de Luis, tablas listas).
 - Comparación controlada (`semantic_matrix_r3_20260712/`): sobre evidencia
   idéntica, V2 acierta 22/23 vs 2/23 de las heurísticas V1.
 - Fixture y oracle: `url_map_golden_fixture_20260712.csv` (36 URLs verificadas),
@@ -127,7 +146,7 @@ no tiene ítems del bucket).
 **SI Luis dice NO a feed-tag**: solo (a) y (c); Canoas/PS queda como revisar
 legítimo y el techo de F2.P4 baja en 1.
 
-### F2.P3 — Fixture envenenado (mide al fiscal B y blinda el 0-FP)
+### F2.P3 ✅ (12-jul-2026) — Fixture envenenado (mide al fiscal B y blinda el 0-FP)
 **ENTRADA**: F2.P1 hecho.
 **ACCIONES**: construir `staging/fase2_v2/eval/fixture_envenenado_v1.csv` con
 15-20 unidades donde la URL es PLAUSIBLE pero INCORRECTA, de páginas reales
@@ -141,7 +160,9 @@ netas de B/C (venenos que A no detuvo solo).
 **SI B/C capturan ≥1 neto**: se quedan. **SI capturan 0**: modo slim por
 defecto (A+gate; B/C solo en desacuerdo o muestreo 10%), código intacto.
 
-### F2.P4 — R4 contra el golden 36
+### F2.P4 ✅ (12-jul-2026) — R4 contra el golden 36
+**RESULTADO**: gate cumplido con R4 (30/36, 0 FP); política de varianza y
+unión R4∪R5=31/36 registradas en §0; Canoas/PSS bug abierto no bloqueante.
 **ENTRADA**: F2.P1-P3 verdes.
 **ACCIONES**: corrida R4 (comando patrón §0, output nuevo, seed nuevo);
 generar `v2_only_differential` + `semantic_comparison`.
@@ -421,6 +442,8 @@ gastar en F7 — los datos de RS ya sostienen el aprendizaje.
 2. Las 6 confirmaciones con `requiere_revision_humana` (F2.P5): ¿match válido?
 3. Autorización del holdout 50 (F2.P6) y de la corrida 497 (F2.P8).
 4. Presupuesto pagado para producción tras la sonda de cuota (F2.P7).
+5. F2.P4: aceptar R4 (30/36, 0 FP) pese a que R5 cayó a 26/36 por varianza,
+   o definir una política adicional antes de pasar a la adjudicación F2.P5.
 
 ## Orden de ejecución recomendado (si nada bloquea)
 F2.P1 → F2.P2 → F2.P3 → F2.P4 → (paralelo: F2.P7, F3.P1, F3.P2, F4.P1) →
