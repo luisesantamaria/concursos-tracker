@@ -5,7 +5,7 @@
 ![Fase](https://img.shields.io/badge/fase-2%20de%208%20·%20RS-orange)
 ![Golden](https://img.shields.io/badge/golden%20RS-22%2F36-yellow)
 ![Precisão](https://img.shields.io/badge/falsos%20positivos-0%20em%2022%20auditadas-brightgreen)
-![Tests](https://img.shields.io/badge/tests%20V2-419%20verdes-brightgreen)
+![Tests](https://img.shields.io/badge/tests%20V2-425%20verdes-brightgreen)
 ![Atualizado](https://img.shields.io/badge/estado%20verificado-2026--07--12-blue)
 
 **Motor de dados e portal de avisos para concursos públicos e processos
@@ -62,7 +62,7 @@ flowchart LR
 | Fase | Escopo | Estado | Resultado-chave |
 |---|---|---|---|
 | F0-F1 | Modelo de autoridade · crawlers de bancas RS | ✅ | Base de certames de bancas |
-| **F2** | **Descoberta municipal RS (motor V2)** | 🔄 | Golden 36: **22 acertos, 0 FP**; sobre evidência idêntica, IA 22/23 vs heurísticas 2/23; 419 testes verdes |
+| **F2** | **Descoberta municipal RS (motor V2)** | 🔄 | F2.P1-P2 concluídos; passo atual F2.P3. Golden 36: **22 acertos, 0 FP**; sobre evidência idêntica, IA 22/23 vs heurísticas 2/23; 425 testes verdes |
 | F3-F4 | Descoberta industrializada · sinal demand-driven | ⬜ | — |
 | F5-F6 | Monitoramento · extração + identidade | ⬜ | — |
 | F7-F8 | Expansão nacional · portal/app | ⬜ | — |

@@ -260,7 +260,7 @@ def test_legitimate_absence_is_distinct_from_access_failure() -> None:
         certifier=FakeCertifier(decision="nao_encontrado"),
     ).request(MUNICIPIO, BUCKET)
 
-    assert outcome.decision == "revisar"
+    assert outcome.decision == "nao_encontrado"
     assert outcome.url == ""
     assert outcome.layer is not None
     assert outcome.cause.kind is LiveCauseKind.LEGITIMATE_ABSENCE

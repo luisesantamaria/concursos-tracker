@@ -491,21 +491,26 @@ class OrionHTTPFetcher:
         payload = b""
         for redirect_count in range(self._max_redirects + 1):
             parsed = urlsplit(current_url)
-            connection = self._connection(parsed, connect_timeout)
             path = parsed.path or "/"
             if parsed.query:
                 path += "?" + parsed.query
-            try:
-                connection.request("GET", path, headers=_live_request_headers())
-                sock = getattr(connection, "sock", None)
-                if sock is not None:
-                    sock.settimeout(read_timeout)
-                response = connection.getresponse()
-                payload = response.read()
-            except ExternalAccessBlocked:
-                raise
-            finally:
-                connection.close()
+            for fetch_attempt in range(2):
+                connection = self._connection(parsed, connect_timeout)
+                try:
+                    connection.request("GET", path, headers=_live_request_headers())
+                    sock = getattr(connection, "sock", None)
+                    if sock is not None:
+                        sock.settimeout(read_timeout)
+                    response = connection.getresponse()
+                    payload = response.read()
+                    break
+                except ExternalAccessBlocked:
+                    raise
+                except (TimeoutError, OSError):
+                    if fetch_attempt == 1:
+                        raise
+                finally:
+                    connection.close()
             status = response.status
             if status in {301, 302, 303, 307, 308}:
                 location = response.getheader("location")
@@ -1027,6 +1032,11 @@ class LiveABCAdapter:
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
             raise ValueError("attempt must be a positive integer")
         self._artifact_attempt = attempt
+
+    def reset_unit(self, municipio: str, bucket: str) -> None:
+        """Forget one terminal outcome before a full A->B->gate retry."""
+
+        self._outcomes.pop((municipio, bucket), None)
 
     def artifact_reference(
         self, municipio: str, bucket: str, attempt: int
@@ -1810,11 +1820,17 @@ class LiveABCAdapter:
                 revisar_por = "revisar_por_C"
             else:
                 revisar_por = "revisar_por_gate"
+        final_decision = result.final_decision.decision
+        final_url = result.final_decision.url
+        if proposal_a_layer is not None and proposal_a_layer.decision == "nao_encontrado":
+            final_decision = "nao_encontrado"
+            final_url = ""
+            revisar_por = ""
         outcome = LiveABCOutcome(
             municipio=municipio,
             bucket=bucket,
-            decision=result.final_decision.decision,
-            url=result.final_decision.url,
+            decision=final_decision,
+            url=final_url,
             cause=LiveCause(kind, result.reason_code, comment, revisar_por),
             layer=layer,
             evidence_snapshot=snapshot,

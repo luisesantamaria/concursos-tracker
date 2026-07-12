@@ -97,6 +97,29 @@ def html_bytes() -> bytes:
     return fx.HTML.encode("utf-8")
 
 
+def test_orion_http_fetcher_retries_one_transient_network_error(monkeypatch) -> None:
+    first = FakeConnection(FakeResponse(html_bytes()))
+    second = FakeConnection(FakeResponse(html_bytes()))
+    attempts = [first, second]
+
+    def connection(parsed, timeout_seconds):
+        current = attempts.pop(0)
+        if current is first:
+            current.request = lambda *args, **kwargs: (_ for _ in ()).throw(
+                TimeoutError("transient timeout")
+            )
+        return current
+
+    monkeypatch.setattr(OrionHTTPFetcher, "_connection", staticmethod(connection))
+
+    fetched = OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=60)
+
+    assert fetched.html == fx.HTML
+    assert first.closed is True
+    assert second.closed is True
+    assert attempts == []
+
+
 @pytest.mark.parametrize(
     ("content_encoding", "compress"),
     [

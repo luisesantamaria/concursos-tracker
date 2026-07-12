@@ -259,7 +259,7 @@ def test_gemini_policy_selects_factory_with_effective_kwargs_and_requires_paid(
             ("Fixture", "concurso_publico"): "https://fixture.invalid"
         },
         "environ": environment,
-        "timeout_seconds": 30.0,
+        "timeout_seconds": 60.0,
     }
     with pytest.raises(
         LiveABCConfigurationError, match="paid_fallback_credential_missing"

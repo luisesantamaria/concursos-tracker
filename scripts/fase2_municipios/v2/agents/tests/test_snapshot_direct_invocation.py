@@ -146,7 +146,7 @@ def test_direct_certifier_factory_uses_role_schema_without_dialect_marker() -> N
 
 
 def test_truncated_inline_snapshot_can_never_support_affirmative_output() -> None:
-    content = "Official index" + ("x" * 200_001)
+    content = "Official index" + ("x" * 400_001)
     snapshot = build_snapshot((EvidenceSource(
         source_id="main",
         url="https://example.invalid/large",
@@ -171,7 +171,7 @@ def test_truncated_inline_snapshot_can_never_support_affirmative_output() -> Non
     source = evidence["sources"][0]
     assert source["content_truncated"] is True
     assert source["original_length"] == len(content)
-    assert len(source["content"]) <= 200_000
+    assert len(source["content"]) <= 400_000
 
 
 # --------------------------------------------------------------------------- #
