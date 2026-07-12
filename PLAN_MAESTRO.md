@@ -73,8 +73,12 @@ wsl.exe ... -m scripts.fase2_municipios.v2.eval.semantic_comparison --run-dir <R
   explícita. Producción usará API pagada (decisión F2.P7).
 - **R-T6 · Intocables**: ver CLAUDE.md (verdict_extract.py,
   cascade_municipios.py, golden CSV, corridas congeladas).
-- **R-T7 · Cierre de paso**: al terminar cada paso, registrar en la memoria
-  del proyecto: qué se hizo, números y el paso siguiente.
+- **R-T7 · Cierre de paso**: al terminar cada paso, (a) actualizar los docs
+  vivos — README (Status/badge), ROADMAP (estados) y este §0 + marcar el paso
+  `✅ (fecha)` — con la skill `/actualizar-docs` (reglas de consistencia en
+  `.claude/skills/actualizar-docs/SKILL.md`); (b) registrar en la memoria del
+  proyecto qué se hizo, números y el paso siguiente. Un paso sin docs
+  actualizados NO está cerrado.
 - **R-T8 · Patrón golden→holdout**: toda capacidad nueva (descubrimiento,
   señal, monitoreo, extracción) se valida contra una verdad manual chica y
   luego contra un holdout ciego antes de operarse a escala.
