@@ -49,19 +49,31 @@ PLANO D — PRODUCTO         ¿A QUIÉN le sirve?   (matching + alertas + portal
 ### Plano A — Descubrimiento de fuentes
 
 Objetivo: para cada (municipio, tipo) y cada banca, conocer la(s) URL(s)
-estables donde se publica. Cuatro familias de fuentes con autoridad distinta
-(modelo authority-first, ya validado):
+estables donde se publica. Cuatro familias de **fuentes de verdad que
+CONVERGEN** — ninguna es "la" autoridad de todo; cada una es autoritativa
+para una porción distinta de los hechos del certame y se corroboran entre sí
+(acuerdo entre fuentes independientes sube confianza; divergencia manda a
+revisión). La autoridad se asigna POR TIPO DE HECHO, no por fuente (matriz
+fuente × evento):
 
-1. **Bancas organizadoras** — autoridad para el ciclo activo del concurso
-   (edital→resultado). *Estado: fase 1 hecha para RS.*
-2. **Prefeituras / órganos** — autoridad para PSS municipales (que muchas veces
-   no tienen banca) y para eventos post-resultado (convocação, nomeação).
-   *Estado: fase 2 RS en curso; motor V2 funcionando (ver §4).*
-3. **Diários oficiales** — autoridad para actos administrativos formales.
-   *Integración clave pendiente: **API de Querido Diário** (querido-diario.ok.org.br):
-   texto completo de diários municipales, buscable por término y municipio.*
+1. **Bancas organizadoras** — la fuente más RICA del ciclo activo
+   (edital→provas→resultado) para los certames que usan banca (mayormente
+   concursos grandes). **La mayoría de los PSS y algunos concursos nunca
+   pasan por banca.** *Estado: fase 1 hecha para RS.*
+2. **Prefeituras / órganos** — el publicador legal; muchas veces la ÚNICA
+   fuente para PSS; autoritativa para convocação/nomeação y seguimiento
+   municipal. *Estado: fase 2 RS en curso; motor V2 funcionando (ver §4).*
+3. **Diários oficiales** — el registro con valor legal de los actos
+   administrativos. *Integración clave pendiente: **API de Querido Diário**
+   (querido-diario.ok.org.br): texto completo de diários municipales,
+   buscable por término y municipio.*
 4. **Radar (Ache Concursos, PCI, QConcursos)** — solo descubrimiento y
    auditoría de cobertura, jamás prueba final.
+
+El resolvedor de identidad del Plano C es la pieza que materializa la
+convergencia: une las menciones multi-fuente en un solo Certame, y cada
+hecho (fecha, cargo, documento, evento) conserva la provenance de la fuente
+que lo prueba.
 
 Componentes ya construidos y reutilizables a escala nacional:
 - Cascada de 5 tiers (barato→caro) para descubrir la URL municipal.

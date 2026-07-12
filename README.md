@@ -19,14 +19,27 @@ evidence**. Current pilot scope: **Rio Grande do Sul (RS)**.
 | `ROADMAP.md` | Phase history + mapping to the master plan. |
 | `authority_first/docs/ARCHITECTURE.md`, `RUNBOOK_corridas_locales.md` | Fase 2 technical detail; how to run scrapes from Brazil (geo-blocking). |
 
-## Authority-First Model
+## Converging Sources of Truth (the authority model)
 
-1. **Banca organizadora** when a banca exists (full active lifecycle).
-2. **Prefeitura/official organ page** when there is no banca (most PSS) and
-   for municipal follow-up (convocações).
-3. **Diários oficiais** (Querido Diário) for administrative events.
-4. **Radar portals** (Ache, PCI, QConcursos) only as discovery/audit signal —
-   never as final authority.
+No single source is "the" authority for everything. Each source is
+authoritative for a different **slice** of a certame's life, and the engine's
+job is to make them **converge** on one entity (identity resolution) — sources
+corroborate each other; agreement raises confidence, divergence flags review:
+
+- **Banca organizadora** — the *richest* source for the active lifecycle
+  (edital → provas → resultado) of certames that use one (mostly larger
+  concursos). **Most PSS and some concursos never touch a banca.**
+- **Prefeitura/official organ** — the legal publisher; often the **only**
+  source for PSS; authoritative for convocações/nomeações and municipal
+  follow-up.
+- **Diários oficiais** (Querido Diário) — the legally binding record of
+  administrative acts.
+- **Radar portals** (Ache, PCI, QConcursos) — discovery/audit signal only,
+  never final proof.
+
+Authority is assigned **per fact type, not per source** (the fuente × evento
+matrix): the same certame is assembled by merging mentions from several
+sources, each fact carrying the provenance of the source that proves it.
 
 ## The two engines (current state, 2026-07-12)
 
