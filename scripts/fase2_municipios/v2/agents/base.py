@@ -31,7 +31,7 @@ from scripts.fase2_municipios.v2.snapshot import (
 
 
 LOGGER = logging.getLogger(__name__)
-MAX_DIRECT_SNAPSHOT_CHARS = 200_000
+MAX_DIRECT_SNAPSHOT_CHARS = 400_000
 PROTOCOL_INSTRUCTION = """APPLICATION AGENTSTEP PROTOCOL (no native function calling):
 Return exactly one JSON object per turn with action=tool or action=final.
 For action=tool provide tool and args, and omit output.

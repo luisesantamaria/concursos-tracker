@@ -37,7 +37,7 @@ Uma decisão afirmativa (`indice_oficial`, `indice_oficial_combinado`, `portal_e
 
 1. **Autoridade oficial** — domínio oficial do município ou portal externo com cadeia oficial explícita (link/botão/iframe/redirect a partir da prefeitura correta). Aparência municipal não é cadeia.
 2. **Identidade** — o conteúdo pertence ao município avaliado (nome no título/heading/main, não só no slug).
-3. **Papel de índice** — superfície estável de consulta: busca, filtros, contador, tabela/cards repetíveis, paginação, abas vigente/encerrado, categoria que agrega certames ao longo do tempo. Pode ter zero, um ou muitos resultados; a função e a estrutura definem o índice, não a contagem atual.
+3. **Papel de índice** — superfície estável de consulta: busca, filtros, contador, tabela/cards repetíveis, paginação, abas vigente/encerrado, categoria que agrega certames ao longo do tempo. Pode ter zero, um ou muitos resultados; a função e a estrutura definem o índice, não a contagem atual. **Dois formatos legítimos que NÃO descaracterizam o índice** (conteúdo sobre formato, nunca slug): (a) **repositório oficial misto de documentos** — uma listagem que mistura tipos (leilões, chamamentos, PSS...) conta como índice do bucket solicitado SE contém itens citáveis DESSE bucket; as citações de `bucket` devem ancorar nos itens do bucket, nunca no contêiner genérico; (b) **feed/tag oficial agregador** — uma tag/feed oficial que reúne as publicações do bucket ao longo do tempo conta como listagem estável (uma notícia individual continua rejeitada: o que vale é o agregador, não o artigo). Em ambos os formatos as 5 dimensões e suas citações seguem obrigatórias. Seção sem NENHUM item citável do bucket só admite afirmativa se a estrutura específica do bucket é inequívoca e citável (título/filtro/aba do próprio bucket); sem isso, nunca afirmativa.
 4. **Bucket exato solicitado** — ver seção seguinte.
 5. **Estabilidade** — a superfície agrega a categoria ao longo do tempo e continuaria útil com zero resultados.
 
@@ -109,5 +109,8 @@ Confirme (`indice_oficial` / `indice_oficial_combinado` / `portal_externo_oficia
 - Vários números de edital do MESMO certame (retificações/anexos) ⇒ detalhe individual, não índice.
 - Snapshot truncado/challenge Cloudflare ⇒ `revisar`, `insuficiencia=antibot` ou `snapshot_incompleto`.
 - Citação literal "Prefeitura Municipal" no footer não prova `identity` da página avaliada.
+- Repositório oficial "Documentos/Editais" misturando leilões, chamamentos e PSS, com linhas de PSS citáveis, avaliado para `processo_seletivo` ⇒ índice válido do bucket (cite as linhas de PSS, não o contêiner).
+- Feed/tag oficial "processo seletivo" agregando as publicações do bucket ao longo do tempo ⇒ listagem válida; um artigo individual DENTRO do feed continua sendo notícia, não índice.
+- Repositório misto avaliado para um bucket SEM nenhum item citável desse bucket ⇒ nunca afirmativa (`revisar` ou `nao_encontrado` conforme o critério operativo).
 - Site oficial acessível, `evidence_state=completa`, menu e busca examinados por inteiro, nenhuma seção/link de concursos nem de PSS em lugar algum ⇒ `nao_encontrado` (ausência comprovada, não `revisar`).
 - Site com challenge Cloudflare que impede ver o menu completo, sem sinal do recurso no que foi capturado ⇒ NÃO é `nao_encontrado` (a ausência não foi comprovada, só não foi vista): `revisar`, `insuficiencia=antibot`.

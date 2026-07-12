@@ -108,6 +108,7 @@ Aplicação aos códigos de ausência/conflito:
 - Página **combinada** (evidência literal de ambos os tipos na mesma superfície estável) NÃO é bucket equivocado. A evidência pode descrevê-la como `combinado`, mas o runtime deve normalizar a decisão final publicável ao bucket solicitado, preservando separadamente o caráter combinado.
 - Para `proved` é preciso **evidência positiva de exclusividade** (ex.: título/filtros/linhas mostram apenas o outro tipo, sem traço do tipo pedido). Se a exclusividade não pode ser demonstrada (conteúdo parcial, ambíguo) ⇒ `unresolved`, nunca `proved`.
 - Combinado reivindicado por A com UMA única citação de `dimension=bucket` não é passe automático para `wrong_bucket=discarded`: trate como combinado NÃO comprovado. Resultado: `unresolved` explícito nesta acusação (ou, se aplicável, um `failure_mode_proposal` concreto, ex. `combinado_unproven`) — nunca silêncio nem `discarded` tácito.
+- **Repositório misto / feed-tag reivindicado como índice do bucket**: formatos legítimos, mas SOMENTE se as citações de `bucket` de A ancoram em itens reais do bucket solicitado. Verifique cada item citado: se são de outro tipo (leilão, chamamento, licitação) ⇒ persiga `wrong_bucket`/`licitacao` conforme o caso; se o contêiner NÃO tem nenhum item do bucket e A citou apenas o contêiner genérico ⇒ a afirmativa está sem prova de bucket: acusação material pertinente com a evidência, nunca `discarded` tácito.
 
 ## Armadilhas históricas (previna ativamente)
 

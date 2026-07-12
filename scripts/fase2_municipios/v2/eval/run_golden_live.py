@@ -57,9 +57,11 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
     LiveAuditEvent,
     LiveCause,
     LiveCauseKind,
+    ModelResponseValidationError,
     OrionHTTPFetcher,
     RenderFallbackFetcher,
 )
+from scripts.fase2_municipios.v2.agents.orchestration import ProposalValidationError
 from scripts.fase2_municipios.v2.eval.live_model_policy import (
     CredentialConfigError,
     ErrorCategory,
@@ -632,6 +634,13 @@ def _result_from_outcome(
     }
 
 
+def _should_retry_unit(outcome: LiveABCOutcome, *, attempt: int) -> bool:
+    return attempt == 1 and isinstance(
+        outcome.original_exception,
+        (ModelResponseValidationError, ProposalValidationError),
+    )
+
+
 class _ResumeAwareProvider:
     def __init__(self, delegate: Any) -> None:
         self.delegate = delegate
@@ -787,7 +796,7 @@ def run_golden_live(
     environ: Mapping[str, str],
     staging_root: Path = CANONICAL_STAGING_ROOT,
     http_connect_timeout: float = 10.0,
-    http_read_timeout: float = 30.0,
+    http_read_timeout: float = 60.0,
     gemini_timeout: float = 60.0,
     seed: int = 0,
     allow_sin_cobertura_v1: bool = False,
@@ -961,64 +970,58 @@ def run_golden_live(
                 )
             else:
                 attempt = state.next_attempt(municipio, bucket)
-                if hasattr(adapter, "set_attempt"):
-                    adapter.set_attempt(attempt)
-                start_wall = datetime.now(timezone.utc)
-                start_monotonic = time.monotonic()
-                try:
-                    outcome = run_live(
-                        contract=contract,
-                        enable_live_abc=True,
-                        abc_provider=provider,
-                        municipio=municipio,
-                        bucket=bucket,
+                while True:
+                    if hasattr(adapter, "set_attempt"):
+                        adapter.set_attempt(attempt)
+                    start_wall = datetime.now(timezone.utc)
+                    start_monotonic = time.monotonic()
+                    try:
+                        outcome = run_live(
+                            contract=contract,
+                            enable_live_abc=True,
+                            abc_provider=provider,
+                            municipio=municipio,
+                            bucket=bucket,
+                        )
+                        if not isinstance(outcome, LiveABCOutcome):
+                            raise GoldenLiveError("live_adapter_returned_invalid_outcome")
+                    except Exception as exc:
+                        outcome = LiveABCAdapter._failure(
+                            municipio, bucket, kind=LiveCauseKind.INTERNAL_FAILURE,
+                            code=type(exc).__name__, error=exc, phase="runner",
+                        )
+                    end_wall = datetime.now(timezone.utc)
+                    unit_result = _result_from_outcome(
+                        outcome, start=start_wall.isoformat(), end=end_wall.isoformat(),
+                        duration_s=time.monotonic() - start_monotonic, attempt=attempt,
                     )
-                    if not isinstance(outcome, LiveABCOutcome):
-                        raise GoldenLiveError("live_adapter_returned_invalid_outcome")
-                except Exception as exc:
-                    outcome = LiveABCAdapter._failure(
-                        municipio,
-                        bucket,
-                        kind=LiveCauseKind.INTERNAL_FAILURE,
-                        code=type(exc).__name__,
-                        error=exc,
-                        phase="runner",
+                    artifact_reference = getattr(adapter, "artifact_reference", None)
+                    if callable(artifact_reference):
+                        reference = artifact_reference(municipio, bucket, attempt)
+                        if isinstance(reference, Mapping):
+                            unit_result.update({
+                                key: value for key, value in reference.items()
+                                if key in {"observability_path", "observability_hash"}
+                                and isinstance(value, str)
+                            })
+                    state.record_unit(
+                        municipio=municipio, bucket=bucket,
+                        url=coverage.target_urls[(municipio, bucket)], result=unit_result,
+                        snapshot=_snapshot_from_outcome(outcome),
                     )
-                end_wall = datetime.now(timezone.utc)
-                unit_result = _result_from_outcome(
-                    outcome,
-                    start=start_wall.isoformat(),
-                    end=end_wall.isoformat(),
-                    duration_s=time.monotonic() - start_monotonic,
-                    attempt=attempt,
-                )
-                artifact_reference = getattr(adapter, "artifact_reference", None)
-                if callable(artifact_reference):
-                    reference = artifact_reference(municipio, bucket, attempt)
-                    if isinstance(reference, Mapping):
-                        unit_result.update({
-                            key: value for key, value in reference.items()
-                            if key in {"observability_path", "observability_hash"}
-                            and isinstance(value, str)
-                        })
-                state.record_unit(
-                    municipio=municipio,
-                    bucket=bucket,
-                    url=coverage.target_urls[(municipio, bucket)],
-                    result=unit_result,
-                    snapshot=_snapshot_from_outcome(outcome),
-                )
-                logger.emit(
-                    municipio=municipio,
-                    bucket=bucket,
-                    stage="final",
-                    model="",
-                    provider="local",
-                    status="ok" if unit_result["status"] == "complete" else "error",
-                    error_class=unit_result["error_class"],
-                    error_message=unit_result["error_message"],
-                    final=outcome.decision,
-                )
+                    logger.emit(
+                        municipio=municipio, bucket=bucket, stage="final", model="",
+                        provider="local",
+                        status="ok" if unit_result["status"] == "complete" else "error",
+                        error_class=unit_result["error_class"],
+                        error_message=unit_result["error_message"], final=outcome.decision,
+                    )
+                    if not _should_retry_unit(outcome, attempt=attempt):
+                        break
+                    attempt += 1
+                    reset_unit = getattr(adapter, "reset_unit", None)
+                    if callable(reset_unit):
+                        reset_unit(municipio, bucket)
             outcomes.append(outcome)
             incomplete_tracker.record_terminal(
                 (municipio, bucket),
@@ -1209,7 +1212,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--http-read-timeout", type=float,
-        default=float(os.environ.get("CONCURSOS_HTTP_READ_TIMEOUT", "30")),
+        default=float(os.environ.get("CONCURSOS_HTTP_READ_TIMEOUT", "60")),
     )
     parser.add_argument(
         "--gemini-timeout", type=float,

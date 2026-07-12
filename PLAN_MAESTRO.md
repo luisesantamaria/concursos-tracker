@@ -19,7 +19,14 @@ comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
 - Motor V2 (adjudicación IA): `scripts/fase2_municipios/v2/` — certificador A
   + fiscal B + juez C sobre Gemini flash-lite free, citas literales
   verificadas por código, gate estructural, registro de dominios, render-once
-  SPA. Suite: **419 tests verdes** (`pytest scripts/fase2_municipios/v2`).
+  SPA. Suite: **425 tests verdes** (`pytest scripts/fase2_municipios/v2`).
+- F2.P1 cerrado: snapshot directo 400K, fetch 60s con un reintento transitorio,
+  reintento integral de unidad ante validación inválida y ausencia legítima
+  preservada como `nao_encontrado`/`negative`.
+- F2.P2 cerrado: política de índice en skills (contenedor mixto SÍ, feed-tag
+  SÍ — decisión de Luis 12-jul; sección sin ítems citables del bucket nunca
+  afirmativa) + espejo en fiscal B. sha256 certifier=b2f3fda0…, prosecutor=
+  435e6bff…. Paso exacto siguiente: **F2.P3** (fixture envenenado).
 - Última corrida golden (R3): `staging/fase2_v2/eval/golden36_fable_20260712_r3/`
   → **22/36 match vs golden, 0 FP** (los 14 differ son abstenciones), paid=0,
   84 llamadas free, perfil 2.33 calls/unidad, 22.4K tokens/unidad, 11.6s/unidad.
@@ -87,7 +94,7 @@ wsl.exe ... -m scripts.fase2_municipios.v2.eval.semantic_comparison --run-dir <R
 
 # FASE 2 — Cerrar descubrimiento municipal RS (fase actual)
 
-### F2.P1 — Fixes mecánicos de evidencia/fetch
+### F2.P1 ✅ (12-jul-2026) — Fixes mecánicos de evidencia/fetch
 **ENTRADA**: suite 419 verde.
 **ACCIONES** (cada una con test RED→GREEN):
 1. `MAX_DIRECT_SNAPSHOT_CHARS` 200.000 → 400.000 en
@@ -107,10 +114,9 @@ wsl.exe ... -m scripts.fase2_municipios.v2.eval.semantic_comparison --run-dir <R
 **SI FALLA** (algún fix rompe otra cosa): revertir SOLO ese fix, documentar,
 continuar con los demás — ninguno depende de otro.
 
-### F2.P2 — Política de índice (2 reglas generales en skills)
-**ENTRADA**: decisión de Luis registrada (estado 12-jul: contenedor mixto =
-SÍ, ya implícito en el principio "content over slug"; feed-tag = pendiente,
-default recomendado SÍ).
+### F2.P2 ✅ (12-jul-2026) — Política de índice (2 reglas generales en skills)
+**ENTRADA**: decisión de Luis registrada (12-jul: contenedor mixto = SÍ;
+feed-tag = **SÍ, confirmado por Luis**).
 **ACCIONES**: en `skills/fase2-resource-certifier/SKILL.md` añadir (general,
 sin municipios): (a) contenedor oficial mixto cuenta como índice del bucket
 SI contiene ítems citables del bucket; (b) feed/tag oficial agregador cuenta
@@ -391,7 +397,7 @@ gastar en F7 — los datos de RS ya sostienen el aprendizaje.
 ---
 
 ## Decisiones pendientes registradas (dueño: Luis)
-1. Feed-tag oficial como índice válido (F2.P2) — default recomendado: SÍ.
+1. ~~Feed-tag oficial como índice válido (F2.P2)~~ — **RESUELTA 12-jul: SÍ**.
 2. Las 6 confirmaciones con `requiere_revision_humana` (F2.P5): ¿match válido?
 3. Autorización del holdout 50 (F2.P6) y de la corrida 497 (F2.P8).
 4. Presupuesto pagado para producción tras la sonda de cuota (F2.P7).
