@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <title>Documentos: Concurso Público</title>
+  <script src="/assets/jquery.dataTables.min.js"></script>
+</head>
+<body>
+  <h1>Documentos: Concurso Público</h1>
+  <table id="documentos"><thead><tr><th>Título</th></tr></thead><tbody></tbody></table>
+  <script>
+    $('#documentos').DataTable({
+      processing: true,
+      serverSide: true,
+      ajax: {
+        url: '/licitacoes/entidades/rs/fortalezadosvalos/documentos',
+        type: 'GET'
+      },
+      columns: [
+        {data: 'tipo'},
+        {data: 'numero'},
+        {data: 'titulo'},
+        {data: 'data_inicio'},
+        {data: 'arquivo'},
+        {data: 'ano'}
+      ]
+    });
+  </script>
+</body>
+</html>

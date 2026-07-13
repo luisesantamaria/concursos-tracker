@@ -1,0 +1,16 @@
+{
+  "fixture_provenance": {
+    "kind": "sanitized offline contract fixture",
+    "source_note": "The mission report did not preserve the real Camaqua XHR body or endpoint; titles come from a verified rendered Atende holdout excerpt and URLs are fixture-only.",
+    "not_a_live_capture": true
+  },
+  "resultado": {
+    "itens": [
+      {"titulo": "Processo Seletivo Simplificado 01/2026", "arquivo": "/fixture-documentos/pss-01-2026.pdf"},
+      {"titulo": "Processo Seletivo Simplificado no 02/2026", "arquivo": "/fixture-documentos/pss-02-2026.pdf"},
+      {"titulo": "Processo Seletivo Simplificado no 03/2026", "arquivo": "/fixture-documentos/pss-03-2026.pdf"},
+      {"titulo": "Processos Seletivos", "arquivo": "#"},
+      {"titulo": "Por favor, aguarde...", "arquivo": "/fixture-documentos/loader.pdf"}
+    ]
+  }
+}
