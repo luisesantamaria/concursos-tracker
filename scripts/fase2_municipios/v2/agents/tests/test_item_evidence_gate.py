@@ -142,7 +142,6 @@ def test_canela_processo_seletivo_real_raw_is_unaffected_not_affirmative() -> No
         "Edital no. 12/2026",
         "Concurso Público num. 7/2026",
         "Resultado Final do Concurso 01/2026",
-        "Seleção Pública 2026",  # keyword + ano adyacente, sin numero/ano
         "Processo de Seleção 004/2026",
         "EDITAL 001/2026",
         "concurso publico 5/26",  # sin acentos, ano de 2 digitos
@@ -164,6 +163,9 @@ def test_item_positive_quotes_are_recognized(quote: str) -> None:
         "Portal da Transparência | Município de Canela",  # sin keyword
         "001/2026",  # marcador sin keyword de bucket
         "Recursos Humanos",
+        # Un año aislado identifica una sección anual, no un ítem publicado.
+        "Seleção Pública 2026",
+        "PROCESSOS SELETIVOS 2026",
     ],
 )
 def test_non_item_positive_quotes_are_rejected(quote: str) -> None:

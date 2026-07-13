@@ -290,6 +290,65 @@ def test_ssl_error_distinct_from_incomplete_chain_never_attempts_recovery(
         OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=1)
 
 
+def test_tls_handshake_timeout_waits_three_seconds_and_retries_once(
+    monkeypatch,
+) -> None:
+    """Seberi/PSS: transient _ssl handshake timeout has its own retry path."""
+
+    attempts = []
+    success = FakeConnection(FakeResponse(html_bytes()))
+
+    def timeout_request(*args, **kwargs):
+        raise TimeoutError("_ssl.c:1063: The handshake operation timed out")
+
+    failing = FakeConnection(FakeResponse(b""))
+    failing.request = timeout_request
+
+    def connection(parsed, timeout_seconds, ssl_context=None):
+        attempts.append(ssl_context)
+        return failing if len(attempts) == 1 else success
+
+    sleeps = []
+    monkeypatch.setattr(OrionHTTPFetcher, "_connection", staticmethod(connection))
+    monkeypatch.setattr(live.time, "sleep", sleeps.append)
+
+    def aia_must_not_run(*args, **kwargs):
+        raise AssertionError("handshake timeout must not use AIA recovery")
+
+    monkeypatch.setattr(live, "_recover_ssl_context_via_aia", aia_must_not_run)
+
+    fetched = OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=1)
+
+    assert fetched.html == fx.HTML
+    assert attempts == [None, None]
+    assert sleeps == [3.0]
+
+
+def test_tls_handshake_timeout_propagates_after_single_retry(monkeypatch) -> None:
+    attempts = []
+    original = TimeoutError("_ssl.c:1063: The handshake operation timed out")
+
+    def timeout_request(*args, **kwargs):
+        raise original
+
+    def connection(parsed, timeout_seconds, ssl_context=None):
+        attempts.append(ssl_context)
+        failing = FakeConnection(FakeResponse(b""))
+        failing.request = timeout_request
+        return failing
+
+    sleeps = []
+    monkeypatch.setattr(OrionHTTPFetcher, "_connection", staticmethod(connection))
+    monkeypatch.setattr(live.time, "sleep", sleeps.append)
+
+    with pytest.raises(TimeoutError) as raised:
+        OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=1)
+
+    assert raised.value is original
+    assert attempts == [None, None]
+    assert sleeps == [3.0]
+
+
 # ---------------------------------------------------------------------------
 # AIA plumbing: parsing + bundle construction, exercised with real certs
 # (generated in-memory, never touching the network -- no_network still holds).

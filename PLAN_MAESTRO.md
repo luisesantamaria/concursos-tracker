@@ -238,7 +238,41 @@ aparece `quota_429` (`approx_rpd` ya se mide).
 trivial); free queda para desarrollo.
 
 ### F2.P8 — Corrida 497 RS completa
-**ENTRADA**: F2.P6 verde.
+**ENTRADA (GATE DE LUIS, 13-jul-2026 — BLOQUEANTE)**: el holdout debe cumplir
+SIMULTÁNEAMENTE: (1) ≥75/88 unidades confirmadas Y RATIFICADAS por auditoría
+(≥85%); (2) cero FP tras auditar TODAS las confirmaciones; (3) ninguna DUDA en
+el numerador; (4) ninguna confirmación bruta cuenta sin verificar evidencia
+item-positiva + autoridad + identidad. Cálculo válido:
+confirmaciones_netas = RATIFICAR; cobertura_neta = RATIFICAR/88 — NUNCA el
+bruto del runner. Tras cada re-corrida: auditar confirmaciones nuevas,
+revalidar los 7 FP conocidos de r2, restar FP y dudas, documentar el neto.
+Si <75/88 o aparece 1 FP: no avanzar, diagnosticar, corrección general,
+fixtures de regresión, nueva iteración en directorio nuevo. **F2.P8 queda
+bloqueada hasta que Luis vea y apruebe el acta que demuestre ≥75/88 RATIFICAR
+y 0 FP.**
+
+**PRE-GATE DE LA CORRIDA r3 (corrección de Luis, 13-jul)**: la corrida live r3
+solo se lanza si la PROYECCIÓN OFFLINE (replay + gates deterministas, con la
+lista de DUDA/REVISAR/NO_ENCONTRADO REGENERADA tras cada replay — nunca
+reutilizar la lista vieja de 10) alcanza ≥75/88 (85%) con 0 FP. Si queda por
+debajo: FASE DE RESCATE GROUNDED antes de r3 — Gemini API, modelo obligatorio
+gemini-2.5-pro (gemini-2.5-flash SOLO si la API rechaza Pro explícitamente),
+herramienta google_search (no Default, no Map Grounding), máximo 5 búsquedas
+grounded por unidad; el grounding PROPONE URLs y evidencia pero NUNCA
+confirma por sí solo — solo cuentan páginas oficiales con evidencia literal
+que pase el gate determinista. Tras el rescate: replay completo + 7/7
+regresiones FP + auditoría de toda confirmación nueva → GO a r3 solo con
+proyección ≥75/88 y 0 FP.
+
+**POLÍTICA COMPUTER USE (Luis, 13-jul)**: reservado para DESPUÉS de agotar
+búsqueda, HTML, endpoints XHR y render automatizado; solo cola residual que
+requiera filtros/botones, JS interactivo, paginación visual, cookies o
+apertura normal de documentos. PROHIBIDO evadir CAPTCHA, antibot,
+autenticación o controles de acceso: ante CAPTCHA → pausa para humano y
+clasificar REVISION_HUMANA_ACCESO_RESTRINGIDO. Tras r3 puede ser última
+adjudicación de residuales con evidencia durable obligatoria: URL
+inicial/final, acciones, texto literal, documento recuperado, veredicto del
+gate.
 **ACCIONES**: correr 497 (menos golden) por lotes de ~50; auditoría muestral
 humana de 50-100 confirmaciones POR LOTE con intervalo de confianza.
 **PRUEBA**: FP=0 en cada muestra; al acumular n≥300 confirmaciones auditadas

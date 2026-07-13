@@ -23,6 +23,11 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import (
 from scripts.fase2_municipios.v2.eval.run_golden_live import main as golden_live_main
 from scripts.fase2_municipios.v2.eval.tests import test_live_abc_error_evidence as fx
 from scripts.fase2_municipios.v2.gemini import gentle_free_only_environment
+from scripts.fase2_municipios.v2.snapshot import (
+    EvidenceSource,
+    anchor_citation,
+    build_snapshot,
+)
 
 
 pytestmark = pytest.mark.offline
@@ -256,6 +261,38 @@ def test_declared_non_utf8_charset_decodes_strictly(monkeypatch) -> None:
     assert fetched.html == html
     assert "Ação" in fetched.content
     assert fetched.decode_diagnostics == ("header_charset:iso8859-1",)
+
+
+def test_iso8859_html_alias_recovers_inhacora_cp1252_dash_for_literal_citation(
+    monkeypatch,
+) -> None:
+    """Inhacora/PSS raw shape: HTTP says Latin-1, body uses cp1252 0x96."""
+
+    quote = "Processo Seletivo Simplificado 08/2021 – Estágio farmácia"
+    html = fx.HTML.replace(
+        "Fixture",
+        "Processo Seletivo Simplificado 08/2021 – Estágio farmácia",
+    )
+    install_connections(
+        monkeypatch,
+        FakeResponse(
+            html.encode("cp1252"),
+            content_type="text/html; charset=iso-8859-1",
+        ),
+    )
+
+    fetched = OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=1)
+    snapshot = build_snapshot((EvidenceSource(
+        source_id="main",
+        url=fetched.final_url,
+        retrieved_at=fetched.retrieved_at,
+        content=fetched.content,
+    ),))
+
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": quote})
+    assert citation.quote == quote
+    assert "\x96" not in fetched.content
+    assert "html_alias:iso8859-1->cp1252" in fetched.decode_diagnostics
 
 
 def test_declared_iso8859_header_with_genuine_utf8_body_prefers_utf8(monkeypatch) -> None:

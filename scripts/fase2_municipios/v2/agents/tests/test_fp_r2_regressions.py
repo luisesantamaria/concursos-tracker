@@ -8,12 +8,14 @@ deterministic item-evidence invariant; they never invoke a model.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
 from scripts.fase2_municipios.v2.agents import certifier
 from scripts.fase2_municipios.v2.agents.base import AgentOutputRejected
+from scripts.fase2_municipios.v2.eval import live_abc_adapter
 
 
 pytestmark = pytest.mark.offline
@@ -68,36 +70,14 @@ def test_canela_concurso_publico_real_raw_rejects_filter_label() -> None:
     _assert_item_evidence_rejection(_CANELA_CONCURSO_PUBLICO_A_RAW)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bucket citation 'PROCESSOS SELETIVOS 2026' is an annual menu label, "
-        "but the keyword-adjacent-year pattern treats it as item-positive"
-    ),
-)
 def test_gramado_xavier_processo_seletivo_real_raw_rejects_annual_menu() -> None:
     _assert_item_evidence_rejection(_GRAMADO_XAVIER_PROCESSO_SELETIVO_A_RAW)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "combined page cites 'CONCURSO PÚBLICO - Edital 01/2024' and "
-        "'Processo Seletivo 2023'; both match current item-marker patterns "
-        "even though the audit found only labels/menus"
-    ),
-)
 def test_nova_santa_rita_concurso_publico_real_raw_rejects_menu_entries() -> None:
     _assert_item_evidence_rejection(_NOVA_SANTA_RITA_CONCURSO_PUBLICO_A_RAW)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bucket citation 'Processos Seletivos 2025' is an annual menu label, "
-        "but the keyword-adjacent-year pattern treats it as item-positive"
-    ),
-)
 def test_nova_santa_rita_processo_seletivo_real_raw_rejects_annual_menu() -> None:
     _assert_item_evidence_rejection(_NOVA_SANTA_RITA_PROCESSO_SELETIVO_A_RAW)
 
@@ -106,12 +86,98 @@ def test_palmitinho_concurso_publico_real_raw_rejects_service_heading() -> None:
     _assert_item_evidence_rejection(_PALMITINHO_CONCURSO_PUBLICO_A_RAW)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "bucket citation 'Processo Seletivo 2025' is a section/year label, "
-        "but the keyword-adjacent-year pattern treats it as item-positive"
-    ),
-)
 def test_progresso_processo_seletivo_real_raw_rejects_section_year_label() -> None:
     _assert_item_evidence_rejection(_PROGRESSO_PROCESSO_SELETIVO_A_RAW)
+
+
+def test_keyword_plus_year_only_is_not_item_positive() -> None:
+    assert certifier._is_item_positive_quote("PROCESSOS SELETIVOS 2026") is False
+
+
+def test_keyword_plus_number_year_is_item_positive() -> None:
+    assert certifier._is_item_positive_quote("Processo Seletivo 001/2026") is True
+
+
+def test_keyword_plus_full_date_is_item_positive() -> None:
+    assert certifier._is_item_positive_quote("Edital publicado em 13/07/2026") is True
+
+
+def _single_bucket_output(quote: str) -> dict[str, Any]:
+    return {
+        "decision": "indice_oficial",
+        "bucket": "concurso_publico",
+        "citations": [
+            {"dimension": "authority", "quote": "MUNICÍPIO DE EXEMPLO", "source_id": "main"},
+            {"dimension": "identity", "quote": "MUNICÍPIO DE EXEMPLO", "source_id": "main"},
+            {"dimension": "page_role", "quote": "Concursos Públicos", "source_id": "main"},
+            {"dimension": "stability", "quote": "Arquivo", "source_id": "main"},
+            {"dimension": "bucket", "quote": quote, "source_id": "main"},
+        ],
+    }
+
+
+def _with_navigation_metadata(
+    output: dict[str, Any],
+    *,
+    html: str,
+    source_text: str,
+) -> dict[str, Any]:
+    fetched = live_abc_adapter.FetchedEvidence(
+        requested_url="https://example.invalid/concursos",
+        final_url="https://example.invalid/concursos",
+        retrieved_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        status=200,
+        content=source_text,
+        html=html,
+        title="Concursos Públicos",
+    )
+    snapshot, _ = live_abc_adapter.LiveABCAdapter._snapshots(fetched)
+    return certifier._prepare_certifier_output(snapshot, output)
+
+
+def test_item_citation_occurring_only_in_navigation_is_rejected() -> None:
+    quote = "CONCURSO PÚBLICO - Edital 01/2024"
+    output = _with_navigation_metadata(
+        _single_bucket_output(quote),
+        html=(
+            f"<header><a>{quote}</a></header>"
+            "<main>MUNICÍPIO DE EXEMPLO Concursos Públicos Arquivo</main>"
+        ),
+        source_text=f"{quote} MUNICÍPIO DE EXEMPLO Concursos Públicos Arquivo",
+    )
+    _assert_item_evidence_rejection(output)
+
+
+def test_item_citation_occurring_in_navigation_and_body_is_accepted() -> None:
+    quote = "CONCURSO PÚBLICO - Edital 01/2024"
+    output = _with_navigation_metadata(
+        _single_bucket_output(quote),
+        html=(
+            f"<nav><a>{quote}</a></nav>"
+            f"<main>MUNICÍPIO DE EXEMPLO Concursos Públicos Arquivo {quote}</main>"
+        ),
+        source_text=(
+            f"{quote} MUNICÍPIO DE EXEMPLO Concursos Públicos Arquivo {quote}"
+        ),
+    )
+    certifier._certifier_invariants(output)
+
+
+def test_navigation_zone_extractor_covers_landmarks_and_class_id_hints() -> None:
+    zone_texts = live_abc_adapter._navigation_zone_texts(
+        "<header>Cabeçalho</header>"
+        "<footer>Rodapé</footer>"
+        "<aside>Lateral</aside>"
+        "<div class='primary-menu'>Menu</div>"
+        "<section id='main-navigation'>Navegação</section>"
+        "<div class='sidebar'>Barra lateral</div>"
+        "<div id='megaMenu'>Mega menu</div>"
+        "<main>Conteúdo real</main>"
+    )
+    combined = " | ".join(zone_texts)
+    for expected in (
+        "Cabeçalho", "Rodapé", "Lateral", "Menu",
+        "Navegação", "Barra lateral", "Mega menu",
+    ):
+        assert expected in combined
+    assert "Conteúdo real" not in combined

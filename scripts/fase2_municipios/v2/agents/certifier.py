@@ -76,8 +76,9 @@ _ABSENCE_MESSAGE_PATTERNS = tuple(
 # "ITEM-POSITIVO": una cita de bucket confirmatoria debe contener una
 # keyword de bucket content-neutral (edital/concurso/processo seletivo o
 # simplificado/selecao) Y ADEMAS un marcador de instancia (numero de
-# edital, par numero/ano, fecha completa, o un ano de 4 digitos pegado a la
-# keyword). Filosofia identica a ITEM_MARKER_PATTERN en
+# edital, par numero/ano o fecha completa). Un ano aislado junto a la keyword
+# es un rotulo anual de seccion, no una instancia publicada. Filosofia
+# identica a ITEM_MARKER_PATTERN en
 # eval/platform_probe_runner.py (ya validado ahi: exige keyword + numero/ano
 # adyacente para que una pagina cuente como indice estructural), replicada
 # aqui de forma independiente y self-contained para una cita individual
@@ -99,11 +100,6 @@ _ITEM_INSTANCE_MARKER_PATTERN = re.compile(
     r"|\d{1,4}\s*/\s*\d{2,4}"        # 001/2026 (numero/ano)
     r"|\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4}"  # dd/mm/yyyy
     r")"
-)
-_ITEM_KEYWORD_YEAR_ADJACENT_PATTERN = re.compile(
-    r"\b(?:editais|edital|concursos?|processos?\s+seletivos?"
-    r"|processos?\s+simplificados?|selecao|selecoes)\b"
-    r"[^\d\n]{0,40}\b20\d{2}\b"
 )
 
 
@@ -132,23 +128,82 @@ def _is_item_positive_quote(quote: str) -> bool:
 
     Requires a bucket keyword (edital/concurso/processo seletivo or
     simplificado/selecao) AND an instance marker: a numbered reference
-    (nº/n°/no./num. + digits), a numero/ano pair (001/2026), a full date
-    (dd/mm/yyyy), or a 4-digit year adjacent to the keyword. A quote that is
-    merely a filter/category LABEL (e.g. "Concurso ou Processo Seletivo")
-    has the keyword but no instance marker and fails this check -- it names
-    a category, it does not point at a published item. Matching is case-
-    and accent-insensitive and content-neutral (no municipio/platform
-    hardcoding), mirroring ITEM_MARKER_PATTERN in
-    eval/platform_probe_runner.py.
+    (nº/n°/no./num. + digits), a numero/ano pair (001/2026), or a full date
+    (dd/mm/yyyy). A quote that is merely a filter/category/annual LABEL (e.g.
+    "Concurso ou Processo Seletivo" or "Processos Seletivos 2026") has the
+    keyword but no instance marker and fails this check -- it names a
+    category, it does not point at a published item. Matching is case- and
+    accent-insensitive and content-neutral (no municipio/platform hardcoding),
+    mirroring ITEM_MARKER_PATTERN in eval/platform_probe_runner.py.
     """
     if not isinstance(quote, str) or not quote:
         return False
     folded = _fold_accents(quote).lower()
     if not _ITEM_KEYWORD_PATTERN.search(folded):
         return False
-    if _ITEM_INSTANCE_MARKER_PATTERN.search(folded):
-        return True
-    return bool(_ITEM_KEYWORD_YEAR_ADJACENT_PATTERN.search(folded))
+    return bool(_ITEM_INSTANCE_MARKER_PATTERN.search(folded))
+
+
+def _visible_text(value: str) -> str:
+    """Normalize HTML-derived visible text without touching citation offsets."""
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", value)).strip()
+
+
+class _PreparedCertifierOutput(dict[str, Any]):
+    """Schema-identical output carrying non-serialized snapshot metadata.
+
+    ``AgentRunner`` validates this object as the same mapping returned by the
+    model: navigation metadata lives on attributes, never as mapping keys, so
+    the public JSON schema and persisted proposal remain unchanged.
+    """
+
+    navigation_zone_texts: Mapping[str, tuple[str, ...]]
+    source_texts: Mapping[str, str]
+
+    def __init__(
+        self,
+        value: Mapping[str, Any],
+        *,
+        navigation_zone_texts: Mapping[str, tuple[str, ...]],
+        source_texts: Mapping[str, str],
+    ) -> None:
+        super().__init__(value)
+        self.navigation_zone_texts = navigation_zone_texts
+        self.source_texts = source_texts
+
+
+def _quote_occurs_only_in_navigation(
+    quote: str,
+    source_id: str,
+    *,
+    navigation_zone_texts: Mapping[str, tuple[str, ...]],
+    source_texts: Mapping[str, str],
+) -> bool:
+    """Return True only when every visible occurrence belongs to navigation.
+
+    Navigation zones are structural HTML containers (nav/header/footer/aside
+    or menu/nav/sidebar/megamenu-like class/id) extracted by the live adapter.
+    Metadata is optional for backward compatibility. A syntactically valid
+    item citation is excluded only if it occurs in at least one such zone and
+    the complete snapshot text has no additional occurrence outside them. If
+    the same literal also appears in body content, it remains admissible.
+    Text normalization is used only for containment/counting; stored source
+    content and citation offsets are never modified.
+    """
+    zones = navigation_zone_texts.get(source_id, ())
+    source_text = source_texts.get(source_id, "")
+    if not zones or not source_text:
+        return False
+    normalized_quote = _visible_text(quote)
+    if not normalized_quote:
+        return False
+    navigation_occurrences = sum(
+        _visible_text(zone).count(normalized_quote) for zone in zones
+    )
+    if navigation_occurrences == 0:
+        return False
+    total_occurrences = _visible_text(source_text).count(normalized_quote)
+    return 0 < total_occurrences <= navigation_occurrences
 
 
 def _certifier_citations(output: Mapping[str, Any]) -> tuple[Citation, ...]:
@@ -166,7 +221,18 @@ def _certifier_citations(output: Mapping[str, Any]) -> tuple[Citation, ...]:
 def _prepare_certifier_output(
     snapshot: EvidenceSnapshot, output: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    prepared = copy.deepcopy(dict(output))
+    raw_navigation_metadata = getattr(snapshot, "navigation_zone_texts", {})
+    navigation_zone_texts = (
+        raw_navigation_metadata
+        if isinstance(raw_navigation_metadata, Mapping)
+        else {}
+    )
+    source_texts = {source.source_id: source.content for source in snapshot.sources}
+    prepared = _PreparedCertifierOutput(
+        copy.deepcopy(dict(output)),
+        navigation_zone_texts=navigation_zone_texts,
+        source_texts=source_texts,
+    )
     failures: list[CitationVerificationError] = []
     for item in prepared["citations"]:
         # Politica 12-jul (aprobada por Luis): el modelo entrega source_id+quote
@@ -197,6 +263,14 @@ def _prepare_certifier_output(
 
 
 def _certifier_invariants(output: Mapping[str, Any]) -> None:
+    """Enforce fail-closed confirmation evidence, including navigation origin.
+
+    A bucket quote must be item-positive and cannot count when its literal text
+    appears exclusively inside navigation zones supplied as optional snapshot
+    metadata. The metadata contract is backward compatible: snapshots without
+    it retain the pre-existing content checks. If the literal also occurs in
+    non-navigation body content, it counts normally.
+    """
     decision = output.get("decision")
     if decision not in AFFIRMATIVE_CERTIFIER_DECISIONS:
         return
@@ -229,9 +303,22 @@ def _certifier_invariants(output: Mapping[str, Any]) -> None:
             role="certifier",
             reason="indice_vacio_sin_items",
         )
+    navigation_zone_texts = getattr(output, "navigation_zone_texts", {})
+    source_texts = getattr(output, "source_texts", {})
     item_positive_bucket_quotes = {
         quote for quote in non_absence_bucket_quotes
         if _is_item_positive_quote(quote)
+        and any(
+            item.get("quote") == quote
+            and not _quote_occurs_only_in_navigation(
+                quote,
+                str(item.get("source_id", "")),
+                navigation_zone_texts=navigation_zone_texts,
+                source_texts=source_texts,
+            )
+            for item in citations
+            if item.get("dimension") == "bucket"
+        )
     }
     if not item_positive_bucket_quotes:
         # R-T1 iteracion 2 (FP real Canela/concurso_publico, holdout 12-jul,
@@ -301,7 +388,7 @@ def _item_evidence_repair_instruction(reason: str) -> str:
         "item real: nombra una categoria, no apunta a un item publicado. "
         "Reenvia el JSON COMPLETO con el mismo schema: si la pagina SI "
         "muestra un concurso/processo seletivo/edital especifico (con "
-        "numero, par numero/ano, fecha o ano), cita ESE texto literal como "
+        "numero, par numero/ano o fecha completa), cita ESE texto literal como "
         "evidencia de bucket. Si la pagina NO muestra ningun item real "
         "(solo filtros/categorias vacias), cambia tu decision a 'revisar' "
         "-- no repitas la misma cita de etiqueta. No inventes contenido que "

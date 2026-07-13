@@ -109,6 +109,22 @@ from scripts.fase2_municipios.v2.snapshot import (
 VALID_BUCKETS = frozenset({"concurso_publico", "processo_seletivo"})
 
 
+@dataclass(frozen=True)
+class _NavigationEvidenceSnapshot(EvidenceSnapshot):
+    """Evidence snapshot plus optional structural navigation metadata.
+
+    ``navigation_zone_texts`` is deliberately outside the content-addressed
+    evidence payload: it annotates where visible strings came from but never
+    changes source content, hashes, literal quotes, or character offsets.
+    Consumers using the base ``EvidenceSnapshot`` contract remain compatible.
+    """
+
+    navigation_zone_texts: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+
 class LiveABCConfigurationError(ValueError):
     """The live adapter cannot run safely with the supplied configuration."""
 
@@ -223,6 +239,28 @@ _MOJIBAKE_UTF8_FINGERPRINT_MIN_MATCHES = 3
 _PERMISSIVE_SINGLE_BYTE_CHARSETS = frozenset({"iso8859-1", "cp1252"})
 
 
+def _decode_declared_html_single_byte(
+    payload: bytes, canonical_header: str
+) -> tuple[str, str]:
+    """Decode a declared single-byte HTML charset with the WHATWG alias.
+
+    Browsers interpret the ``iso-8859-1`` label as Windows-1252.  Municipal
+    portals commonly rely on that behavior for bytes 0x80-0x9F (for example,
+    0x96 is an en dash in cp1252 but a non-printing C1 control in Latin-1).
+    Only use the alias when such a byte is actually present, and fall back to
+    strict ISO-8859-1 if cp1252 cannot represent an undefined C1 byte.
+    """
+
+    if canonical_header == "iso8859-1" and any(
+        0x80 <= byte <= 0x9F for byte in payload
+    ):
+        try:
+            return payload.decode("cp1252"), "html_alias:iso8859-1->cp1252"
+        except UnicodeDecodeError:
+            pass
+    return payload.decode(canonical_header), f"header_charset:{canonical_header}"
+
+
 def _decode_response_payload(
     payload: bytes, declared_charset: str | None
 ) -> tuple[str, tuple[str, ...]]:
@@ -284,9 +322,12 @@ def _decode_response_payload(
 
     if canonical_header is not None:
         try:
-            return payload.decode(canonical_header), tuple(
-                (f"header_charset:{canonical_header}", *diagnostics)
+            response_text, decode_source = _decode_declared_html_single_byte(
+                payload, canonical_header
+            ) if canonical_header in _PERMISSIVE_SINGLE_BYTE_CHARSETS else (
+                payload.decode(canonical_header), f"header_charset:{canonical_header}"
             )
+            return response_text, tuple((decode_source, *diagnostics))
         except UnicodeDecodeError:
             # Charset DECLARADO que miente (comunisimo en portales municipales:
             # header utf-8 con bytes latin-1/cp1252, caso Porto Alegre). No se
@@ -399,6 +440,7 @@ def _looks_like_html_or_text(head: bytes) -> bool:
 # peticion real), seguir su URI de CA Issuers, descargar el intermedio y
 # verificar el reintento contra un bundle temporal certifi+intermedio.
 _SSL_INCOMPLETE_CHAIN_MESSAGE = "unable to get local issuer certificate"
+_TLS_HANDSHAKE_TIMEOUT_MESSAGE = "handshake operation timed out"
 
 
 def _is_incomplete_chain_error(exc: ssl.SSLCertVerificationError) -> bool:
@@ -409,6 +451,15 @@ def _is_incomplete_chain_error(exc: ssl.SSLCertVerificationError) -> bool:
 
     message = (getattr(exc, "verify_message", "") or str(exc)).lower()
     return _SSL_INCOMPLETE_CHAIN_MESSAGE in message
+
+
+def _is_tls_handshake_timeout(exc: BaseException) -> bool:
+    """Recognize only the transient TLS-handshake timeout variant of SSLError."""
+
+    return (
+        isinstance(exc, TimeoutError)
+        and _TLS_HANDSHAKE_TIMEOUT_MESSAGE in str(exc).lower()
+    )
 
 
 def _fetch_leaf_certificate_der(host: str, port: int, timeout: float) -> bytes:
@@ -731,7 +782,9 @@ class OrionHTTPFetcher:
             # nunca en tests que no la ejercitan -- ver comentario en
             # _connection sobre no pasar el kwarg salvo que sea necesario).
             ssl_context_override = None
-            for fetch_attempt in range(2):
+            handshake_timeout_retried = False
+            transport_retry_used = False
+            while True:
                 connection = (
                     self._connection(parsed, connect_timeout, ssl_context=ssl_context_override)
                     if ssl_context_override is not None
@@ -758,9 +811,22 @@ class OrionHTTPFetcher:
                     ssl_context_override = recovered_context
                     ssl_aia_recovered = True
                     continue
-                except (TimeoutError, OSError):
-                    if fetch_attempt == 1:
+                except TimeoutError as exc:
+                    if parsed.scheme == "https" and _is_tls_handshake_timeout(exc):
+                        if handshake_timeout_retried:
+                            raise
+                        handshake_timeout_retried = True
+                        time.sleep(3.0)
+                        continue
+                    if transport_retry_used:
                         raise
+                    transport_retry_used = True
+                    continue
+                except OSError:
+                    if transport_retry_used:
+                        raise
+                    transport_retry_used = True
+                    continue
                 finally:
                     connection.close()
             status = response.status
@@ -889,24 +955,41 @@ def _is_thin_shell(page: "cascade.Page") -> bool:
 #     the item vocabulary never appears anywhere in the served text.
 #   * nav_heavy -- platform-agnostic: the item vocabulary is either absent
 #     everywhere, or present only inside a persistent-navigation container
-#     (<nav>/<header>/<footer>, or a menu/nav/submenu/breadcrumb class or id
+#     (<nav>/<header>/<footer>/<aside>, or a menu/nav/submenu/breadcrumb/
+#     sidebar/megamenu class or id
 #     -- the same convention atende.net's own "menu-item"/"menu_central"
 #     follows, not a hardcode for that one platform).
 #
 # A page whose real listing lives in the body always keeps its item markers
 # outside those containers, so neither signal fires on an already-working
 # index page (verified live against chiapetta.rs.gov.br and crissiumal.rs.gov.br).
+_BUCKET_KEYWORD_RE = re.compile(
+    r"\b(?:concursos?(?:\s+p[u\u00fa]blicos?)?"
+    r"|processos?\s+seletivos?(?:\s+simplificados?)?"
+    r"|pss|sele[c\u00e7][a\u00e3]o\s+p[u\u00fa]blica)\b",
+    re.IGNORECASE,
+)
 _ITEM_MARKER_RE = re.compile(
-    r"(edital|concurso|processos?\s+seletivos?|pss)\b[^\n]{0,40}?"
-    r"(n[ºo°.]?\s*\d{1,4}\b|\d{1,4}\s*/\s*\d{2,4})",
+    r"\b(?:edital|concursos?(?:\s+p[u\u00fa]blicos?)?"
+    r"|processos?\s+seletivos?(?:\s+simplificados?)?|pss"
+    r"|sele[c\u00e7][a\u00e3]o\s+p[u\u00fa]blica)\b"
+    r"(?:(?!\blei\b)[^\n]){0,80}?"
+    r"(?:n(?:\u00c2)?(?:[\u00ba\u00b0o.]|ro\.?)?\s*\d{1,4}\b"
+    r"|(?<![\d.])\d{1,4}\s*/\s*\d{4}\b"
+    r"|(?<!\d)\d{1,2}\s*[/.-]\s*\d{1,2}\s*[/.-]\s*\d{2,4}\b)",
     re.IGNORECASE,
 )
 
+_FORM_OR_SELECT_RE = re.compile(r"<(?:form|select)\b", re.IGNORECASE)
+_SNAPSHOT_MIN_TEXT_CHARS = 50
+_SNAPSHOT_MIN_HTML_BYTES = 5 * 1024
+_WAIT_PLACEHOLDER_RE = re.compile(r"por\s+favor,?\s*aguarde", re.IGNORECASE)
+
 _ATENDE_HOST_SUFFIX = ".atende.net"
 
-_NAV_LANDMARK_TAGS = {"nav", "header", "footer"}
+_NAV_LANDMARK_TAGS = {"nav", "header", "footer", "aside"}
 _SKIP_CONTENT_TAGS = {"script", "style"}
-_NAV_HINT_RE = re.compile(r"\b(menu|nav|submenu|breadcrumb)\b", re.IGNORECASE)
+_NAV_HINT_RE = re.compile(r"menu|nav|sidebar|megamenu|breadcrumb", re.IGNORECASE)
 
 # Cap on how much HTML the nav-aware extractor walks: mirrors the same
 # safety valve _page_from_html applies to its SPA-marker scan, so a
@@ -937,12 +1020,15 @@ class _NavAwareTextExtractor(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._skip_depth = 0
-        self._stack: list[tuple[str, bool]] = []
+        self._navigation_depth = 0
+        self._content_skip_depth = 0
+        self._stack: list[tuple[str, bool, bool, bool]] = []
         self._chunks: list[str] = []
+        self._navigation_zones: list[list[str]] = []
+        self._active_navigation_zone: list[str] | None = None
 
-    def _is_skippable(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
-        if tag in _NAV_LANDMARK_TAGS or tag in _SKIP_CONTENT_TAGS:
+    def _is_navigation(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+        if tag in _NAV_LANDMARK_TAGS:
             return True
         for name, value in attrs:
             if name in ("class", "id") and value and _NAV_HINT_RE.search(value):
@@ -950,27 +1036,49 @@ class _NavAwareTextExtractor(HTMLParser):
         return False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        skip = self._is_skippable(tag, attrs)
-        if skip:
-            self._skip_depth += 1
-        self._stack.append((tag, skip))
+        navigation = self._is_navigation(tag, attrs)
+        content_skip = tag in _SKIP_CONTENT_TAGS
+        starts_zone = navigation and self._navigation_depth == 0
+        if starts_zone:
+            self._active_navigation_zone = []
+            self._navigation_zones.append(self._active_navigation_zone)
+        if navigation:
+            self._navigation_depth += 1
+        if content_skip:
+            self._content_skip_depth += 1
+        self._stack.append((tag, navigation, content_skip, starts_zone))
 
     def handle_endtag(self, tag: str) -> None:
         for i in range(len(self._stack) - 1, -1, -1):
             if self._stack[i][0] == tag:
                 popped = self._stack[i:]
                 del self._stack[i:]
-                for _, skip in popped:
-                    if skip and self._skip_depth > 0:
-                        self._skip_depth -= 1
+                for _, navigation, content_skip, starts_zone in reversed(popped):
+                    if content_skip and self._content_skip_depth > 0:
+                        self._content_skip_depth -= 1
+                    if navigation and self._navigation_depth > 0:
+                        self._navigation_depth -= 1
+                    if starts_zone:
+                        self._active_navigation_zone = None
                 break
 
     def handle_data(self, data: str) -> None:
-        if self._skip_depth == 0:
+        if self._content_skip_depth > 0:
+            return
+        if self._navigation_depth == 0:
             self._chunks.append(data)
+        elif self._active_navigation_zone is not None:
+            self._active_navigation_zone.append(data)
 
     def text(self) -> str:
         return re.sub(r"\s+", " ", " ".join(self._chunks)).strip()
+
+    def navigation_texts(self) -> tuple[str, ...]:
+        return tuple(
+            text
+            for chunks in self._navigation_zones
+            if (text := re.sub(r"\s+", " ", " ".join(chunks)).strip())
+        )
 
 
 def _text_outside_nav(html: str) -> str:
@@ -980,6 +1088,22 @@ def _text_outside_nav(html: str) -> str:
     except Exception:
         return ""
     return parser.text()
+
+
+def _navigation_zone_texts(html: str) -> tuple[str, ...]:
+    """Extract visible texts of structural navigation zones.
+
+    These strings are snapshot metadata only: the snapshot's evidence content
+    remains ``page.text`` exactly as before, so existing literal citations and
+    character offsets are unchanged. Malformed/oversized HTML fails open to no
+    metadata; the certifier then retains its backward-compatible checks.
+    """
+    parser = _NavAwareTextExtractor()
+    try:
+        parser.feed((html or "")[:_NAV_EXTRACT_HTML_CHARS])
+    except Exception:
+        return ()
+    return parser.navigation_texts()
 
 
 def _nav_shell_render_trigger(page: "cascade.Page") -> str:
@@ -1008,6 +1132,56 @@ def _nav_shell_render_trigger(page: "cascade.Page") -> str:
     return ""
 
 
+def _residual_render_trigger(page: "cascade.Page") -> str:
+    """Detect generic residual shells missed by SPA/nav heuristics.
+
+    ``snapshot_minimo`` covers tiny successful HTML responses with virtually
+    no extracted text. ``form_sin_items`` covers dynamic indexes whose static
+    response exposes only a bucket selector/form and relies on XHR for rows.
+    Neither signal claims evidence: it only authorizes one render attempt.
+    """
+    if not page.ok:
+        return ""
+    text = (page.text or "").strip()
+    html = page.html or ""
+    if (
+        _FORM_OR_SELECT_RE.search(html)
+        and _BUCKET_KEYWORD_RE.search(text)
+        and not _ITEM_MARKER_RE.search(text)
+    ):
+        return "form_sin_items"
+    if (
+        len(text) < _SNAPSHOT_MIN_TEXT_CHARS
+        and len(html.encode("utf-8")) < _SNAPSHOT_MIN_HTML_BYTES
+    ):
+        return "snapshot_minimo"
+    return ""
+
+
+def _poll_rendered_body(
+    browser_page: Any, *, attempts: int = 24, interval_ms: int = 500
+) -> str:
+    """Poll until an item loads or an observed wait placeholder clears.
+
+    Pages without a loading placeholder must keep polling for XHR rows; the
+    absence of ``aguarde`` on the first sample is not itself a completion
+    signal. The caller still validates the final snapshot fail-closed.
+    """
+    body_text = ""
+    saw_wait_placeholder = False
+    for _ in range(attempts):
+        body_text = browser_page.locator("body").inner_text()
+        stripped = body_text.strip()
+        has_wait_placeholder = bool(_WAIT_PLACEHOLDER_RE.search(stripped))
+        if _ITEM_MARKER_RE.search(stripped):
+            break
+        if saw_wait_placeholder and not has_wait_placeholder:
+            break
+        saw_wait_placeholder = saw_wait_placeholder or has_wait_placeholder
+        browser_page.wait_for_timeout(interval_ms)
+    return body_text
+
+
 def render_page_networkidle(url: str):
     """Render-once V2: como ``cascade.render_page_sync`` pero esperando a que
     el SPA cargue datos reales.
@@ -1015,7 +1189,7 @@ def render_page_networkidle(url: str):
     El render de cascade espera 2000ms fijos tras domcontentloaded; los shells
     de atende.net terminan con title correcto y body VACIO (verificado en vivo
     12-jul: Gramado 0 chars). Aqui: networkidle acotado + sondeo del texto del
-    body hasta ~8s. Reutiliza el browser singleton y el perfil pt-BR de
+    body hasta ~12s. Reutiliza el browser singleton y el perfil pt-BR de
     cascade/playwright_net (neutrales); cascade queda intocado.
     """
     try:
@@ -1051,20 +1225,10 @@ def render_page_networkidle(url: str):
             browser_page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass  # networkidle puede no llegar (polling/analytics); sondeamos.
-        body_text = ""
-        # ~10s poll (mission render_interactivo, 12-jul): wait for real item
-        # markers to appear, or for the "Por favor, aguarde..." loading
-        # placeholder to clear with substantial content behind it. The
-        # atende.net shells resolve their AJAX-loaded listing within ~4-7s
-        # in practice (verified live: lagoabonitadosul/camponovo/estrela).
-        for _ in range(20):
-            body_text = browser_page.locator("body").inner_text()
-            stripped = body_text.strip()
-            if _ITEM_MARKER_RE.search(stripped):
-                break  # real listing content has loaded
-            if len(stripped) >= _THIN_SHELL_MAX_TEXT_CHARS and "aguarde" not in stripped.lower():
-                break  # cleared the loading placeholder with real content
-            browser_page.wait_for_timeout(500)
+        # ~12s poll: wait for an item-positive row loaded by XHR, or for an
+        # actually observed "Por favor, aguarde..." placeholder to clear.
+        # A long selector-only body without the placeholder is not complete.
+        body_text = _poll_rendered_body(browser_page)
         links = browser_page.eval_on_selector_all(
             "a[href]",
             "els => els.map(el => [el.href, (el.innerText || '').trim()])",
@@ -1155,9 +1319,21 @@ class RenderFallbackFetcher:
             html=fetched.html,
             requested_url=fetched.requested_url,
         )
-        nav_trigger = _nav_shell_render_trigger(page)
-        if not (page.is_antibot or page.is_spa or _is_thin_shell(page) or nav_trigger):
+        render_trigger = (
+            _residual_render_trigger(page) or _nav_shell_render_trigger(page)
+        )
+        if not (
+            page.is_antibot or page.is_spa or _is_thin_shell(page) or render_trigger
+        ):
             return fetched
+        if render_trigger:
+            fetched = replace(
+                fetched,
+                decode_diagnostics=(
+                    *fetched.decode_diagnostics,
+                    f"render_trigger={render_trigger}",
+                ),
+            )
         if self._waf.is_frozen(url):
             return fetched  # Provider already frozen: do not burn a pass.
 
@@ -1197,12 +1373,6 @@ class RenderFallbackFetcher:
         if not (strictly_longer or gained_item_markers):
             return fetched
 
-        # render_trigger=... records WHY only for the nav-shell signals (the
-        # trigger tag stays absent, as before, for the pre-existing
-        # antibot/is_spa/_is_thin_shell paths). Inserted before the fixed
-        # "render_fallback_applied" tail so existing ``[-1]`` assertions on
-        # that marker are unaffected.
-        trigger_diagnostics = (f"render_trigger={nav_trigger}",) if nav_trigger else ()
         return replace(
             fetched,
             final_url=rendered.final_url or fetched.final_url,
@@ -1217,7 +1387,7 @@ class RenderFallbackFetcher:
             title=rendered.title or fetched.title,
             evidence_state="renderizada",
             decode_diagnostics=(
-                *fetched.decode_diagnostics, *trigger_diagnostics, "render_fallback_applied",
+                *fetched.decode_diagnostics, "render_fallback_applied",
             ),
         )
 
@@ -1732,7 +1902,14 @@ class LiveABCAdapter:
             retrieved_at=fetched.retrieved_at,
             content=fetched.content,
         )
-        model_snapshot = build_snapshot((source,))
+        base_snapshot = build_snapshot((source,))
+        model_snapshot = _NavigationEvidenceSnapshot(
+            sources=base_snapshot.sources,
+            snapshot_sha256=base_snapshot.snapshot_sha256,
+            navigation_zone_texts={
+                source.source_id: _navigation_zone_texts(fetched.html),
+            },
+        )
         candidate_snapshot = cascade.EvidenceSnapshot(
             html=fetched.html,
             text=fetched.content,

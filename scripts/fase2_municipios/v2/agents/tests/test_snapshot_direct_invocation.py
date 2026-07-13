@@ -145,6 +145,73 @@ def test_direct_certifier_factory_uses_role_schema_without_dialect_marker() -> N
     assert "APPLICATION AGENTSTEP PROTOCOL" not in rendered
 
 
+def test_imbe_real_raw_invented_authority_url_is_rejected_against_portal_snapshot() -> None:
+    """Imbe/PSS run_r2 raw: provenance URL is not literal snapshot content."""
+
+    from scripts.fase2_municipios.v2.agents import build_certifier_agent
+    from scripts.fase2_municipios.v2.agents.tests import test_agents as fixtures
+
+    raw = {
+        "authority": "confirmada",
+        "bucket": "processo_seletivo",
+        "candidate_id": "v1:887d645eb948a49f834a0460c95dc3f249d0dde6",
+        "citations": [
+            {
+                "dimension": "authority",
+                "quote": "https://www.imbe.rs.gov.br/processos-seletivos",
+                "source_field": "provenance",
+                "source_id": "main",
+            },
+            {
+                "dimension": "identity",
+                "quote": "Portal",
+                "source_field": "heading",
+                "source_id": "main",
+            },
+        ],
+        "confidence": "low",
+        "decision": "revisar",
+        "evidence_state": "completa",
+        "identity": "confirmada",
+        "insufficiency": "snapshot_incompleto",
+        "learning_proposal": None,
+        "page_role": "desconocido",
+        "reason": (
+            "O conteúdo do snapshot está vazio ou truncado (apenas a palavra "
+            "'Portal'), impossibilitando a verificação da estrutura de índice."
+        ),
+        "source_kind": "dominio_oficial_prefeitura",
+        "tool_request": None,
+    }
+    snapshot = build_snapshot((EvidenceSource(
+        source_id="main",
+        url="https://www.imbe.rs.gov.br/processos-seletivos",
+        retrieved_at=datetime(2026, 7, 13, 3, 32, 20, tzinfo=timezone.utc),
+        content="Portal",
+    ),))
+    # The direct runner offers one citation-repair round. Replaying the same
+    # real raw output proves both attempts remain fail-closed.
+    transport = fixtures.FakeTransport([raw, raw])
+    limiter, _clock = fixtures.limiter_with_fake_clock()
+    agent = build_certifier_agent(
+        transport=transport,
+        limiter=limiter,
+        repo_root=fixtures.REPO_ROOT,
+        invocation_mode="direct",
+    )
+
+    result = agent.certify(snapshot=snapshot, task="Certify Imbé PSS.")
+
+    assert isinstance(result, base.SnapshotInvalidOutput)
+    assert result.code == "AgentOutputRejected"
+    assert result.original_exception.reason == "citation_verification_failed:1"
+    failures = result.original_exception.__cause__.failures
+    assert [(failure.reason, failure.quote_preview) for failure in failures] == [
+        ("quote_not_found", "https://www.imbe.rs.gov.br/processos-seletivos"[:48])
+    ]
+    assert len(transport.requests) == 2
+
+
 def test_truncated_inline_snapshot_can_never_support_affirmative_output() -> None:
     content = "Official index" + ("x" * 400_001)
     snapshot = build_snapshot((EvidenceSource(
