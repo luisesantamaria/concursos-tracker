@@ -783,8 +783,12 @@ def run_rescue(
     interruption: InterruptionState | None = None,
     timestamp_factory: Callable[[], str] = _utc_timestamp,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
-    if model != REQUIRED_MODEL:
-        raise ValueError(f"model_debe_ser_{REQUIRED_MODEL}")
+    if model not in (REQUIRED_MODEL, FALLBACK_MODEL):
+        # FALLBACK_MODEL autorizado por Luis (13-jul): canary independiente
+        # confirmó que gemini-2.5-pro tiene limit=0 en free tier
+        # (429 generate_content_free_tier_requests); Pro queda no disponible
+        # para free durante toda la corrida, sin reintentos por unidad.
+        raise ValueError(f"model_debe_ser_{REQUIRED_MODEL}_o_{FALLBACK_MODEL}")
     if not 1 <= max_searches <= MAX_POLICY_SEARCHES:
         raise ValueError("max_searches_debe_estar_entre_1_y_5")
     policy = {
