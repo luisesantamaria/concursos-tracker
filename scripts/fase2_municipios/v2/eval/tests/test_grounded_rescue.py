@@ -23,6 +23,7 @@ from scripts.fase2_municipios.v2.eval.grounded_rescue import (
     _clean_url,
     _new_redirect_session,
     build_queries,
+    dispatch_f3_adapter,
     extract_answer_url_sources,
     load_grounded_credentials,
     micro_acquire_unit,
@@ -119,6 +120,250 @@ class HttpError(RuntimeError):
         super().__init__(message)
         self.response = SimpleNamespace(status_code=status, headers=headers or {})
         self.pro_rejected = pro_rejected
+
+
+class Multi24AcquisitionTests(unittest.TestCase):
+    ENTRY_URL = (
+        "https://sistemas.progresso.rs.gov.br/multi24/sistemas/transparencia/index"
+        "?entidade=1&secao=dinamico&id=6146"
+    )
+    CHILD_URL = (
+        "https://sistemas.progresso.rs.gov.br/multi24/sistemas/transparencia/index"
+        "?entidade=1&secao=dinamico&id=11730"
+    )
+    OFFICIAL_URL = "https://progresso.rs.gov.br"
+    TRANSPARENCIA_URL = f"{OFFICIAL_URL}/transparencia"
+    INVENTED_URL = (
+        "https://sistemas.progresso.rs.gov.br/multi24/sistemas/transparencia/index"
+        "?entidade=1&secao=dinamico&id=999999"
+    )
+    FIXTURES = Path(__file__).parent / "fixtures" / "f3_multi24"
+
+    @classmethod
+    def _fixture(cls, name: str) -> str:
+        return (cls.FIXTURES / name).read_text(encoding="utf-8")
+
+    @classmethod
+    def _official_html(cls, *, linked: bool = True) -> str:
+        anchor = (
+            f'<a href="{cls.ENTRY_URL.replace("&", "&amp;")}">'
+            "Portal da Transparencia</a>"
+            if linked else "<p>Sem enlace para o portal</p>"
+        )
+        return (
+            "<html><head><title>Municipio de Progresso</title></head>"
+            "<body><header><p>Municipio de Progresso</p></header>"
+            f"{anchor}</body></html>"
+        )
+
+    @classmethod
+    def _fetcher(cls, *, linked: bool = True) -> MappingFetcher:
+        return MappingFetcher({
+            cls.ENTRY_URL: FetchResult(
+                200, cls._fixture("progresso_tree.html"), cls.ENTRY_URL
+            ),
+            cls.OFFICIAL_URL: FetchResult(
+                200, cls._official_html(linked=linked), cls.OFFICIAL_URL
+            ),
+            cls.CHILD_URL: FetchResult(
+                200, cls._fixture("progresso_2026.html"), cls.CHILD_URL
+            ),
+            cls.INVENTED_URL: FetchResult(
+                200, "<html>inventada</html>", cls.INVENTED_URL
+            ),
+        })
+
+    def _acquire(
+        self,
+        directory: str,
+        fetcher: MappingFetcher,
+        *,
+        cache: dict | None = None,
+        adapter_dispatcher=dispatch_f3_adapter,
+    ) -> dict:
+        with patch(
+            "scripts.fase2_municipios.v2.eval.grounded_rescue._municipality_site_base",
+            return_value=self.OFFICIAL_URL,
+        ):
+            return micro_acquire_unit(
+                Target("progresso", "concurso_publico", self.ENTRY_URL, "render_incierto"),
+                self.ENTRY_URL,
+                output_dir=Path(directory),
+                fetcher=fetcher,
+                timestamp_run="2026-07-13T12:00:00+00:00",
+                renderer=lambda _url: None,
+                adapter_dispatcher=adapter_dispatcher,
+                multi24_authority_cache=cache,
+            )
+
+    def test_multi24_builds_authority_from_real_official_href(self) -> None:
+        fetcher = self._fetcher()
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self._acquire(directory, fetcher)
+        adapter = payload["adaptador"]
+        self.assertEqual("context_acquired", adapter["acquisition_provenance"]["result"])
+        self.assertEqual(self.ENTRY_URL, adapter["acquisition_provenance"]["official_href"])
+        self.assertEqual(
+            [self.OFFICIAL_URL, self.ENTRY_URL],
+            adapter["acquisition_provenance"]["official_navigation_chain"],
+        )
+        self.assertNotIn(self.TRANSPARENCIA_URL, fetcher.urls)
+        self.assertTrue(adapter["candidates"])
+
+    def test_multi24_depth_one_authority_is_cached_with_its_subpage_snapshot(self) -> None:
+        homepage = (
+            "<html><body><h1>Municipio de Progresso</h1>"
+            f'<a href="{self.TRANSPARENCIA_URL}">Acesso a informacao</a>'
+            "</body></html>"
+        )
+        subpage = (
+            "<html><body><h1>Municipio de Progresso</h1>"
+            f'<a href="{self.ENTRY_URL.replace("&", "&amp;")}">Portal</a>'
+            "</body></html>"
+        )
+        fetcher = self._fetcher(linked=False)
+        fetcher.outcomes[self.OFFICIAL_URL] = FetchResult(200, homepage, self.OFFICIAL_URL)
+        fetcher.outcomes[self.TRANSPARENCIA_URL] = FetchResult(
+            200, subpage, self.TRANSPARENCIA_URL
+        )
+        cache: dict = {}
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._acquire(directory, fetcher, cache=cache)
+            second = self._acquire(directory, fetcher, cache=cache)
+
+        self.assertEqual(1, fetcher.urls.count(self.OFFICIAL_URL))
+        self.assertEqual(1, fetcher.urls.count(self.TRANSPARENCIA_URL))
+        self.assertFalse(first["adaptador"]["acquisition_provenance"]["official_cache_hit"])
+        self.assertTrue(second["adaptador"]["acquisition_provenance"]["official_cache_hit"])
+        self.assertEqual(
+            self.TRANSPARENCIA_URL,
+            second["adaptador"]["acquisition_provenance"]["official_source_url"],
+        )
+
+    def test_multi24_without_official_href_remains_dispatch_refusal(self) -> None:
+        fetcher = self._fetcher(linked=False)
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self._acquire(directory, fetcher)
+        adapter = payload["adaptador"]
+        self.assertEqual([], adapter["candidates"])
+        self.assertEqual(
+            "multi24_authority_or_linked_pages_missing",
+            adapter["refusal_reason"],
+        )
+        self.assertEqual(
+            "official_portal_href_missing",
+            adapter["acquisition_provenance"]["result"],
+        )
+
+    def test_multi24_follows_official_transparency_subpage_for_authority(self) -> None:
+        homepage = (
+            "<html><head><title>Municipio de Progresso</title></head><body>"
+            '<a href="/transparencia">Acesso a Transparencia</a>'
+            "</body></html>"
+        )
+        subpage = (
+            "<html><head><title>Municipio de Progresso - Transparencia</title></head>"
+            "<body><p>Municipio de Progresso</p>"
+            f'<a href="{self.ENTRY_URL.replace("&", "&amp;")}">'
+            "Portal da Transparencia</a></body></html>"
+        )
+        fetcher = self._fetcher(linked=False)
+        fetcher.outcomes[self.OFFICIAL_URL] = FetchResult(200, homepage, self.OFFICIAL_URL)
+        fetcher.outcomes[self.TRANSPARENCIA_URL] = FetchResult(
+            200, subpage, self.TRANSPARENCIA_URL
+        )
+        captured: dict = {}
+
+        def capturing_dispatcher(**kwargs):
+            captured.update(kwargs["context"])
+            return dispatch_f3_adapter(**kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self._acquire(
+                directory,
+                fetcher,
+                adapter_dispatcher=capturing_dispatcher,
+            )
+
+        provenance = payload["adaptador"]["acquisition_provenance"]
+        authority = captured["multi24_authority"]
+        self.assertEqual("context_acquired", provenance["result"])
+        self.assertEqual(self.TRANSPARENCIA_URL, provenance["official_source_url"])
+        self.assertEqual(
+            [self.OFFICIAL_URL, self.TRANSPARENCIA_URL, self.ENTRY_URL],
+            provenance["official_navigation_chain"],
+        )
+        self.assertEqual(
+            self.TRANSPARENCIA_URL,
+            authority.navigation_snapshots[0].final_url,
+        )
+
+    def test_multi24_depth_one_is_same_host_fail_closed_and_capped_at_five(self) -> None:
+        internal = [f"{self.OFFICIAL_URL}/servicos/{index}" for index in range(1, 8)]
+        external = "https://example.invalid/portal-transparencia"
+        anchors = "".join(
+            f'<a href="{url}">Portal de Servicos {index}</a>'
+            for index, url in enumerate(internal, start=1)
+        )
+        homepage = (
+            "<html><body><p>Municipio de Progresso</p>"
+            f'{anchors}<a href="{external}">Portal da Transparencia externo</a>'
+            "</body></html>"
+        )
+        fetcher = self._fetcher(linked=False)
+        fetcher.outcomes[self.OFFICIAL_URL] = FetchResult(200, homepage, self.OFFICIAL_URL)
+        for url in internal[:5]:
+            fetcher.outcomes[url] = FetchResult(
+                200,
+                "<html><body><p>Municipio de Progresso</p><p>Sem portal</p></body></html>",
+                url,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self._acquire(directory, fetcher)
+
+        adapter = payload["adaptador"]
+        provenance = adapter["acquisition_provenance"]
+        self.assertEqual([], adapter["candidates"])
+        self.assertEqual("official_portal_href_missing", provenance["result"])
+        self.assertEqual(internal[:5], provenance["official_subpages_reviewed"])
+        self.assertEqual(5, len(provenance["official_navigation_attempts"]))
+        self.assertNotIn(external, fetcher.urls)
+        self.assertTrue(
+            all(
+                url == self.ENTRY_URL or url.startswith(self.OFFICIAL_URL)
+                for url in fetcher.urls
+            )
+        )
+
+    def test_multi24_fetches_children_only_from_adapter_real_edges(self) -> None:
+        fetcher = self._fetcher()
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self._acquire(directory, fetcher)
+        provenance = payload["adaptador"]["acquisition_provenance"]
+        self.assertEqual([self.CHILD_URL], provenance["linked_pages_fetched"])
+        self.assertIn(self.CHILD_URL, fetcher.urls)
+        self.assertNotIn(self.INVENTED_URL, fetcher.urls)
+
+    def test_multi24_official_authority_fetch_is_cached_by_municipality(self) -> None:
+        fetcher = self._fetcher()
+        cache: dict = {}
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._acquire(directory, fetcher, cache=cache)
+            second = self._acquire(directory, fetcher, cache=cache)
+        self.assertEqual(1, fetcher.urls.count(self.OFFICIAL_URL))
+        self.assertFalse(first["adaptador"]["acquisition_provenance"]["official_cache_hit"])
+        self.assertTrue(second["adaptador"]["acquisition_provenance"]["official_cache_hit"])
+
+    def test_multi24_acquisition_never_confirms_a_candidate(self) -> None:
+        fetcher = self._fetcher()
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self._acquire(directory, fetcher)
+        self.assertTrue(payload["adaptador"]["candidates"])
+        self.assertTrue(
+            all(candidate["confirmed"] is False for candidate in payload["adaptador"]["candidates"])
+        )
+        self.assertFalse(payload["veredicto_gate"]["pasa"])
 
 
 def sdk_response(url: str = "https://camaqua.rs.gov.br/concursos") -> SimpleNamespace:

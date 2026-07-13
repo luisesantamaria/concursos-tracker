@@ -44,10 +44,16 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
+from bs4 import BeautifulSoup
+
 from scripts.fase2_municipios.v2 import authority
 from scripts.fase2_municipios.v2.agents import certifier
 from scripts.fase2_municipios.v2.eval.live_abc_adapter import render_page_networkidle
-from scripts.fase2_municipios.v2.eval.f3_adapters_dispatch import dispatch_f3_adapter
+from scripts.fase2_municipios.v2.eval import f3_multi24_adapter
+from scripts.fase2_municipios.v2.eval.f3_adapters_dispatch import (
+    detect_platform,
+    dispatch_f3_adapter,
+)
 from scripts.fase2_municipios.v2.eval.live_model_policy import (
     ErrorCategory,
     classify_error,
@@ -72,6 +78,12 @@ DEFAULT_DAILY_SEARCH_LIMIT = 500
 QUOTA_STOP_FRACTION = 0.90
 SNIPPET_LIMIT = 500
 SNAPSHOT_LIMIT = 8000
+MULTI24_CHILD_LIMIT = 10
+MULTI24_FETCH_TIMEOUT = 10
+MULTI24_OFFICIAL_SUBPAGE_LIMIT = 5
+MULTI24_OFFICIAL_NAV_HINT_RE = re.compile(
+    r"\b(?:transparencia|portal|acesso\s+a\s+informacao|servicos?)\b"
+)
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[{}\"']+", re.IGNORECASE)
 SUB_CAUSAS = {"url_mala", "render_incierto", "dificil_rederivado"}
 OUTPUT_COLUMNS = (
@@ -773,6 +785,7 @@ def extract_answer_urls(answer: GroundedAnswer) -> list[str]:
 
 
 _MUNICIPALITY_CONTEXT_CACHE: dict[str, tuple[str, str]] | None = None
+_MUNICIPALITY_SITE_CACHE: dict[str, str] | None = None
 
 
 def _municipality_context() -> dict[str, tuple[str, str]]:
@@ -803,6 +816,29 @@ def municipality_natural_name(slug_or_name: str) -> tuple[str, str]:
         if words[index].casefold() in {"da", "das", "de", "do", "dos", "e"}:
             words[index] = words[index].casefold()
     return " ".join(words), domain
+
+
+def _municipality_site_base(slug_or_name: str) -> str:
+    """Resolve the CSV site_base through the runner's natural-name identity."""
+
+    global _MUNICIPALITY_SITE_CACHE
+    natural_name, _ = municipality_natural_name(slug_or_name)
+    wanted = re.sub(r"[^a-z0-9]", "", _norm(natural_name))
+    if _MUNICIPALITY_SITE_CACHE is None:
+        path = Path(__file__).resolve().parents[4] / "data/fase2/municipios_rs_local.csv"
+        sites: dict[str, str] = {}
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    name = (row.get("municipio") or "").strip()
+                    slug = re.sub(r"[^a-z0-9]", "", _norm(name))
+                    site = _clean_url((row.get("site_base") or "").strip())
+                    if slug and site:
+                        sites[slug] = site
+        except OSError:
+            pass
+        _MUNICIPALITY_SITE_CACHE = sites
+    return _MUNICIPALITY_SITE_CACHE.get(wanted, "")
 
 
 def build_queries(target: Target) -> list[str]:
@@ -1216,6 +1252,366 @@ def _snapshot_identity_matches(municipio: str, text: str) -> bool:
     return bool(target) and target in snapshot
 
 
+@dataclass(frozen=True)
+class _Multi24OfficialPage:
+    site_base: str
+    snapshot: f3_multi24_adapter.Multi24Snapshot | None
+    href_targets: tuple[str, ...]
+    status_code: int | None
+    error: str
+    source_url: str = ""
+    navigation_chain: tuple[str, ...] = ()
+    candidate_subpages: tuple[str, ...] = ()
+    reviewed_subpages: tuple[str, ...] = ()
+    navigation_attempts: tuple[tuple[str, ...], ...] = ()
+    navigation_errors: tuple[tuple[str, str], ...] = ()
+
+
+def _http_origin(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return ""
+    scheme = parsed.scheme.casefold()
+    host = (parsed.hostname or "").casefold()
+    if scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+        return ""
+    default = 443 if scheme == "https" else 80
+    suffix = f":{port}" if port is not None and port != default else ""
+    return f"{scheme}://{host}{suffix}"
+
+
+def _http_host(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or parsed.username or parsed.password:
+        return ""
+    return (parsed.hostname or "").casefold()
+
+
+def _multi24_official_links(
+    page_url: str,
+    html: str,
+    *,
+    official_host: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return document hrefs and depth-1, same-host navigation candidates.
+
+    Candidates are content-neutral Portuguese municipal navigation concepts.
+    DOM order is retained deliberately: this is a bounded traversal, not a
+    numeric scorer or a municipality/provider-specific routing rule.
+    """
+
+    hrefs: list[str] = []
+    candidates: list[str] = []
+    soup = BeautifulSoup(html, "html.parser")
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href", "")).strip()
+        if not href or href.casefold().startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        target = _clean_url(urljoin(page_url, href))
+        if not target or not _http_origin(target):
+            continue
+        hrefs.append(target)
+        if _http_host(target) != official_host:
+            continue
+        # Fragment-only and menu links back to the current document are not
+        # depth-1 subpages and would only repeat the homepage fetch.
+        if target.casefold() == page_url.casefold():
+            continue
+        parsed = urlsplit(target)
+        hint_source = " ".join((
+            anchor.get_text(" ", strip=True),
+            parsed.path,
+            parsed.query,
+        ))
+        hint = re.sub(r"[^a-z0-9]+", " ", _norm(hint_source)).strip()
+        if MULTI24_OFFICIAL_NAV_HINT_RE.search(hint):
+            candidates.append(target)
+    return tuple(dict.fromkeys(hrefs)), tuple(dict.fromkeys(candidates))
+
+
+def _multi24_snapshot(
+    requested_url: str,
+    fetched: Any,
+    *,
+    retrieved_at: str,
+) -> f3_multi24_adapter.Multi24Snapshot:
+    final_url = _clean_url(str(fetched.final_url or requested_url)) or requested_url
+    return f3_multi24_adapter.Multi24Snapshot(
+        requested_url=requested_url,
+        final_url=final_url,
+        status_code=int(fetched.status_code),
+        body=str(fetched.html).encode("utf-8"),
+        content_type="text/html; charset=utf-8",
+        retrieved_at=retrieved_at,
+    )
+
+
+def _official_multi24_page(
+    municipio: str,
+    *,
+    portal_url: str,
+    fetcher: Fetcher,
+    fetch_timeout: int,
+    retrieved_at: str,
+    cache: dict[str, _Multi24OfficialPage],
+) -> tuple[_Multi24OfficialPage, bool]:
+    natural_name, _ = municipality_natural_name(municipio)
+    key = re.sub(r"[^a-z0-9]", "", _norm(natural_name))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached, True
+
+    site_base = _municipality_site_base(natural_name)
+    if not site_base:
+        page = _Multi24OfficialPage("", None, (), None, "site_base_missing")
+        cache[key] = page
+        return page, False
+    try:
+        fetched = fetcher.get(site_base, min(fetch_timeout, MULTI24_FETCH_TIMEOUT))
+        effective_url = _clean_url(str(fetched.final_url or site_base)) or site_base
+        # The frozen adapter only accepts HTTPS municipal origins.  Represent
+        # the actual post-redirect document as the requested proof snapshot.
+        snapshot = _multi24_snapshot(effective_url, fetched, retrieved_at=retrieved_at)
+        official_host = _http_host(effective_url)
+        portal_host = _http_host(portal_url)
+        hrefs, candidates = _multi24_official_links(
+            effective_url,
+            str(fetched.html),
+            official_host=official_host,
+        )
+        matching = tuple(href for href in hrefs if _http_host(href) == portal_host)
+        source_snapshot = snapshot
+        source_url = effective_url
+        root_chain = [site_base]
+        canonical_site_base = _clean_url(site_base) or site_base
+        if effective_url.casefold() != canonical_site_base.casefold():
+            root_chain.append(effective_url)
+        navigation_chain: tuple[str, ...] = (
+            tuple((*root_chain, matching[0])) if matching else ()
+        )
+        reviewed: list[str] = []
+        attempts: list[tuple[str, ...]] = []
+        navigation_errors: list[tuple[str, str]] = []
+
+        # Depth is exactly one.  A redirect away from the official hostname is
+        # never inspected or accepted as authority; the Fetcher interface may
+        # follow it at transport level, so its final URL is also checked here.
+        if not matching and official_host and portal_host:
+            for subpage_url in candidates[:MULTI24_OFFICIAL_SUBPAGE_LIMIT]:
+                reviewed.append(subpage_url)
+                try:
+                    subpage_fetch = fetcher.get(
+                        subpage_url,
+                        min(fetch_timeout, MULTI24_FETCH_TIMEOUT),
+                    )
+                    subpage_effective = (
+                        _clean_url(str(subpage_fetch.final_url or subpage_url)) or subpage_url
+                    )
+                    attempt = [*root_chain, subpage_url]
+                    if subpage_effective.casefold() != subpage_url.casefold():
+                        attempt.append(subpage_effective)
+                    if _http_host(subpage_effective) != official_host:
+                        attempts.append(tuple(attempt))
+                        navigation_errors.append((subpage_url, "redirected_outside_official_host"))
+                        continue
+                    subpage_hrefs, _ = _multi24_official_links(
+                        subpage_effective,
+                        str(subpage_fetch.html),
+                        official_host=official_host,
+                    )
+                    subpage_matching = tuple(
+                        href for href in subpage_hrefs if _http_host(href) == portal_host
+                    )
+                    if subpage_matching:
+                        attempt.append(subpage_matching[0])
+                        attempts.append(tuple(attempt))
+                        source_snapshot = _multi24_snapshot(
+                            subpage_effective,
+                            subpage_fetch,
+                            retrieved_at=retrieved_at,
+                        )
+                        source_url = subpage_effective
+                        hrefs = subpage_hrefs
+                        navigation_chain = tuple(attempt)
+                        matching = subpage_matching
+                        break
+                    attempts.append(tuple(attempt))
+                except RescueInterrupted:
+                    raise
+                except Exception as exc:
+                    attempts.append(tuple((*root_chain, subpage_url)))
+                    navigation_errors.append((subpage_url, type(exc).__name__))
+        page = _Multi24OfficialPage(
+            site_base=site_base,
+            snapshot=source_snapshot,
+            href_targets=tuple(hrefs),
+            status_code=int(fetched.status_code),
+            error="",
+            source_url=source_url,
+            navigation_chain=navigation_chain,
+            candidate_subpages=candidates,
+            reviewed_subpages=tuple(reviewed),
+            navigation_attempts=tuple(attempts),
+            navigation_errors=tuple(navigation_errors),
+        )
+    except RescueInterrupted:
+        raise
+    except Exception as exc:
+        page = _Multi24OfficialPage(
+            site_base=site_base,
+            snapshot=None,
+            href_targets=(),
+            status_code=None,
+            error=f"official_fetch_error:{type(exc).__name__}",
+        )
+    cache[key] = page
+    return page, False
+
+
+def _acquire_multi24_dispatch_context(
+    *,
+    target: Target,
+    portal_url: str,
+    portal_fetch: Any,
+    fetcher: Fetcher,
+    fetch_timeout: int,
+    retrieved_at: str,
+    current_year: int,
+    base_context: Mapping[str, Any],
+    authority_cache: dict[str, _Multi24OfficialPage],
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Acquire only official navigation proof and adapter-observed children."""
+
+    context = dict(base_context)
+    natural_name, _ = municipality_natural_name(target.municipio)
+    entry = _multi24_snapshot(portal_url, portal_fetch, retrieved_at=retrieved_at)
+    context["multi24_entry_snapshot"] = entry
+    provenance: dict[str, Any] = {
+        "attempted": True,
+        "municipio_natural": natural_name,
+        "portal_url": portal_url,
+        "official_site_base": "",
+        "official_cache_hit": False,
+        "official_status_code": None,
+        "official_href": "",
+        "official_source_url": "",
+        "official_navigation_chain": [],
+        "official_subpage_limit": MULTI24_OFFICIAL_SUBPAGE_LIMIT,
+        "official_subpage_candidates": [],
+        "official_subpages_reviewed": [],
+        "official_navigation_attempts": [],
+        "official_navigation_errors": [],
+        "linked_pages_limit": MULTI24_CHILD_LIMIT,
+        "linked_pages_fetched": [],
+        "linked_page_errors": [],
+        "result": "",
+    }
+
+    official, cache_hit = _official_multi24_page(
+        target.municipio,
+        portal_url=portal_url,
+        fetcher=fetcher,
+        fetch_timeout=fetch_timeout,
+        retrieved_at=retrieved_at,
+        cache=authority_cache,
+    )
+    provenance.update({
+        "official_site_base": official.site_base,
+        "official_cache_hit": cache_hit,
+        "official_status_code": official.status_code,
+        "official_source_url": official.source_url,
+        "official_navigation_chain": list(official.navigation_chain),
+        "official_subpage_candidates": list(official.candidate_subpages),
+        "official_subpages_reviewed": list(official.reviewed_subpages),
+        "official_navigation_attempts": [list(item) for item in official.navigation_attempts],
+        "official_navigation_errors": [
+            {"url": url, "error": error}
+            for url, error in official.navigation_errors
+        ],
+    })
+    if official.snapshot is None:
+        provenance["result"] = official.error or "official_snapshot_missing"
+        return context, provenance, natural_name
+
+    portal_host = _http_host(portal_url)
+    matching_hrefs = tuple(
+        href for href in official.href_targets
+        if _http_host(href) == portal_host
+    )
+    if not matching_hrefs:
+        provenance["result"] = "official_portal_href_missing"
+        return context, provenance, natural_name
+    official_origin = _http_origin(official.snapshot.final_url)
+    if not official_origin.startswith("https://"):
+        provenance["result"] = "official_source_origin_not_https"
+        return context, provenance, natural_name
+
+    provenance["official_href"] = matching_hrefs[0]
+    authority_proof = f3_multi24_adapter.Multi24Authority(
+        official_source_origins=(official_origin,),
+        navigation_snapshots=(official.snapshot,),
+    )
+    context["multi24_authority"] = authority_proof
+    context["multi24_linked_pages"] = {}
+    try:
+        observed = f3_multi24_adapter.analyze_multi24(
+            entry=entry,
+            linked_pages={},
+            authority=authority_proof,
+            municipio=natural_name,
+            bucket=target.bucket,
+            current_year=current_year,
+        )
+    except f3_multi24_adapter.Multi24ContractError as exc:
+        provenance["result"] = f"adapter_contract_error:{exc}"
+        return context, provenance, natural_name
+
+    eligible_edges = [
+        edge for edge in observed.edges
+        if f3_multi24_adapter._year_in_text(
+            f3_multi24_adapter._norm(edge.label), current_year
+        )
+        and f3_multi24_adapter._classify_path(edge.provenance) == target.bucket
+    ]
+    linked_pages: dict[str, f3_multi24_adapter.Multi24Snapshot] = {}
+    seen: set[str] = set()
+    attempted_children = 0
+    for edge in eligible_edges:
+        canonical = edge.target_url.casefold()
+        if canonical in seen:
+            continue
+        if attempted_children >= MULTI24_CHILD_LIMIT:
+            break
+        seen.add(canonical)
+        attempted_children += 1
+        try:
+            child_fetch = fetcher.get(
+                edge.target_url,
+                min(fetch_timeout, MULTI24_FETCH_TIMEOUT),
+            )
+            linked_pages[edge.target_url] = _multi24_snapshot(
+                edge.target_url,
+                child_fetch,
+                retrieved_at=retrieved_at,
+            )
+            provenance["linked_pages_fetched"].append(edge.target_url)
+        except RescueInterrupted:
+            raise
+        except Exception as exc:
+            provenance["linked_page_errors"].append({
+                "url": edge.target_url,
+                "error": type(exc).__name__,
+            })
+    context["multi24_linked_pages"] = linked_pages
+    provenance["result"] = "context_acquired"
+    return context, provenance, natural_name
+
+
 def micro_acquire_unit(
     target: Target,
     url: str,
@@ -1229,6 +1625,7 @@ def micro_acquire_unit(
     prior_redirector: str = "",
     adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
     adapter_context: Mapping[str, Any] | None = None,
+    multi24_authority_cache: dict[str, _Multi24OfficialPage] | None = None,
 ) -> dict[str, Any]:
     """Perform exactly one controlled fetch+render acquisition and persist it."""
     initial_url = url
@@ -1244,29 +1641,74 @@ def micro_acquire_unit(
         trigger = "sin_url_candidata_grounded"
     else:
         try:
-            fetched = fetcher.get(initial_url, fetch_timeout)
+            initial_timeout = (
+                min(fetch_timeout, MULTI24_FETCH_TIMEOUT)
+                if detect_platform(initial_url, "") == "multi24"
+                else fetch_timeout
+            )
+            fetched = fetcher.get(initial_url, initial_timeout)
             final_url = _clean_url(fetched.final_url or initial_url) or initial_url
             if final_url and final_url != redirect_chain[-1]:
                 redirect_chain.append(final_url)
             dispatch_context = dict(adapter_context or {})
             dispatch_context.setdefault("status_code", fetched.status_code)
+            dispatch_municipio = target.municipio
+            acquisition_provenance: dict[str, Any] = {}
+            current_year = datetime.now().year
+            detected_platform = detect_platform(final_url, fetched.html)
+            if detected_platform == "multi24":
+                try:
+                    dispatch_context, acquisition_provenance, dispatch_municipio = (
+                        _acquire_multi24_dispatch_context(
+                            target=target,
+                            portal_url=final_url,
+                            portal_fetch=fetched,
+                            fetcher=fetcher,
+                            fetch_timeout=fetch_timeout,
+                            retrieved_at=timestamp_run,
+                            current_year=current_year,
+                            base_context=dispatch_context,
+                            authority_cache=(
+                                multi24_authority_cache
+                                if multi24_authority_cache is not None else {}
+                            ),
+                        )
+                    )
+                except RescueInterrupted:
+                    raise
+                except Exception as exc:
+                    dispatch_municipio = municipality_natural_name(target.municipio)[0]
+                    acquisition_provenance = {
+                        "attempted": True,
+                        "municipio_natural": dispatch_municipio,
+                        "portal_url": final_url,
+                        "official_site_base": _municipality_site_base(target.municipio),
+                        "linked_pages_limit": MULTI24_CHILD_LIMIT,
+                        "linked_pages_fetched": [],
+                        "linked_page_errors": [],
+                        "result": f"acquisition_error:{type(exc).__name__}",
+                    }
             try:
                 adapter_result = dict(adapter_dispatcher(
                     url=final_url,
                     page_html=fetched.html,
-                    municipio=target.municipio,
+                    municipio=dispatch_municipio,
                     bucket=target.bucket,
-                    current_year=datetime.now().year,
+                    current_year=current_year,
                     context=dispatch_context,
                 ) or {})
+                if acquisition_provenance:
+                    adapter_result["acquisition_provenance"] = acquisition_provenance
             except RescueInterrupted:
                 raise
             except BaseException as exc:
                 adapter_result = {
-                    "platform": None,
+                    "platform": detected_platform,
                     "candidates": [],
                     "refusal_reason": f"dispatcher_error:{type(exc).__name__}",
                 }
+                if acquisition_provenance:
+                    adapter_result["acquisition_provenance"] = acquisition_provenance
             if adapter_result.get("candidates"):
                 _, snapshot_text = extract_title_and_text(fetched.html)
                 status = fetched.status_code
@@ -1316,7 +1758,11 @@ def micro_acquire_unit(
     }
     if error:
         payload["error_tipo"] = error
-    if adapter_result.get("candidates") or adapter_result.get("hook"):
+    if (
+        adapter_result.get("candidates")
+        or adapter_result.get("hook")
+        or adapter_result.get("platform") == "multi24"
+    ):
         payload["adaptador"] = adapter_result
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1410,6 +1856,7 @@ def run_micro_acquisitions(
     or renderer and cannot create a candidate.
     """
     result_rows = list(rows)
+    multi24_authority_cache: dict[str, _Multi24OfficialPage] = {}
     for target in targets:
         if target.sub_causa != "render_incierto":
             continue
@@ -1434,6 +1881,7 @@ def run_micro_acquisitions(
                 adapter_context_provider(target, selected["url"])
                 if adapter_context_provider is not None else None
             ),
+            multi24_authority_cache=multi24_authority_cache,
         )
         unit["micro_archivo"] = f"micro_{target.municipio}_{target.bucket}.json"
         unit["micro_veredicto"] = payload["veredicto_gate"]
@@ -1516,6 +1964,7 @@ def run_rescue(
     skipped_existing = 0
     stop_after_current = False
     redirect_cache: dict[str, str | None] = {}
+    multi24_authority_cache: dict[str, _Multi24OfficialPage] = {}
     for target in targets:
         key = f"{target.municipio}/{target.bucket}"
         path = _unit_path(output_path, target) if output_path is not None else None
@@ -1780,6 +2229,7 @@ def run_rescue(
                         adapter_context_provider(target, selected["url"])
                         if adapter_context_provider is not None else None
                     ),
+                    multi24_authority_cache=multi24_authority_cache,
                 )
                 adapter_rows = _adapter_candidate_rows(
                     target,
