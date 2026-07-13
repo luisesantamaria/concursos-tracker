@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
+import ipaddress
 import json
 import logging
 import os
 import re
 import signal
+import socket
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -33,7 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from scripts.fase2_municipios.v2 import authority
 from scripts.fase2_municipios.v2.agents import certifier
@@ -58,7 +61,7 @@ FALLBACK_MODEL = "gemini-2.5-flash"
 MAX_POLICY_SEARCHES = 5
 SNIPPET_LIMIT = 500
 SNAPSHOT_LIMIT = 8000
-URL_PATTERN = re.compile(r"https?://[^\s<>\]\[(){}\"']+", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://[^\s<>\]\[{}\"']+", re.IGNORECASE)
 SUB_CAUSAS = {"url_mala", "render_incierto", "dificil_rederivado"}
 OUTPUT_COLUMNS = (
     "municipio",
@@ -69,9 +72,22 @@ OUTPUT_COLUMNS = (
     "host_oficial_check",
     "item_markers",
     "http_status",
+    "fuente",
+    "redirector_original",
 )
 PROVIDERS = ("gemini_free_1", "gemini_free_2", "gemini_paid")
 UNIT_SCHEMA_VERSION = 1
+MAX_GROUNDING_REDIRECTS = 3
+REDIRECT_RESOLUTION_TIMEOUT = 10
+# Add a host here only after confirming that it is an official Google
+# grounding redirector. Redirect recognition is intentionally fail-closed.
+GOOGLE_GROUNDING_REDIRECT_HOSTS = frozenset({
+    "vertexaisearch.cloud.google.com",
+})
+_BLOCKED_REDIRECT_HOSTS = frozenset({
+    "localhost",
+    "metadata.google.internal",
+})
 
 
 @dataclass(frozen=True)
@@ -102,6 +118,8 @@ class CandidateRow:
     host_oficial_check: str
     item_markers: int
     http_status: str
+    fuente: str = "grounding"
+    redirector_original: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_COLUMNS}
@@ -169,7 +187,14 @@ def _is_explicit_model_rejection(exc: BaseException, model: str) -> bool:
     model_tokens = (model.casefold(), model.removeprefix("models/").casefold())
     rejection = any(
         marker in text
-        for marker in ("not found", "unsupported", "not supported", "not available", "invalid model")
+        for marker in (
+            "not found",
+            "unsupported",
+            "not supported",
+            "not available",
+            "no longer available",
+            "invalid model",
+        )
     )
     return rejection and any(token in text for token in model_tokens)
 
@@ -202,6 +227,8 @@ class GeminiGroundedClient:
         self._tokens: Counter[str] = Counter()
         self._quota_rate: Counter[str] = Counter()
         self._fallback_events: list[dict[str, str]] = []
+        self._capacity_veto: dict[tuple[str, str], str] = {}
+        self._capacity_errors: dict[tuple[str, str], str] = {}
 
     @property
     def telemetry(self) -> dict[str, Any]:
@@ -217,6 +244,10 @@ class GeminiGroundedClient:
         return {
             "providers": providers,
             "fallback_events": list(self._fallback_events),
+            "capacidad_vetada": [
+                (provider, model, cause)
+                for (provider, model), cause in self._capacity_veto.items()
+            ],
             "paid_calls": self._calls["gemini_paid"],
         }
 
@@ -263,56 +294,92 @@ class GeminiGroundedClient:
             self._tokens[provider] += total
         return response
 
+    def _veto_capacity(self, provider: str, model: str, exc: BaseException) -> None:
+        key = (provider, model)
+        if key in self._capacity_veto:
+            return
+        self._capacity_veto[key] = "model_unavailable_for_provider"
+        self._capacity_errors[key] = _safe_error(exc, self._secret_values())
+
+    def _next_available_provider(
+        self,
+        steps: Sequence[str],
+        start: int,
+        model: str,
+    ) -> str | None:
+        for provider in steps[start:]:
+            if (provider, model) not in self._capacity_veto:
+                return provider
+        return None
+
     def _key_policy_call(self, model: str, prompt: str) -> tuple[Any, str, list[dict[str, str]]]:
         last: BaseException | None = None
+        last_provider = ""
+        last_cause = ""
         events: list[dict[str, str]] = []
         free_steps = (
             ("gemini_free_1", "gemini_free_2")
             if "GEMINI_API_KEY_FREE_2" in self._credentials
             else ("gemini_free_1", "gemini_free_1")
         )
-        for attempt, provider in enumerate(free_steps, start=1):
+        steps = (*free_steps, "gemini_paid")
+        for index, provider in enumerate(steps):
+            if (provider, model) in self._capacity_veto:
+                continue
             try:
                 return self._invoke(provider, model, prompt), provider, events
             except RescueInterrupted:
                 raise
             except BaseException as exc:
                 if _is_explicit_model_rejection(exc, model):
-                    raise ExplicitProRejection(
-                        _safe_error(exc, self._secret_values()), provider
-                    ) from exc
-                classified = classify_error(exc)
-                if not classified.fallback_eligible:
-                    raise
-                last = exc
-                if attempt == 1:
+                    self._veto_capacity(provider, model, exc)
+                    # El modelo autorizado no existe en el proyecto de ESTA
+                    # clave (p.ej. "no longer available to new users"); la
+                    # siguiente clave puede pertenecer a otro proyecto con
+                    # acceso: rotación de CLAVE, nunca de modelo.
+                    last = exc
+                    last_provider = provider
+                    rotation_cause = "model_unavailable_for_provider"
+                    rotation_retry_after = 0.0
+                else:
+                    classified = classify_error(exc)
+                    if not classified.fallback_eligible:
+                        raise
+                    last = exc
+                    last_provider = provider
+                    rotation_cause = classified.category.value
+                    rotation_retry_after = classified.retry_after or 0.0
+                last_cause = rotation_cause
+                next_provider = self._next_available_provider(steps, index + 1, model)
+                if next_provider is not None:
                     event = {
                         "from_provider": provider,
-                        "to_provider": free_steps[1],
-                        "cause": classified.category.value,
+                        "to_provider": next_provider,
+                        "cause": rotation_cause,
                     }
                     events.append(event)
                     self._fallback_events.append(dict(event))
-                    if free_steps[1] == provider:
-                        self._sleep(max(1.0, classified.retry_after or 0.0))
-        assert last is not None
-        event = {
-            "from_provider": free_steps[-1],
-            "to_provider": "gemini_paid",
-            "cause": classify_error(last).category.value,
-        }
-        events.append(event)
-        self._fallback_events.append(dict(event))
-        try:
-            return self._invoke("gemini_paid", model, prompt), "gemini_paid", events
-        except RescueInterrupted:
-            raise
-        except BaseException as exc:
-            if _is_explicit_model_rejection(exc, model):
-                raise ExplicitProRejection(
-                    _safe_error(exc, self._secret_values()), "gemini_paid"
-                ) from exc
-            raise
+                    if next_provider == provider:
+                        self._sleep(max(1.0, rotation_retry_after))
+        if last is None:
+            for provider in reversed(steps):
+                if (provider, model) in self._capacity_veto:
+                    raise ExplicitProRejection(
+                        self._capacity_errors.get(
+                            (provider, model), "model_unavailable_for_provider"
+                        ),
+                        provider,
+                    )
+            raise RuntimeError("provider_policy_without_attempt")
+        if last_cause == "model_unavailable_for_provider":
+            raise ExplicitProRejection(
+                self._capacity_errors.get(
+                    (last_provider, model),
+                    _safe_error(last, self._secret_values()),
+                ),
+                last_provider,
+            ) from last
+        raise last
 
     def search(self, query: str, *, model: str, municipio: str, bucket: str) -> GroundedAnswer:
         prompt = (
@@ -405,7 +472,10 @@ def extract_grounding_metadata(response: Any) -> tuple[list[str], list[str]]:
 
 
 def _clean_url(raw: str) -> str:
-    value = raw.strip().rstrip(".,;:!?")
+    value = html.unescape(raw).strip().rstrip(".,;:!?")
+    for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+        while value.endswith(closing) and value.count(closing) > value.count(opening):
+            value = value[:-1].rstrip(".,;:!?")
     try:
         parsed = urlsplit(value)
     except ValueError:
@@ -415,11 +485,24 @@ def _clean_url(raw: str) -> str:
     return urlunsplit((parsed.scheme.casefold(), parsed.netloc, parsed.path or "/", parsed.query, ""))
 
 
+def extract_answer_url_sources(answer: GroundedAnswer) -> list[tuple[str, str]]:
+    """Extract candidate URLs while preserving their first model provenance."""
+    found = [(item, "grounding") for item in answer.grounding_urls]
+    found.extend((item, "texto_modelo") for item in URL_PATTERN.findall(answer.text))
+    extracted: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw, source in found:
+        cleaned = _clean_url(raw)
+        key = (cleaned.casefold(), source)
+        if cleaned and key not in seen:
+            seen.add(key)
+            extracted.append((cleaned, source))
+    return extracted
+
+
 def extract_answer_urls(answer: GroundedAnswer) -> list[str]:
-    found = list(answer.grounding_urls)
-    found.extend(URL_PATTERN.findall(answer.text))
-    cleaned = (_clean_url(item) for item in found)
-    return list(dict.fromkeys(item for item in cleaned if item))
+    """Backward-compatible URL-only view of answer candidates."""
+    return list(dict.fromkeys(url for url, _source in extract_answer_url_sources(answer)))
 
 
 def build_queries(target: Target) -> list[str]:
@@ -462,8 +545,140 @@ def _host(url: str) -> str:
 
 
 def _is_google_grounding_redirect(url: str) -> bool:
-    host = _host(url)
-    return host == "vertexaisearch.cloud.google.com" and "grounding-api-redirect" in url
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    return (
+        (parsed.hostname or "").casefold().rstrip(".") in GOOGLE_GROUNDING_REDIRECT_HOSTS
+        and parsed.path.startswith("/grounding-api-redirect/")
+    )
+
+
+def _default_redirect_host_resolver(host: str) -> tuple[str, ...]:
+    addresses = {
+        item[4][0]
+        for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    }
+    return tuple(sorted(addresses))
+
+
+def _address_is_public(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (
+        address.is_loopback
+        or address.is_private
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _redirect_hop_is_safe(
+    url: str,
+    host_resolver: Callable[[str], Sequence[str]] = _default_redirect_host_resolver,
+) -> bool:
+    """Fail closed for schemes and explicit local/private redirect targets."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return False
+    if parsed.scheme.casefold() != "https" or not host:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if host in _BLOCKED_REDIRECT_HOSTS or host.endswith(".localhost"):
+        return False
+    if host.endswith(".metadata.google.internal"):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            resolved = tuple(host_resolver(host))
+        except (OSError, ValueError):
+            return False
+        return bool(resolved) and all(_address_is_public(item) for item in resolved)
+    return _address_is_public(str(address))
+
+
+def _new_redirect_session() -> Any:
+    """Create an isolated session that cannot inherit model credentials."""
+    import requests
+
+    session = requests.Session()
+    session.headers.clear()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; GroundingRedirectResolver/1.0)",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    })
+    session.auth = None
+    session.cookies.clear()
+    session.trust_env = False
+    return session
+
+
+def _resolve_grounding_redirect(
+    url: str,
+    *,
+    timeout: int,
+    cache: dict[str, str | None],
+    session_factory: Callable[[], Any] = _new_redirect_session,
+    host_resolver: Callable[[str], Sequence[str]] = _default_redirect_host_resolver,
+) -> str | None:
+    """Resolve a grounding redirect hop-by-hop under a strict SSRF policy."""
+    key = url.casefold()
+    if key not in cache:
+        session: Any | None = None
+        try:
+            current = _clean_url(url)
+            if not _is_google_grounding_redirect(current) or not _redirect_hop_is_safe(
+                current, host_resolver
+            ):
+                cache[key] = None
+                return cache[key]
+            session = session_factory()
+            for redirects_followed in range(MAX_GROUNDING_REDIRECTS + 1):
+                if not _redirect_hop_is_safe(current, host_resolver):
+                    cache[key] = None
+                    break
+                response = session.get(
+                    current,
+                    timeout=min(timeout, REDIRECT_RESOLUTION_TIMEOUT),
+                    allow_redirects=False,
+                )
+                try:
+                    location = response.headers.get("Location", "")
+                    is_redirect = 300 <= int(response.status_code) < 400 and bool(location)
+                finally:
+                    close_response = getattr(response, "close", None)
+                    if callable(close_response):
+                        close_response()
+                if not is_redirect:
+                    cache[key] = current if not _is_google_grounding_redirect(current) else None
+                    break
+                if redirects_followed >= MAX_GROUNDING_REDIRECTS:
+                    cache[key] = None
+                    break
+                next_url = _clean_url(urljoin(current, location))
+                if not next_url or not _redirect_hop_is_safe(next_url, host_resolver):
+                    cache[key] = None
+                    break
+                current = next_url
+        except RescueInterrupted:
+            raise
+        except BaseException:
+            cache[key] = None
+        finally:
+            close_session = getattr(session, "close", None)
+            if callable(close_session):
+                close_session()
+    return cache[key]
 
 
 def official_host_check(municipio: str, url: str) -> tuple[bool, str]:
@@ -549,6 +764,7 @@ def _provider_snapshot(client: GroundedClient) -> dict[str, Any]:
     return {
         "providers": normalized,
         "fallback_events": list(telemetry.get("fallback_events", ()) or ()),
+        "capacidad_vetada": list(telemetry.get("capacidad_vetada", ()) or ()),
     }
 
 
@@ -571,15 +787,25 @@ def _unit_telemetry(
         normalized = dict(event)
         if normalized not in clean_fallbacks:
             clean_fallbacks.append(normalized)
+    before_vetoes = {tuple(item) for item in before.get("capacidad_vetada", ()) or ()}
+    new_vetoes = [
+        list(item)
+        for item in after.get("capacidad_vetada", ()) or ()
+        if tuple(item) not in before_vetoes
+    ]
     return {
         "providers": providers,
         "fallbacks": clean_fallbacks,
+        "capacidad_vetada": new_vetoes,
         "paid_calls": providers["gemini_paid"]["calls"],
     }
 
 
 def _candidate_from_dict(value: Mapping[str, Any]) -> CandidateRow:
-    return CandidateRow(**{name: value[name] for name in OUTPUT_COLUMNS})
+    return CandidateRow(**{
+        name: value.get(name, "") if name in {"fuente", "redirector_original"} else value[name]
+        for name in OUTPUT_COLUMNS
+    })
 
 
 def _read_unit_files(output_dir: Path) -> list[dict[str, Any]]:
@@ -780,6 +1006,8 @@ def run_rescue(
     skip_existing: bool = False,
     micro_acquire: bool = False,
     renderer: Callable[[str], Any] = render_page_networkidle,
+    redirect_session_factory: Callable[[], Any] = _new_redirect_session,
+    redirect_host_resolver: Callable[[str], Sequence[str]] = _default_redirect_host_resolver,
     interruption: InterruptionState | None = None,
     timestamp_factory: Callable[[], str] = _utc_timestamp,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
@@ -808,6 +1036,7 @@ def run_rescue(
     payloads: list[dict[str, Any]] = []
     skipped_existing = 0
     stop_after_current = False
+    redirect_cache: dict[str, str | None] = {}
     for target in targets:
         key = f"{target.municipio}/{target.bucket}"
         path = _unit_path(output_path, target) if output_path is not None else None
@@ -839,8 +1068,7 @@ def run_rescue(
             "micro_pendientes": [],
             "confirmacion": False,
         }
-        seen: set[str] = set()
-        fetched: set[str] = set()
+        seen_final: set[str] = set()
         queries = build_queries(target)[:max_searches]
         micro_result: dict[str, Any] | None = None
         estado = "completed"
@@ -883,42 +1111,76 @@ def run_rescue(
                     grounded["proveedores_que_respondieron"].append(answer.provider)
                 grounded["fallbacks"].extend(answer.fallbacks)
                 snippet = _snippet(answer)
-                for url in extract_answer_urls(answer):
-                    normalized = url.casefold()
-                    if normalized in seen:
-                        continue
-                    seen.add(normalized)
+                for url, source in extract_answer_url_sources(answer):
+                    source_snippet = snippet if source == "grounding" else ""
                     grounding_redirect = _is_google_grounding_redirect(url)
-                    allowed, reason = official_host_check(target.municipio, url)
-                    if not allowed and not grounding_redirect:
-                        grounded["descartadas"].append({"url": url, "razon": reason})
+                    redirector_original = url if grounding_redirect else ""
+                    candidate_url = url
+                    if grounding_redirect:
+                        candidate_url = _resolve_grounding_redirect(
+                            url,
+                            timeout=fetch_timeout,
+                            cache=redirect_cache,
+                            session_factory=redirect_session_factory,
+                            host_resolver=redirect_host_resolver,
+                        ) or ""
+                        if not candidate_url:
+                            grounded["descartadas"].append({
+                                "url": url,
+                                "razon": "redirect_no_resuelto",
+                                "fuente": source,
+                                "redirector_original": url,
+                            })
+                            continue
+                    allowed, reason = official_host_check(target.municipio, candidate_url)
+                    if not allowed:
+                        grounded["descartadas"].append({
+                            "url": candidate_url,
+                            "razon": reason,
+                            "fuente": source,
+                            "redirector_original": redirector_original,
+                        })
                         continue
-                    if normalized in fetched:
+                    normalized = candidate_url.casefold()
+                    if normalized in seen_final:
                         continue
-                    fetched.add(normalized)
+                    seen_final.add(normalized)
                     status = ""
                     markers = 0
                     positive_quotes: list[str] = []
-                    candidate_url = url
                     try:
-                        result = fetcher.get(url, fetch_timeout)
+                        result = fetcher.get(candidate_url, fetch_timeout)
                         status = str(result.status_code)
-                        candidate_url = _clean_url(result.final_url or url) or url
+                        candidate_url = _clean_url(result.final_url or candidate_url) or candidate_url
                         final_allowed, final_reason = official_host_check(target.municipio, candidate_url)
                         if not final_allowed:
                             grounded["descartadas"].append({
                                 "url": candidate_url,
-                                "razon": "redirect_final_no_oficial" if grounding_redirect else final_reason,
+                                "razon": final_reason,
+                                "fuente": source,
+                                "redirector_original": redirector_original,
                             })
                             continue
-                        reason = (
-                            f"google_grounding_redirect->{final_reason}"
-                            if grounding_redirect
-                            else final_reason
-                        )
+                        reason = final_reason
                         _, visible_text = extract_title_and_text(result.html)
                         markers = _count_item_markers(_norm(visible_text))
                         positive_quotes = _candidate_item_positive_quotes(visible_text, target.bucket)
+                        if not _status_stable(result.status_code):
+                            grounded["descartadas"].append({
+                                "url": candidate_url,
+                                "razon": "http_no_estable",
+                                "fuente": source,
+                                "redirector_original": redirector_original,
+                            })
+                            continue
+                        if not _snapshot_identity_matches(target.municipio, visible_text):
+                            grounded["descartadas"].append({
+                                "url": candidate_url,
+                                "razon": "identidad_no_demostrada",
+                                "fuente": source,
+                                "redirector_original": redirector_original,
+                            })
+                            continue
                     except RescueInterrupted:
                         raise
                     except BaseException as exc:
@@ -928,22 +1190,33 @@ def run_rescue(
                             "stage": "fetch",
                         })
                         status = f"error:{type(exc).__name__}"
-                        if grounding_redirect:
-                            grounded["descartadas"].append({
-                                "url": url,
-                                "razon": "grounding_redirect_fetch_error",
-                            })
-                            continue
-                    final_normalized = candidate_url.casefold()
-                    if final_normalized != normalized and final_normalized in seen:
+                        grounded["descartadas"].append({
+                            "url": candidate_url,
+                            "razon": "fetch_fallido",
+                            "fuente": source,
+                            "redirector_original": redirector_original,
+                        })
                         continue
-                    seen.add(final_normalized)
+                    final_normalized = candidate_url.casefold()
+                    if final_normalized != normalized and final_normalized in seen_final:
+                        continue
+                    seen_final.add(final_normalized)
                     if target.sub_causa == "render_incierto" and not positive_quotes:
                         grounded["micro_pendientes"].append({
                             "url": candidate_url,
                             "query": query,
-                            "snippet": snippet,
+                            "snippet": source_snippet,
                             "host_oficial_check": reason,
+                            "fuente": source,
+                            "redirector_original": redirector_original,
+                        })
+                        continue
+                    if not positive_quotes:
+                        grounded["descartadas"].append({
+                            "url": candidate_url,
+                            "razon": "bucket_item_positive_no_demostrado",
+                            "fuente": source,
+                            "redirector_original": redirector_original,
                         })
                         continue
                     unit_candidates.append(CandidateRow(
@@ -951,10 +1224,12 @@ def run_rescue(
                         bucket=target.bucket,
                         url_candidata=candidate_url,
                         query_usada=query,
-                        snippet_grounding=snippet,
+                        snippet_grounding=source_snippet,
                         host_oficial_check=reason,
                         item_markers=markers,
                         http_status=status,
+                        fuente=source,
+                        redirector_original=redirector_original,
                     ))
                 if index + 1 < len(queries) and sleep_seconds:
                     sleep(sleep_seconds)
@@ -968,6 +1243,8 @@ def run_rescue(
                     "query": "",
                     "snippet": "",
                     "host_oficial_check": "sin_url_candidata_grounded",
+                    "fuente": "",
+                    "redirector_original": "",
                 }
                 if output_path is None:
                     raise ValueError("micro_acquire_requiere_output_dir")
@@ -990,6 +1267,8 @@ def run_rescue(
                         host_oficial_check=micro_result["veredicto_gate"]["razon_autoridad"],
                         item_markers=len(micro_result["citas_candidatas"]),
                         http_status="micro_acquire",
+                        fuente=selected["fuente"],
+                        redirector_original=selected["redirector_original"],
                     ))
         except RescueInterrupted:
             estado = "failed"
@@ -1056,6 +1335,7 @@ def _aggregate_unit_payloads(
     units: dict[str, Any] = {}
     candidates = 0
     searches = 0
+    capacity_vetoes: list[tuple[str, str, str]] = []
     for payload in payloads:
         grounded = dict(payload.get("grounded", {}) or {})
         key = f'{payload.get("municipio", "")}/{payload.get("bucket", "")}'
@@ -1082,6 +1362,10 @@ def _aggregate_unit_payloads(
             if provider not in fallback_counters:
                 provider = "unknown"
             fallback_counters[provider][str(event.get("cause") or "unknown")] += 1
+        for item in telemetry.get("capacidad_vetada", ()) or ():
+            normalized_veto = tuple(str(part) for part in item)
+            if len(normalized_veto) == 3 and normalized_veto not in capacity_vetoes:
+                capacity_vetoes.append(normalized_veto)
     calls_by_provider = {name: values["calls"] for name, values in providers.items()}
     errors_by_provider = {name: values["errors"] for name, values in providers.items()}
     tokens_by_provider = {name: values["tokens"] for name, values in providers.items()}
@@ -1090,6 +1374,7 @@ def _aggregate_unit_payloads(
     }
     return {
         "policy": dict(policy),
+        "capacidad_vetada": capacity_vetoes,
         "unidades": units,
         "global": {
             "unidades": len(payloads),
@@ -1104,10 +1389,12 @@ def _aggregate_unit_payloads(
             "tokens_by_provider": tokens_by_provider,
             "errors_by_provider": errors_by_provider,
             "fallbacks_by_provider": fallbacks_by_provider,
+            "capacidad_vetada": capacity_vetoes,
             "paid_calls": calls_by_provider["gemini_paid"],
             "telemetria": {
                 "providers": providers,
                 "fallbacks_by_provider": fallbacks_by_provider,
+                "capacidad_vetada": capacity_vetoes,
                 "paid_calls": calls_by_provider["gemini_paid"],
             },
         },
