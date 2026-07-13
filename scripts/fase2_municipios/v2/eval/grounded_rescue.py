@@ -1,9 +1,13 @@
 """Grounded URL-candidate rescue runner for the F2 V2 adjudication gate.
 
-POLITICA DE LUIS (obligatoria):
-- Gemini API con modelo OBLIGATORIO gemini-2.5-pro; gemini-2.5-flash
-  UNICAMENTE si la API rechaza Pro explicitamente (capturar y registrar el
-  error exacto).
+POLITICA DE LUIS (obligatoria, 2026-07-13):
+- El unico modelo autorizado para este rescate es exactamente
+  ``gemini-3.1-flash-lite``. No se permite 2.5 Flash, Pro ni variantes
+  ``-preview``; REQUIRED_MODEL y FALLBACK_MODEL quedan fijados al mismo ID
+  para que no exista rotacion de modelo.
+- En ``--free-only`` la topologia es FREE1 -> FREE2 -> STOP: el proveedor
+  paid no se agrega a la secuencia ni se construye. Produccion solo puede usar
+  FREE1 -> FREE2 -> PAID con permiso explicito y configuracion separada.
 - Herramienta google_search (grounding de busqueda). NO usar retrieval
   Default. NO usar Map Grounding.
 - Maximo 5 busquedas grounded por unidad.
@@ -26,17 +30,19 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import signal
 import socket
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from scripts.fase2_municipios.v2 import authority
 from scripts.fase2_municipios.v2.agents import certifier
@@ -44,7 +50,6 @@ from scripts.fase2_municipios.v2.eval.live_abc_adapter import render_page_networ
 from scripts.fase2_municipios.v2.eval.live_model_policy import (
     ErrorCategory,
     classify_error,
-    load_model_credentials,
 )
 from scripts.fase2_municipios.v2.eval.platform_probe_runner import (
     Fetcher,
@@ -56,9 +61,14 @@ from scripts.fase2_municipios.v2.eval.platform_probe_runner import (
 
 
 LOGGER = logging.getLogger(__name__)
-REQUIRED_MODEL = "gemini-2.5-pro"
-FALLBACK_MODEL = "gemini-2.5-flash"
+REQUIRED_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_MODEL = REQUIRED_MODEL
 MAX_POLICY_SEARCHES = 5
+MAX_OPERATIONAL_RPM = 12
+MIN_MODEL_INTERVAL_SECONDS = 60.0 / MAX_OPERATIONAL_RPM
+DEFAULT_DAILY_MODEL_LIMIT = 500
+DEFAULT_DAILY_SEARCH_LIMIT = 500
+QUOTA_STOP_FRACTION = 0.90
 SNIPPET_LIMIT = 500
 SNAPSHOT_LIMIT = 8000
 URL_PATTERN = re.compile(r"https?://[^\s<>\]\[{}\"']+", re.IGNORECASE)
@@ -76,14 +86,19 @@ OUTPUT_COLUMNS = (
     "redirector_original",
 )
 PROVIDERS = ("gemini_free_1", "gemini_free_2", "gemini_paid")
+TELEMETRY_COUNTERS = (
+    "model_requests", "successful_model_responses", "google_search_queries",
+    "query_count_unknown", "grounded_responses", "quota_429", "paid_calls",
+)
 UNIT_SCHEMA_VERSION = 1
-MAX_GROUNDING_REDIRECTS = 3
+MAX_GROUNDING_REDIRECTS = 3  # also the hard maximum HTTP requests per wrapper URL
 REDIRECT_RESOLUTION_TIMEOUT = 10
 # Add a host here only after confirming that it is an official Google
 # grounding redirector. Redirect recognition is intentionally fail-closed.
 GOOGLE_GROUNDING_REDIRECT_HOSTS = frozenset({
     "vertexaisearch.cloud.google.com",
 })
+GOOGLE_QUERY_REDIRECT_HOSTS = frozenset({"google.com", "www.google.com"})
 _BLOCKED_REDIRECT_HOSTS = frozenset({
     "localhost",
     "metadata.google.internal",
@@ -106,6 +121,8 @@ class GroundedAnswer:
     model: str = REQUIRED_MODEL
     provider: str = ""
     fallbacks: tuple[dict[str, str], ...] = ()
+    google_search_query_count: int | None = None
+    grounded: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,8 +149,8 @@ class GroundedClient(Protocol):
         """Perform one grounded search intent and return candidate evidence."""
 
 
-class ExplicitProRejection(RuntimeError):
-    """The API explicitly rejected gemini-2.5-pro for this request."""
+class ExplicitModelRejection(RuntimeError):
+    """An API provider explicitly rejected the exact required model."""
 
     def __init__(self, exact_error: str, provider: str = "") -> None:
         self.exact_error = exact_error
@@ -143,6 +160,57 @@ class ExplicitProRejection(RuntimeError):
 
 class RescueInterrupted(RuntimeError):
     """Cooperative stop used by SIGINT/SIGTERM handling."""
+
+
+class DailyQuotaExhausted(RuntimeError):
+    """FREE2 reported daily exhaustion; the run must checkpoint and stop."""
+
+
+class PreventiveQuotaStop(RuntimeError):
+    """The 90% model/search quota brake or global call budget fired."""
+
+
+class PolicyFailure(RuntimeError):
+    """A free-only invariant was violated."""
+
+
+@dataclass
+class QuotaGovernor:
+    """Run-wide 12 RPM limiter and preventive daily/budget brake."""
+
+    global_call_budget: int
+    daily_model_limit: int = DEFAULT_DAILY_MODEL_LIMIT
+    daily_search_limit: int = DEFAULT_DAILY_SEARCH_LIMIT
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    jitter: Callable[[], float] = random.random
+    min_interval_seconds: float = MIN_MODEL_INTERVAL_SECONDS
+    last_request_at: float | None = None
+
+    def before_request(self, *, model_requests: int, google_search_queries: int) -> None:
+        if self.global_call_budget < 1 or model_requests >= self.global_call_budget:
+            raise PreventiveQuotaStop("global_call_budget_exhausted")
+        model_stop = int(self.daily_model_limit * QUOTA_STOP_FRACTION)
+        search_stop = int(self.daily_search_limit * QUOTA_STOP_FRACTION)
+        # Stop before request/search number 450 when the active limit is 500.
+        if model_requests + 1 >= model_stop:
+            raise PreventiveQuotaStop("preventive_90pct_model_requests")
+        # A grounded response may report several real queries; reserve the
+        # per-intent policy maximum so a single response cannot cross 90%.
+        if google_search_queries + MAX_POLICY_SEARCHES >= search_stop:
+            raise PreventiveQuotaStop("preventive_90pct_google_search_queries")
+        now = self.clock()
+        if self.last_request_at is not None:
+            remaining = self.min_interval_seconds - (now - self.last_request_at)
+            if remaining > 0:
+                self.sleep(remaining)
+                now = max(self.clock(), self.last_request_at + self.min_interval_seconds)
+        self.last_request_at = now
+
+    def backoff_seconds(self, attempt: int, retry_after: float | None) -> float:
+        if retry_after is not None:
+            return max(0.0, retry_after)
+        return (2.0 ** max(0, attempt - 1)) + max(0.0, min(1.0, self.jitter()))
 
 
 @dataclass
@@ -200,27 +268,49 @@ def _is_explicit_model_rejection(exc: BaseException, model: str) -> bool:
 
 
 class GeminiGroundedClient:
-    """google-genai adapter with the repository's free/free/paid key policy."""
+    """google-genai adapter with structurally separate free-only routing."""
 
     def __init__(
         self,
         credentials: Mapping[str, str],
         *,
         client_factory: Callable[..., Any] | None = None,
+        free_only: bool = False,
+        global_call_budget: int = 100,
+        daily_model_limit: int = DEFAULT_DAILY_MODEL_LIMIT,
+        daily_search_limit: int = DEFAULT_DAILY_SEARCH_LIMIT,
+        clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        jitter: Callable[[], float] = random.random,
+        max_free2_attempts: int = 3,
     ) -> None:
-        if "GEMINI_API_KEY_FREE" not in credentials or "GEMINI_API_KEY" not in credentials:
-            raise ValueError("gemini_authorized_credentials_missing")
+        if not credentials.get("GEMINI_API_KEY_FREE"):
+            raise ValueError("gemini_free1_credential_missing")
+        if not free_only and not credentials.get("GEMINI_API_KEY"):
+            raise ValueError("gemini_paid_credential_missing_for_production")
         if client_factory is None:
             try:
                 from google import genai  # type: ignore[import-not-found]
             except ImportError as exc:
                 raise RuntimeError("google-genai no esta instalado") from exc
             client_factory = genai.Client
-        self._credentials = credentials
+        allowed_names = ("GEMINI_API_KEY_FREE", "GEMINI_API_KEY_FREE_2") if free_only else (
+            "GEMINI_API_KEY_FREE", "GEMINI_API_KEY_FREE_2", "GEMINI_API_KEY"
+        )
+        self._credentials = {name: credentials[name] for name in allowed_names if credentials.get(name)}
         self._client_factory = client_factory
         self._clients: dict[str, Any] = {}
+        self.free_only = free_only
         self._sleep = sleep
+        self._max_free2_attempts = max(1, max_free2_attempts)
+        self._governor = QuotaGovernor(
+            global_call_budget=global_call_budget,
+            daily_model_limit=daily_model_limit,
+            daily_search_limit=daily_search_limit,
+            clock=clock,
+            sleep=sleep,
+            jitter=jitter,
+        )
         self._calls: Counter[str] = Counter()
         self._errors: Counter[str] = Counter()
         self._responses: Counter[str] = Counter()
@@ -229,6 +319,12 @@ class GeminiGroundedClient:
         self._fallback_events: list[dict[str, str]] = []
         self._capacity_veto: dict[tuple[str, str], str] = {}
         self._capacity_errors: dict[tuple[str, str], str] = {}
+        self._model_requests = 0
+        self._successful_model_responses = 0
+        self._google_search_queries = 0
+        self._query_count_unknown = 0
+        self._grounded_responses = 0
+        self._quota_429 = 0
 
     @property
     def telemetry(self) -> dict[str, Any]:
@@ -249,6 +345,15 @@ class GeminiGroundedClient:
                 for (provider, model), cause in self._capacity_veto.items()
             ],
             "paid_calls": self._calls["gemini_paid"],
+            "model_requests": self._model_requests,
+            "successful_model_responses": self._successful_model_responses,
+            "google_search_queries": self._google_search_queries,
+            "query_count_unknown": self._query_count_unknown,
+            "grounded_responses": self._grounded_responses,
+            "calls_by_provider": {name: self._calls[name] for name in PROVIDERS},
+            "responses_by_provider": {name: self._responses[name] for name in PROVIDERS},
+            "errors_by_provider": {name: self._errors[name] for name in PROVIDERS},
+            "quota_429": self._quota_429,
         }
 
     @staticmethod
@@ -261,6 +366,15 @@ class GeminiGroundedClient:
         }
 
     def _invoke(self, provider: str, model: str, prompt: str) -> Any:
+        if model != REQUIRED_MODEL:
+            raise ValueError(f"model_debe_ser_exactamente_{REQUIRED_MODEL}")
+        if self.free_only and provider == "gemini_paid":
+            raise PolicyFailure("FALLO_DE_POLITICA:paid_provider_reachable")
+        self._governor.before_request(
+            model_requests=self._model_requests,
+            google_search_queries=self._google_search_queries,
+        )
+        self._model_requests += 1
         self._calls[provider] += 1
         try:
             if provider not in self._clients:
@@ -286,12 +400,21 @@ class GeminiGroundedClient:
             self._errors[provider] += 1
             if classify_error(exc).category is ErrorCategory.QUOTA_429:
                 self._quota_rate[provider] += 1
+                self._quota_429 += 1
             raise
         self._responses[provider] += 1
+        self._successful_model_responses += 1
         usage = getattr(response, "usage_metadata", None)
         total = getattr(usage, "total_token_count", 0) if usage is not None else 0
         if isinstance(total, int) and not isinstance(total, bool) and total > 0:
             self._tokens[provider] += total
+        query_count, grounded = extract_grounding_usage(response)
+        if query_count is None:
+            self._query_count_unknown += 1
+        else:
+            self._google_search_queries += query_count
+        if grounded:
+            self._grounded_responses += 1
         return response
 
     def _veto_capacity(self, provider: str, model: str, exc: BaseException) -> None:
@@ -364,7 +487,7 @@ class GeminiGroundedClient:
         if last is None:
             for provider in reversed(steps):
                 if (provider, model) in self._capacity_veto:
-                    raise ExplicitProRejection(
+                    raise ExplicitModelRejection(
                         self._capacity_errors.get(
                             (provider, model), "model_unavailable_for_provider"
                         ),
@@ -372,7 +495,7 @@ class GeminiGroundedClient:
                     )
             raise RuntimeError("provider_policy_without_attempt")
         if last_cause == "model_unavailable_for_provider":
-            raise ExplicitProRejection(
+            raise ExplicitModelRejection(
                 self._capacity_errors.get(
                     (last_provider, model),
                     _safe_error(last, self._secret_values()),
@@ -381,6 +504,96 @@ class GeminiGroundedClient:
             ) from last
         raise last
 
+    def _record_free_event(
+        self, events: list[dict[str, str]], provider: str, next_provider: str, cause: str
+    ) -> None:
+        event = {"from_provider": provider, "to_provider": next_provider, "cause": cause}
+        events.append(event)
+        self._fallback_events.append(dict(event))
+
+    @staticmethod
+    def _daily_quota_exhausted(exc: BaseException) -> bool:
+        if classify_error(exc).category is not ErrorCategory.QUOTA_429:
+            return False
+        text = str(exc).casefold()
+        return any(marker in text for marker in (
+            "per day", "daily", "requests per day", "rpd",
+            "generate_content_free_tier_requests", "quota metric: generatecontent",
+        ))
+
+    def _free_steps(self) -> tuple[str, ...]:
+        if self._credentials.get("GEMINI_API_KEY_FREE_2"):
+            return ("gemini_free_1", "gemini_free_2")
+        return ("gemini_free_1",)
+
+    def _free_only_call(self, model: str, prompt: str) -> tuple[Any, str, list[dict[str, str]]]:
+        """FREE1 -> FREE2 -> STOP; paid is structurally absent."""
+        last: BaseException | None = None
+        events: list[dict[str, str]] = []
+        steps = self._free_steps()
+        for index, provider in enumerate(steps):
+            if (provider, model) in self._capacity_veto:
+                continue
+            attempts = self._max_free2_attempts if provider == "gemini_free_2" else 1
+            for attempt in range(1, attempts + 1):
+                try:
+                    return self._invoke(provider, model, prompt), provider, events
+                except (RescueInterrupted, PreventiveQuotaStop, PolicyFailure):
+                    raise
+                except BaseException as exc:
+                    last = exc
+                    next_provider = steps[index + 1] if index + 1 < len(steps) else "STOP"
+                    if _is_explicit_model_rejection(exc, model):
+                        self._veto_capacity(provider, model, exc)
+                        self._record_free_event(
+                            events, provider, next_provider, "model_unavailable_for_provider"
+                        )
+                        break
+                    classified = classify_error(exc)
+                    if not classified.fallback_eligible:
+                        raise
+                    if provider == "gemini_free_2" and classified.category is ErrorCategory.QUOTA_429:
+                        if self._daily_quota_exhausted(exc):
+                            raise DailyQuotaExhausted("free2_daily_quota_exhausted") from exc
+                        delay = self._governor.backoff_seconds(attempt, classified.retry_after)
+                        if attempt < attempts:
+                            self._sleep(delay)
+                            continue
+                        self._sleep(delay)
+                    elif classified.category is ErrorCategory.QUOTA_429:
+                        # Retry-After/backoff applies even when the next attempt
+                        # rotates to another free provider.
+                        self._sleep(self._governor.backoff_seconds(attempt, classified.retry_after))
+                    self._record_free_event(events, provider, next_provider, classified.category.value)
+                    break
+        if last is None:
+            raise RuntimeError("free_provider_policy_without_attempt")
+        raise last
+
+    def _production_call(self, model: str, prompt: str) -> tuple[Any, str, list[dict[str, str]]]:
+        """Authorized production extension; never used by ``--free-only``."""
+        try:
+            return self._free_only_call(model, prompt)
+        except (RescueInterrupted, PreventiveQuotaStop, DailyQuotaExhausted, PolicyFailure):
+            raise
+        except BaseException as exc:
+            classified = classify_error(exc)
+            if not classified.fallback_eligible and not _is_explicit_model_rejection(exc, model):
+                raise
+            cause = (
+                "model_unavailable_for_provider"
+                if _is_explicit_model_rejection(exc, model)
+                else classified.category.value
+            )
+            event = {
+                "from_provider": self._free_steps()[-1],
+                "to_provider": "gemini_paid",
+                "cause": cause,
+            }
+            self._fallback_events.append(dict(event))
+            response = self._invoke("gemini_paid", model, prompt)
+            return response, "gemini_paid", [event]
+
     def search(self, query: str, *, model: str, municipio: str, bucket: str) -> GroundedAnswer:
         prompt = (
             "Atue somente como descobridor de URLs candidatas. Use Google Search. "
@@ -388,35 +601,22 @@ class GeminiGroundedClient:
             "nunca PDF, noticia individual ou edital individual. Responda com URLs completas "
             "e uma evidencia curta para cada uma. Consulta: " + query
         )
+        if model != REQUIRED_MODEL:
+            raise ValueError(f"model_debe_ser_exactamente_{REQUIRED_MODEL}")
         fallbacks: list[dict[str, str]] = []
-        actual_model = model
+        actual_model = REQUIRED_MODEL
         try:
-            response, provider, key_fallbacks = self._key_policy_call(model, prompt)
+            if self.free_only:
+                response, provider, key_fallbacks = self._free_only_call(model, prompt)
+            else:
+                response, provider, key_fallbacks = self._production_call(model, prompt)
             fallbacks.extend(key_fallbacks)
-        except ExplicitProRejection as exc:
-            if model != REQUIRED_MODEL:
-                raise
-            fallbacks.append({
-                "from_provider": exc.provider or "unknown",
-                "to_provider": exc.provider or "unknown",
-                "from_model": REQUIRED_MODEL,
-                "to_model": FALLBACK_MODEL,
-                "cause": "explicit_pro_rejection",
-                "exact_error": exc.exact_error,
-            })
-            actual_model = FALLBACK_MODEL
-            try:
-                response, provider, key_fallbacks = self._key_policy_call(actual_model, prompt)
-                fallbacks.extend(key_fallbacks)
-            except RescueInterrupted:
-                raise
-            except BaseException as fallback_exc:
-                raise RuntimeError(_safe_error(fallback_exc, self._secret_values())) from fallback_exc
-        except RescueInterrupted:
+        except (RescueInterrupted, PreventiveQuotaStop, DailyQuotaExhausted, PolicyFailure):
             raise
         except BaseException as exc:
             raise RuntimeError(_safe_error(exc, self._secret_values())) from exc
         urls, snippets = extract_grounding_metadata(response)
+        query_count, grounded = extract_grounding_usage(response)
         return GroundedAnswer(
             text=str(getattr(response, "text", "") or ""),
             grounding_urls=tuple(urls),
@@ -424,6 +624,8 @@ class GeminiGroundedClient:
             model=actual_model,
             provider=provider,
             fallbacks=tuple(fallbacks),
+            google_search_query_count=query_count,
+            grounded=grounded,
         )
 
     def _secret_values(self) -> tuple[str, ...]:
@@ -435,7 +637,7 @@ class GeminiGroundedClient:
 
 
 def _iter_candidates(response: Any) -> list[Any]:
-    candidates = getattr(response, "candidates", None)
+    candidates = response.get("candidates") if isinstance(response, Mapping) else getattr(response, "candidates", None)
     return list(candidates) if candidates else []
 
 
@@ -471,23 +673,75 @@ def extract_grounding_metadata(response: Any) -> tuple[list[str], list[str]]:
     return list(dict.fromkeys(urls)), list(dict.fromkeys(snippets))
 
 
-def _clean_url(raw: str) -> str:
-    value = html.unescape(raw).strip().rstrip(".,;:!?")
+def extract_grounding_usage(response: Any) -> tuple[int | None, bool]:
+    """Return only real API search-query metadata; never infer a count."""
+    counts: list[int] = []
+    grounded = False
+    metadata_seen = False
+    for candidate in _iter_candidates(response):
+        metadata = _get(candidate, "grounding_metadata")
+        if not metadata:
+            continue
+        metadata_seen = True
+        chunks = _get(metadata, "grounding_chunks", ()) or ()
+        supports = _get(metadata, "grounding_supports", ()) or ()
+        grounded = grounded or bool(chunks or supports)
+        queries = _get(metadata, "web_search_queries", None)
+        if queries is None:
+            queries = _get(metadata, "google_search_queries", None)
+        if isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+            counts.append(len(queries))
+    return (sum(counts) if counts else None), bool(metadata_seen and grounded)
+
+
+_MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]*\]\((https?://.*?)\)", re.IGNORECASE)
+_FORMAT_QUOTES = "\"'“”‘’«»"
+
+
+def _pre_normalize_url(raw: str) -> str:
+    """Remove observed markdown/Unicode corruption before any URL parsing."""
+    value = html.unescape(str(raw or ""))
+    match = _MARKDOWN_LINK_PATTERN.fullmatch(value.strip())
+    if match:
+        value = match.group(1)
+    value = re.sub(r"%60", "`", value, flags=re.IGNORECASE)
+    value = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+    value = value.strip().replace("`", "")
+    value = value.replace("**", "").replace("__", "")
+    previous = None
+    while value != previous:
+        previous = value
+        value = value.strip().strip(_FORMAT_QUOTES).rstrip(".,;:!?").strip(_FORMAT_QUOTES)
     for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
         while value.endswith(closing) and value.count(closing) > value.count(opening):
             value = value[:-1].rstrip(".,;:!?")
+    previous = None
+    while value != previous:
+        previous = value
+        value = value.strip().strip(_FORMAT_QUOTES).rstrip(".,;:!?").strip(_FORMAT_QUOTES)
+    return value
+
+
+def _clean_url(raw: str) -> str:
+    value = _pre_normalize_url(raw)
     try:
         parsed = urlsplit(value)
     except ValueError:
         return ""
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
         return ""
+    host = parsed.hostname.casefold().rstrip(".")
+    if host in GOOGLE_QUERY_REDIRECT_HOSTS and parsed.path == "/url":
+        destination = (parse_qs(parsed.query).get("q") or parse_qs(parsed.query).get("url") or [""])[0]
+        if destination and destination != value:
+            return _clean_url(destination)
     return urlunsplit((parsed.scheme.casefold(), parsed.netloc, parsed.path or "/", parsed.query, ""))
 
 
 def extract_answer_url_sources(answer: GroundedAnswer) -> list[tuple[str, str]]:
     """Extract candidate URLs while preserving their first model provenance."""
     found = [(item, "grounding") for item in answer.grounding_urls]
+    found.extend((item, "texto_modelo") for item in _MARKDOWN_LINK_PATTERN.findall(answer.text))
     found.extend((item, "texto_modelo") for item in URL_PATTERN.findall(answer.text))
     extracted: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -505,48 +759,89 @@ def extract_answer_urls(answer: GroundedAnswer) -> list[str]:
     return list(dict.fromkeys(url for url, _source in extract_answer_url_sources(answer)))
 
 
+_MUNICIPALITY_CONTEXT_CACHE: dict[str, tuple[str, str]] | None = None
+
+
+def _municipality_context() -> dict[str, tuple[str, str]]:
+    global _MUNICIPALITY_CONTEXT_CACHE
+    if _MUNICIPALITY_CONTEXT_CACHE is not None:
+        return _MUNICIPALITY_CONTEXT_CACHE
+    path = Path(__file__).resolve().parents[4] / "data/fase2/municipios_rs_local.csv"
+    context: dict[str, tuple[str, str]] = {}
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                natural = (row.get("municipio") or "").strip()
+                site = _clean_url((row.get("site_base") or "").strip())
+                slug = re.sub(r"[^a-z0-9]", "", _norm(natural))
+                if slug and natural:
+                    context[slug] = (natural, _host(site))
+    except OSError:
+        pass
+    _MUNICIPALITY_CONTEXT_CACHE = context
+    return context
+
+
+def municipality_natural_name(slug_or_name: str) -> tuple[str, str]:
+    slug = re.sub(r"[^a-z0-9]", "", _norm(slug_or_name))
+    natural, domain = _municipality_context().get(slug, (slug_or_name.strip(), ""))
+    words = natural.split()
+    for index in range(1, len(words)):
+        if words[index].casefold() in {"da", "das", "de", "do", "dos", "e"}:
+            words[index] = words[index].casefold()
+    return " ".join(words), domain
+
+
 def build_queries(target: Target) -> list[str]:
-    kind = "concursos publicos edital" if target.bucket == "concurso_publico" else "processo seletivo simplificado edital"
-    base = f'prefeitura "{target.municipio}" RS {kind} site oficial'
+    natural_name, official_domain = municipality_natural_name(target.municipio)
+    kind = (
+        '"concurso público" cargos efetivos edital'
+        if target.bucket == "concurso_publico"
+        else '"processo seletivo simplificado" contratação temporária edital'
+    )
+    exclusions = (
+        "excluir processo seletivo e contratação temporária"
+        if target.bucket == "concurso_publico"
+        else "excluir concurso público para cargos efetivos"
+    )
+    domain = f" site:{official_domain}" if official_domain else " site oficial"
+    hint = f"Pista original: {target.pista}"
+    base = f'prefeitura "{natural_name}" RS {kind} 2026{domain}; {exclusions}'
     if target.sub_causa == "render_incierto":
         return [
-            f'{base} superficie oficial estatica alternativa com itens. Pista: {target.pista}',
-            f'{base} endpoint XHR AJAX da listagem oficial. Pista: {target.pista}',
-            f'{base} URL final da listagem oficial apos carregamento. Pista: {target.pista}',
-            f'{base} documento ou indice oficial enlazado pela pagina. Pista: {target.pista}',
-            f'{base} parametros reproduziveis de filtro e paginacao da listagem. Pista: {target.pista}',
+            f'{base}; superfície oficial estática alternativa com itens. {hint}',
+            f'{base}; endpoint XHR AJAX da listagem oficial. {hint}',
+            f'{base}; URL final da listagem oficial após carregamento. {hint}',
+            f'{base}; documento ou índice oficial ligado pela página. {hint}',
+            f'{base}; parâmetros reproduzíveis de filtro e paginação da listagem. {hint}',
         ]
     if target.sub_causa == "dificil_rederivado":
-        qualifier = (
-            "onde publica concursos publicos para cargos efetivos; excluir selecao publica, "
-            "processo seletivo e contratacao temporaria"
-        )
         return [
-            f'{base}; {qualifier}. Pista: {target.pista}',
-            f'prefeitura "{target.municipio}" RS indice oficial de concurso publico para cargos efetivos',
-            f'site:rs.gov.br "{target.municipio}" "concurso publico" edital -"processo seletivo"',
-            f'"{target.municipio}" onde publica concursos publicos nao-selecoes site oficial',
-            f'prefeitura municipal de "{target.municipio}" concursos publicos historico editais efetivos',
+            f'{base}; onde publica a listagem oficial. {hint}',
+            f'{base}; índice oficial e histórico. {hint}',
+            f'{base}; página de publicações da prefeitura. {hint}',
+            f'{base}; todos os anos e arquivos anteriores. {hint}',
+            f'{base}; menu transparência editais e seleções. {hint}',
         ]
     return [
-        f"{base}. Pista: {target.pista}",
-        f'{kind} "{target.municipio}" RS indice listagem prefeitura',
-        f'site:rs.gov.br "{target.municipio}" {kind}',
-        f'"{target.municipio}" {kind} atende.net OR multi24h',
-        f'prefeitura municipal de "{target.municipio}" {kind} todos os anos',
+        f"{base}; índice ou listagem oficial. {hint}",
+        f'{base}; publicações e editais vigentes. {hint}',
+        f'{base}; histórico de editais todos os anos. {hint}',
+        f'{base}; portal oficial delegado pela prefeitura. {hint}',
+        f'{base}; menu transparência concursos e seleções. {hint}',
     ]
 
 
 def _host(url: str) -> str:
     try:
-        return (urlsplit(url).hostname or "").casefold().rstrip(".")
+        return (urlsplit(_pre_normalize_url(url)).hostname or "").casefold().rstrip(".")
     except ValueError:
         return ""
 
 
 def _is_google_grounding_redirect(url: str) -> bool:
     try:
-        parsed = urlsplit(url)
+        parsed = urlsplit(_pre_normalize_url(url))
     except ValueError:
         return False
     return (
@@ -584,7 +879,7 @@ def _redirect_hop_is_safe(
 ) -> bool:
     """Fail closed for schemes and explicit local/private redirect targets."""
     try:
-        parsed = urlsplit(url)
+        parsed = urlsplit(_pre_normalize_url(url))
         host = (parsed.hostname or "").casefold().rstrip(".")
     except ValueError:
         return False
@@ -643,7 +938,7 @@ def _resolve_grounding_redirect(
                 cache[key] = None
                 return cache[key]
             session = session_factory()
-            for redirects_followed in range(MAX_GROUNDING_REDIRECTS + 1):
+            for redirects_followed in range(MAX_GROUNDING_REDIRECTS):
                 if not _redirect_hop_is_safe(current, host_resolver):
                     cache[key] = None
                     break
@@ -662,7 +957,7 @@ def _resolve_grounding_redirect(
                 if not is_redirect:
                     cache[key] = current if not _is_google_grounding_redirect(current) else None
                     break
-                if redirects_followed >= MAX_GROUNDING_REDIRECTS:
+                if redirects_followed + 1 >= MAX_GROUNDING_REDIRECTS:
                     cache[key] = None
                     break
                 next_url = _clean_url(urljoin(current, location))
@@ -716,6 +1011,37 @@ def read_targets(path: Path) -> list[Target]:
     return targets
 
 
+def load_grounded_credentials(path: Path, *, free_only: bool) -> dict[str, str]:
+    """Load only authorized names; paid is not required or returned in free-only."""
+    try:
+        lines = Path(path).expanduser().read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError("gemini_credential_file_unreadable") from exc
+    allowed = {"GEMINI_API_KEY_FREE", "GEMINI_API_KEY_FREE_2"}
+    if not free_only:
+        allowed.add("GEMINI_API_KEY")
+    loaded: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, value = stripped.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if name not in allowed:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if value:
+            loaded[name] = value
+    required = {"GEMINI_API_KEY_FREE"} if free_only else {
+        "GEMINI_API_KEY_FREE", "GEMINI_API_KEY"
+    }
+    missing = sorted(required.difference(loaded))
+    if missing:
+        raise ValueError("gemini_authorized_credentials_missing:" + ",".join(missing))
+    return loaded
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -761,11 +1087,19 @@ def _provider_snapshot(client: GroundedClient) -> dict[str, Any]:
             field: int(raw.get(field, 0) or 0)
             for field in ("calls", "errors", "responses", "tokens", "quota_rate")
         }
-    return {
+    snapshot = {
         "providers": normalized,
         "fallback_events": list(telemetry.get("fallback_events", ()) or ()),
         "capacidad_vetada": list(telemetry.get("capacidad_vetada", ()) or ()),
     }
+    snapshot.update({name: int(telemetry.get(name, 0) or 0) for name in TELEMETRY_COUNTERS})
+    # Legacy/injected clients still get honest provider-derived request totals.
+    if "model_requests" not in telemetry:
+        snapshot["model_requests"] = sum(item["calls"] for item in normalized.values())
+    if "successful_model_responses" not in telemetry:
+        snapshot["successful_model_responses"] = sum(item["responses"] for item in normalized.values())
+    snapshot["paid_calls"] = normalized["gemini_paid"]["calls"]
+    return snapshot
 
 
 def _unit_telemetry(
@@ -793,11 +1127,18 @@ def _unit_telemetry(
         for item in after.get("capacidad_vetada", ()) or ()
         if tuple(item) not in before_vetoes
     ]
+    counters = {
+        name: max(0, int(after.get(name, 0)) - int(before.get(name, 0)))
+        for name in TELEMETRY_COUNTERS
+    }
     return {
         "providers": providers,
         "fallbacks": clean_fallbacks,
         "capacidad_vetada": new_vetoes,
-        "paid_calls": providers["gemini_paid"]["calls"],
+        **counters,
+        "calls_by_provider": {name: providers[name]["calls"] for name in PROVIDERS},
+        "responses_by_provider": {name: providers[name]["responses"] for name in PROVIDERS},
+        "errors_by_provider": {name: providers[name]["errors"] for name in PROVIDERS},
     }
 
 
@@ -818,7 +1159,10 @@ def _read_unit_files(output_dir: Path) -> list[dict[str, Any]]:
         if (
             isinstance(payload, dict)
             and payload.get("schema_version") == UNIT_SCHEMA_VERSION
-            and payload.get("estado") in {"completed", "failed"}
+            and payload.get("estado") in {
+                "completed", "failed", "DETENIDA_CUOTA_DIARIA_FREE2",
+                "DETENIDA_FRENO_CUOTA", "FALLO_DE_POLITICA",
+            }
         ):
             payloads.append(payload)
     return payloads
@@ -868,6 +1212,8 @@ def micro_acquire_unit(
     timestamp_run: str,
     fetch_timeout: int = 30,
     renderer: Callable[[str], Any] = render_page_networkidle,
+    selection_reason: str = "url_candidata_unica_evaluada",
+    prior_redirector: str = "",
 ) -> dict[str, Any]:
     """Perform exactly one controlled fetch+render acquisition and persist it."""
     initial_url = url
@@ -876,6 +1222,7 @@ def micro_acquire_unit(
     snapshot_text = ""
     status: Any = None
     render_obtained = False
+    redirect_chain = [item for item in (prior_redirector, initial_url) if item]
     error = ""
     if not initial_url:
         trigger = "sin_url_candidata_grounded"
@@ -883,10 +1230,14 @@ def micro_acquire_unit(
         try:
             fetched = fetcher.get(initial_url, fetch_timeout)
             final_url = _clean_url(fetched.final_url or initial_url) or initial_url
+            if final_url and final_url != redirect_chain[-1]:
+                redirect_chain.append(final_url)
             rendered = renderer(final_url)
             if rendered is not None:
                 render_obtained = True
                 final_url = _clean_url(getattr(rendered, "final_url", "") or final_url) or final_url
+                if final_url and final_url != redirect_chain[-1]:
+                    redirect_chain.append(final_url)
                 snapshot_text = str(getattr(rendered, "text", "") or "")
                 status = getattr(rendered, "status", None)
             else:
@@ -914,6 +1265,8 @@ def micro_acquire_unit(
     payload = {
         "url_inicial": initial_url,
         "url_final": final_url,
+        "cadena_redirects": redirect_chain,
+        "razon_seleccion_url": selection_reason,
         "trigger": trigger,
         "snapshot_recortado": snapshot_text[:SNAPSHOT_LIMIT],
         "citas_candidatas": quotes,
@@ -928,6 +1281,38 @@ def micro_acquire_unit(
     path = output_dir / f"micro_{target.municipio}_{target.bucket}.json"
     _atomic_write_json(path, payload)
     return payload
+
+
+def _select_micro_target(target: Target, pending: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Prefer a replay URL; otherwise require an evaluated, unambiguous candidate."""
+    original_urls = extract_answer_urls(GroundedAnswer(text=target.pista))
+    for original in original_urls:
+        allowed, reason = official_host_check(target.municipio, original)
+        if allowed:
+            return {
+                "url": original, "query": "", "snippet": target.pista,
+                "host_oficial_check": reason, "fuente": "target_original",
+                "redirector_original": "", "selection_reason": "url_original_target_replay",
+            }
+    evaluated = [dict(item) for item in pending if item.get("url") and item.get("host_oficial_check")]
+    bucket_specific = [
+        item for item in evaluated
+        if _bucket_matches(f'{item.get("url", "")} {item.get("snippet", "")}', target.bucket)
+    ]
+    if len(bucket_specific) == 1:
+        selected = bucket_specific[0]
+        selected["selection_reason"] = "unica_candidata_con_evidencia_del_bucket"
+        return selected
+    if len(evaluated) == 1:
+        selected = evaluated[0]
+        selected["selection_reason"] = "unica_candidata_oficial_estable_evaluada"
+        return selected
+    return {
+        "url": "", "query": "", "snippet": "",
+        "host_oficial_check": "sin_url_no_ambigua",
+        "fuente": "", "redirector_original": "",
+        "selection_reason": "sin_candidata_evaluada_no_ambigua",
+    }
 
 
 def run_micro_acquisitions(
@@ -956,12 +1341,7 @@ def run_micro_acquisitions(
         pending = unit.get("micro_pendientes", [])
         if unit["candidatas"]:
             continue
-        selected = pending[0] if pending else {
-            "url": "",
-            "query": "",
-            "snippet": "",
-            "host_oficial_check": "sin_url_candidata_grounded",
-        }
+        selected = _select_micro_target(target, pending)
         payload = micro_acquire_unit(
             target,
             selected["url"],
@@ -970,6 +1350,8 @@ def run_micro_acquisitions(
             timestamp_run=timestamp_run,
             fetch_timeout=fetch_timeout,
             renderer=renderer,
+            selection_reason=selected["selection_reason"],
+            prior_redirector=selected.get("redirector_original", ""),
         )
         unit["micro_archivo"] = f"micro_{target.municipio}_{target.bucket}.json"
         unit["micro_veredicto"] = payload["veredicto_gate"]
@@ -1010,13 +1392,10 @@ def run_rescue(
     redirect_host_resolver: Callable[[str], Sequence[str]] = _default_redirect_host_resolver,
     interruption: InterruptionState | None = None,
     timestamp_factory: Callable[[], str] = _utc_timestamp,
+    free_only: bool = False,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
-    if model not in (REQUIRED_MODEL, FALLBACK_MODEL):
-        # FALLBACK_MODEL autorizado por Luis (13-jul): canary independiente
-        # confirmó que gemini-2.5-pro tiene limit=0 en free tier
-        # (429 generate_content_free_tier_requests); Pro queda no disponible
-        # para free durante toda la corrida, sin reintentos por unidad.
-        raise ValueError(f"model_debe_ser_{REQUIRED_MODEL}_o_{FALLBACK_MODEL}")
+    if model != REQUIRED_MODEL:
+        raise ValueError(f"model_debe_ser_exactamente_{REQUIRED_MODEL}")
     if not 1 <= max_searches <= MAX_POLICY_SEARCHES:
         raise ValueError("max_searches_debe_estar_entre_1_y_5")
     policy = {
@@ -1027,7 +1406,11 @@ def run_rescue(
         "confirmation_performed": False,
         "writes_url_map": False,
         "micro_acquire": micro_acquire,
+        "free_only": free_only,
+        "provider_sequence": "FREE1->FREE2->STOP" if free_only else "FREE1->FREE2->PAID",
     }
+    if free_only and _provider_snapshot(client)["paid_calls"] != 0:
+        raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_before_run")
     output_path = Path(output_dir) if output_dir is not None else None
     if output_path is not None:
         output_path.mkdir(parents=True, exist_ok=True)
@@ -1086,9 +1469,47 @@ def run_rescue(
                         municipio=target.municipio,
                         bucket=target.bucket,
                     )
+                    if free_only and _provider_snapshot(client)["paid_calls"] != 0:
+                        raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_changed")
                 except RescueInterrupted:
                     raise
+                except PolicyFailure as exc:
+                    error = {"query": query, "type": "FALLO_DE_POLITICA"}
+                    grounded["errores"].append(error)
+                    query_result["error"] = dict(error)
+                    grounded["queries"].append(query_result)
+                    estado = "FALLO_DE_POLITICA"
+                    causa = str(exc)
+                    stop_after_current = True
+                    break
+                except DailyQuotaExhausted:
+                    error = {"query": query, "type": "cuota_diaria_free2_agotada"}
+                    grounded["errores"].append(error)
+                    query_result["error"] = dict(error)
+                    grounded["queries"].append(query_result)
+                    estado = "DETENIDA_CUOTA_DIARIA_FREE2"
+                    causa = "checkpoint_atomico_cuota_diaria_free2"
+                    stop_after_current = True
+                    break
+                except PreventiveQuotaStop as exc:
+                    error = {"query": query, "type": str(exc)}
+                    grounded["errores"].append(error)
+                    query_result["error"] = dict(error)
+                    grounded["queries"].append(query_result)
+                    estado = "DETENIDA_FRENO_CUOTA"
+                    causa = str(exc)
+                    stop_after_current = True
+                    break
                 except BaseException as exc:
+                    if free_only and _provider_snapshot(client)["paid_calls"] != 0:
+                        error = {"query": query, "type": "FALLO_DE_POLITICA"}
+                        grounded["errores"].append(error)
+                        query_result["error"] = dict(error)
+                        grounded["queries"].append(query_result)
+                        estado = "FALLO_DE_POLITICA"
+                        causa = "FALLO_DE_POLITICA:paid_calls_changed_during_error"
+                        stop_after_current = True
+                        break
                     error = {"query": query, "type": type(exc).__name__}
                     grounded["errores"].append(error)
                     query_result["error"] = dict(error)
@@ -1233,19 +1654,19 @@ def run_rescue(
                     ))
                 if index + 1 < len(queries) and sleep_seconds:
                     sleep(sleep_seconds)
-            if grounded["queries"] and all("error" in item for item in grounded["queries"]):
+            if (
+                estado == "completed"
+                and grounded["queries"]
+                and all("error" in item for item in grounded["queries"])
+            ):
                 estado = "failed"
                 causa = "all_grounded_searches_failed"
-            if micro_acquire and target.sub_causa == "render_incierto" and not unit_candidates:
+            if (
+                estado == "completed" and micro_acquire
+                and target.sub_causa == "render_incierto" and not unit_candidates
+            ):
                 pending = grounded["micro_pendientes"]
-                selected = pending[0] if pending else {
-                    "url": "",
-                    "query": "",
-                    "snippet": "",
-                    "host_oficial_check": "sin_url_candidata_grounded",
-                    "fuente": "",
-                    "redirector_original": "",
-                }
+                selected = _select_micro_target(target, pending)
                 if output_path is None:
                     raise ValueError("micro_acquire_requiere_output_dir")
                 micro_result = micro_acquire_unit(
@@ -1256,6 +1677,8 @@ def run_rescue(
                     timestamp_run=timestamp_factory(),
                     fetch_timeout=fetch_timeout,
                     renderer=renderer,
+                    selection_reason=selected["selection_reason"],
+                    prior_redirector=selected.get("redirector_original", ""),
                 )
                 if micro_result["veredicto_gate"]["pasa"]:
                     unit_candidates.append(CandidateRow(
@@ -1310,6 +1733,9 @@ def run_rescue(
     else:
         summary = _aggregate_unit_payloads(payloads, policy=policy, skipped_existing=0)
         candidates = _rows_from_unit_payloads(payloads)
+    if free_only and summary["global"]["paid_calls"] != 0:
+        summary["global"]["estado_corrida"] = "FALLO_DE_POLITICA"
+        raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_after_run")
     return candidates, summary
 
 
@@ -1336,6 +1762,7 @@ def _aggregate_unit_payloads(
     candidates = 0
     searches = 0
     capacity_vetoes: list[tuple[str, str, str]] = []
+    telemetry_counters = Counter({name: 0 for name in TELEMETRY_COUNTERS})
     for payload in payloads:
         grounded = dict(payload.get("grounded", {}) or {})
         key = f'{payload.get("municipio", "")}/{payload.get("bucket", "")}'
@@ -1353,6 +1780,8 @@ def _aggregate_unit_payloads(
         candidates += len(grounded.get("candidatas", ()) or ())
         searches += int(grounded.get("busquedas_usadas", 0) or 0)
         telemetry = payload.get("telemetria", {}) or {}
+        for name in TELEMETRY_COUNTERS:
+            telemetry_counters[name] += int(telemetry.get(name, 0) or 0)
         for provider in PROVIDERS:
             raw = telemetry.get("providers", {}).get(provider, {}) or {}
             for field in providers[provider]:
@@ -1368,6 +1797,7 @@ def _aggregate_unit_payloads(
                 capacity_vetoes.append(normalized_veto)
     calls_by_provider = {name: values["calls"] for name, values in providers.items()}
     errors_by_provider = {name: values["errors"] for name, values in providers.items()}
+    responses_by_provider = {name: values["responses"] for name, values in providers.items()}
     tokens_by_provider = {name: values["tokens"] for name, values in providers.items()}
     fallbacks_by_provider = {
         name: dict(counter) for name, counter in fallback_counters.items()
@@ -1386,13 +1816,29 @@ def _aggregate_unit_payloads(
             "llamadas": sum(calls_by_provider.values()),
             "errores": sum(errors_by_provider.values()),
             "calls_by_provider": calls_by_provider,
+            "responses_by_provider": responses_by_provider,
             "tokens_by_provider": tokens_by_provider,
             "errors_by_provider": errors_by_provider,
             "fallbacks_by_provider": fallbacks_by_provider,
             "capacidad_vetada": capacity_vetoes,
             "paid_calls": calls_by_provider["gemini_paid"],
+            "model_requests": telemetry_counters["model_requests"],
+            "successful_model_responses": telemetry_counters["successful_model_responses"],
+            "google_search_queries": telemetry_counters["google_search_queries"],
+            "query_count_unknown": telemetry_counters["query_count_unknown"],
+            "grounded_responses": telemetry_counters["grounded_responses"],
+            "quota_429": telemetry_counters["quota_429"],
             "telemetria": {
                 "providers": providers,
+                "model_requests": telemetry_counters["model_requests"],
+                "successful_model_responses": telemetry_counters["successful_model_responses"],
+                "google_search_queries": telemetry_counters["google_search_queries"],
+                "query_count_unknown": telemetry_counters["query_count_unknown"],
+                "grounded_responses": telemetry_counters["grounded_responses"],
+                "calls_by_provider": calls_by_provider,
+                "responses_by_provider": responses_by_provider,
+                "errors_by_provider": errors_by_provider,
+                "quota_429": telemetry_counters["quota_429"],
                 "fallbacks_by_provider": fallbacks_by_provider,
                 "capacidad_vetada": capacity_vetoes,
                 "paid_calls": calls_by_provider["gemini_paid"],
@@ -1447,6 +1893,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sleep", type=float, default=1.0)
     parser.add_argument("--fetch-timeout", type=int, default=30)
     parser.add_argument(
+        "--free-only", action="store_true",
+        help="Secuencia estructural FREE1 -> FREE2 -> STOP; obligatoria para rescate/evaluacion.",
+    )
+    parser.add_argument(
+        "--global-call-budget", type=int,
+        default=int(os.environ.get("GROUNDED_GLOBAL_CALL_BUDGET", "100")),
+    )
+    parser.add_argument(
+        "--daily-model-limit", type=int,
+        default=int(os.environ.get("GROUNDED_DAILY_MODEL_LIMIT", str(DEFAULT_DAILY_MODEL_LIMIT))),
+    )
+    parser.add_argument(
+        "--daily-search-limit", type=int,
+        default=int(os.environ.get("GROUNDED_DAILY_SEARCH_LIMIT", str(DEFAULT_DAILY_SEARCH_LIMIT))),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Salta unidades completed ya persistidas; reintenta failed o ausentes.",
@@ -1468,8 +1930,18 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.sleep < 0 or args.fetch_timeout < 1:
         raise ValueError("sleep/fetch-timeout invalidos")
-    credentials = load_model_credentials(args.credentials_file)
-    client = GeminiGroundedClient(credentials)
+    if not args.free_only:
+        raise PolicyFailure("FALLO_DE_POLITICA:rescate_cli_requiere_--free-only")
+    if args.global_call_budget < 1 or args.daily_model_limit < 1 or args.daily_search_limit < 1:
+        raise ValueError("limites_de_cuota_invalidos")
+    credentials = load_grounded_credentials(args.credentials_file, free_only=True)
+    client = GeminiGroundedClient(
+        credentials,
+        free_only=True,
+        global_call_budget=args.global_call_budget,
+        daily_model_limit=args.daily_model_limit,
+        daily_search_limit=args.daily_search_limit,
+    )
     targets = read_targets(args.targets)
     fetcher = RequestsFetcher()
     interruption = InterruptionState()
@@ -1492,6 +1964,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip_existing=args.skip_existing,
                 micro_acquire=args.micro_acquire,
                 interruption=interruption,
+                free_only=True,
             )
         except RescueInterrupted:
             payloads = _read_unit_files(args.output_dir)
@@ -1507,7 +1980,14 @@ def main(argv: list[str] | None = None) -> int:
         summary["global"]["unidades"],
         len(rows),
     )
-    return 130 if interruption.requested else 0
+    if interruption.requested:
+        return 130
+    states = {unit.get("estado") for unit in summary.get("unidades", {}).values()}
+    if "FALLO_DE_POLITICA" in states:
+        return 4
+    if states & {"DETENIDA_CUOTA_DIARIA_FREE2", "DETENIDA_FRENO_CUOTA"}:
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

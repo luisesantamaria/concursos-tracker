@@ -12,13 +12,19 @@ from unittest.mock import patch
 from scripts.fase2_municipios.v2.eval.grounded_rescue import (
     FALLBACK_MODEL,
     REQUIRED_MODEL,
+    DailyQuotaExhausted,
     GeminiGroundedClient,
     GroundedAnswer,
     InterruptionState,
+    PolicyFailure,
+    PreventiveQuotaStop,
+    QuotaGovernor,
     Target,
+    _clean_url,
     _new_redirect_session,
     build_queries,
     extract_answer_url_sources,
+    load_grounded_credentials,
     micro_acquire_unit,
     read_targets,
     rebuild_summary,
@@ -106,9 +112,12 @@ def public_host_resolver(_host: str) -> tuple[str, ...]:
 
 
 class HttpError(RuntimeError):
-    def __init__(self, status: int, message: str, *, pro_rejected: bool = False) -> None:
+    def __init__(
+        self, status: int, message: str, *, pro_rejected: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
-        self.response = SimpleNamespace(status_code=status, headers={})
+        self.response = SimpleNamespace(status_code=status, headers=headers or {})
         self.pro_rejected = pro_rejected
 
 
@@ -138,6 +147,19 @@ class SequencedClient:
         self.outcomes = outcomes
         self.log = log
         self.models = SequencedModels(self)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 class GroundedRescueTests(unittest.TestCase):
@@ -298,7 +320,7 @@ class GroundedRescueTests(unittest.TestCase):
         clients = {
             "FREE1": SequencedClient(
                 "free1",
-                [HttpError(404, "gemini-2.5-pro model not found", pro_rejected=True)],
+                [HttpError(404, f"{REQUIRED_MODEL} model not found", pro_rejected=True)],
                 log,
             ),
             "FREE2": SequencedClient("free2", [sdk_response(), sdk_response()], log),
@@ -339,7 +361,7 @@ class GroundedRescueTests(unittest.TestCase):
             ),
             "FREE2": SequencedClient(
                 "free2",
-                [HttpError(404, "gemini-2.5-pro model not found", pro_rejected=True)],
+                [HttpError(404, f"{REQUIRED_MODEL} model not found", pro_rejected=True)],
                 log,
             ),
             "PAID": SequencedClient("paid", [sdk_response(), sdk_response()], log),
@@ -396,7 +418,7 @@ class GroundedRescueTests(unittest.TestCase):
             sleep_seconds=0,
         )
         self.assertEqual([], rows)
-        self.assertEqual(4, len(session.calls))
+        self.assertEqual(3, len(session.calls))
         self.assertTrue(all(timeout <= 10 and not follow for _, timeout, follow in session.calls))
 
     def test_private_metadata_and_local_redirect_targets_are_rejected_at_every_hop(self) -> None:
@@ -708,11 +730,11 @@ class GroundedRescueTests(unittest.TestCase):
             "render_incierto",
         ))
         expected = (
-            "superficie oficial estatica alternativa",
+            "superfície oficial estática alternativa",
             "endpoint XHR AJAX",
             "URL final da listagem oficial",
-            "documento ou indice oficial enlazado",
-            "parametros reproduziveis de filtro e paginacao",
+            "documento ou índice oficial ligado",
+            "parâmetros reproduzíveis de filtro e paginação",
         )
         self.assertEqual(5, len(queries))
         self.assertEqual(expected, tuple(marker for marker, query in zip(expected, queries) if marker in query))
@@ -745,6 +767,7 @@ class GroundedRescueTests(unittest.TestCase):
                 "url_inicial", "url_final", "trigger",
                 "snapshot_recortado", "citas_candidatas",
                 "veredicto_gate", "http_status", "timestamp",
+                "cadena_redirects", "razon_seleccion_url",
             }, set(durable))
             self.assertTrue(durable["citas_candidatas"])
             self.assertTrue(durable["veredicto_gate"]["pasa"])
@@ -845,22 +868,15 @@ class GroundedRescueTests(unittest.TestCase):
         discarded = summary["unidades"]["camaqua/concurso_publico"]["descartadas"]
         self.assertEqual("host_no_oficial", discarded[0]["razon"])
 
-    def test_explicit_pro_rejection_is_only_then_flash_fallback(self) -> None:
+    def test_free1_model_unavailable_is_vetoed_once_and_model_never_rotates(self) -> None:
         log: list[tuple] = []
         clients = {
             "FREE": SequencedClient(
                 "free",
-                [
-                    HttpError(404, "gemini-2.5-pro model not found", pro_rejected=True),
-                    sdk_response(),
-                ],
+                [HttpError(404, f"{REQUIRED_MODEL} model not found", pro_rejected=True)],
                 log,
             ),
-            "PAID": SequencedClient(
-                "paid",
-                [HttpError(404, "gemini-2.5-pro model not found", pro_rejected=True)],
-                log,
-            ),
+            "FREE2": SequencedClient("free2", [sdk_response(), sdk_response()], log),
         }
 
         def factory(*, api_key, vertexai):
@@ -868,18 +884,18 @@ class GroundedRescueTests(unittest.TestCase):
             return clients[api_key]
 
         client = GeminiGroundedClient(
-            {"GEMINI_API_KEY_FREE": "FREE", "GEMINI_API_KEY": "PAID"},
+            {"GEMINI_API_KEY_FREE": "FREE", "GEMINI_API_KEY_FREE_2": "FREE2"},
             client_factory=factory,
+            free_only=True,
             sleep=lambda _: None,
         )
         answer = client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
-        self.assertEqual(FALLBACK_MODEL, answer.model)
-        self.assertEqual(
-            [REQUIRED_MODEL, REQUIRED_MODEL, FALLBACK_MODEL],
-            [item[1] for item in log],
-        )
-        self.assertEqual("explicit_pro_rejection", answer.fallbacks[0]["cause"])
-        self.assertIn("model not found", answer.fallbacks[0]["exact_error"])
+        client.search("q2", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
+        self.assertEqual(REQUIRED_MODEL, FALLBACK_MODEL)
+        self.assertEqual(REQUIRED_MODEL, answer.model)
+        self.assertEqual(["free", "free2", "free2"], [item[0] for item in log])
+        events = client.telemetry["fallback_events"]
+        self.assertEqual(1, sum(e["cause"] == "model_unavailable_for_provider" for e in events))
         self.assertEqual({"google_search": {}}, log[0][2]["tools"][0])
         self.assertNotIn("retrieval", json.dumps(log[0][2]).casefold())
 
@@ -899,11 +915,271 @@ class GroundedRescueTests(unittest.TestCase):
             sleep=lambda _: None,
         )
         answer = client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
-        self.assertEqual(["free", "free", "paid"], [item[0] for item in log])
+        self.assertEqual(["free", "paid"], [item[0] for item in log])
         self.assertEqual("gemini_paid", answer.provider)
         self.assertEqual("quota_429", answer.fallbacks[-1]["cause"])
-        self.assertEqual(2, client.telemetry["providers"]["gemini_free_1"]["errors"])
+        self.assertEqual(1, client.telemetry["providers"]["gemini_free_1"]["errors"])
         self.assertEqual(1, client.telemetry["providers"]["gemini_paid"]["responses"])
+
+    def test_observed_url_corruptions_are_normalized_before_parsing(self) -> None:
+        expected = "https://camaqua.rs.gov.br/concursos?ano=2026&tipo=aberto"
+        cases = (
+            expected + "`",
+            expected + "%60",
+            "**" + expected + "**",
+            "__" + expected + "__",
+            f'“{expected}”).',
+            f"[índice oficial]({expected})",
+            "https://www.google.com/url?q=" + expected.replace("&", "%26"),
+            expected.replace("&", "&amp;") + "\u200b",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(expected, _clean_url(raw))
+
+    def test_joined_slug_becomes_natural_name_and_hint_survives_every_query(self) -> None:
+        target = Target(
+            "fortalezadosvalos", "concurso_publico", "documentos oficiais conhecidos"
+        )
+        queries = build_queries(target)
+        self.assertEqual(5, len(queries))
+        self.assertTrue(all('"Fortaleza dos Valos"' in query for query in queries))
+        self.assertTrue(all("fortalezadosvalos" not in query for query in queries))
+        self.assertTrue(all("Pista original: documentos oficiais conhecidos" in query for query in queries))
+        self.assertTrue(all("site:pmfv.rs.gov.br" in query and "2026" in query for query in queries))
+        self.assertTrue(all("concurso público" in query and "excluir processo seletivo" in query for query in queries))
+        pss_queries = build_queries(Target(
+            "fortalezadosvalos", "processo_seletivo", "mesma pista"
+        ))
+        self.assertTrue(all(
+            "processo seletivo simplificado" in query
+            and "excluir concurso público" in query
+            and "Pista original: mesma pista" in query
+            for query in pss_queries
+        ))
+
+    def test_micro_acquisition_reuses_original_target_url_without_grounded_url(self) -> None:
+        original = "https://camaqua.rs.gov.br/concursos"
+        rendered = SimpleNamespace(
+            final_url=original,
+            text="Prefeitura de Camaqua\nConcurso Publico Edital 01/2026",
+            status=200,
+        )
+        target = Target("camaqua", "concurso_publico", f"Replay conhecido: {original}", "render_incierto")
+        with tempfile.TemporaryDirectory() as directory:
+            rows, _ = run_rescue(
+                [target],
+                client=FakeGroundedClient([GroundedAnswer(text="")]),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=Path(directory),
+                micro_acquire=True,
+                renderer=lambda _: rendered,
+            )
+            durable = json.loads(
+                (Path(directory) / "micro_camaqua_concurso_publico.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(original, durable["url_inicial"])
+        self.assertEqual(original, durable["url_final"])
+        self.assertEqual([original], durable["cadena_redirects"])
+        self.assertEqual("url_original_target_replay", durable["razon_seleccion_url"])
+        self.assertEqual(original, rows[0].url_candidata)
+
+    def test_free_only_run_never_constructs_or_calls_paid_client(self) -> None:
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient(
+                "free", [HttpError(429, "minute quota", headers={"Retry-After": "5"})], log
+            ),
+            "FREE2": SequencedClient("free2", [sdk_response()], log),
+        }
+
+        def factory(*, api_key, vertexai):
+            if api_key == "PAID_BOMB":
+                raise AssertionError("paid client must be structurally unreachable")
+            return clients[api_key]
+
+        client = GeminiGroundedClient(
+            {
+                "GEMINI_API_KEY_FREE": "FREE",
+                "GEMINI_API_KEY_FREE_2": "FREE2",
+                "GEMINI_API_KEY": "PAID_BOMB",
+            },
+            client_factory=factory,
+            free_only=True,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(0, client.telemetry["paid_calls"])
+        _, summary = run_rescue(
+            [Target("camaqua", "concurso_publico", "pista")],
+            client=client,
+            fetcher=FakeFetcher(),
+            max_searches=1,
+            sleep_seconds=0,
+            free_only=True,
+        )
+        self.assertEqual(0, client.telemetry["paid_calls"])
+        self.assertEqual(0, summary["global"]["paid_calls"])
+        self.assertEqual(["free", "free2"], [item[0] for item in log])
+
+    def test_free_only_credential_loader_does_not_require_or_return_paid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "credentials.env"
+            path.write_text(
+                "GEMINI_API_KEY_FREE=free-placeholder\n"
+                "GEMINI_API_KEY=paid-placeholder\n",
+                encoding="utf-8",
+            )
+            loaded = load_grounded_credentials(path, free_only=True)
+        self.assertEqual({"GEMINI_API_KEY_FREE": "free-placeholder"}, loaded)
+
+    def test_free_only_aborts_with_policy_state_if_paid_counter_changes(self) -> None:
+        class ViolatingClient:
+            def __init__(self) -> None:
+                self.telemetry = {
+                    "providers": {
+                        "gemini_free_1": {"calls": 0, "errors": 0, "responses": 0},
+                        "gemini_paid": {"calls": 0, "errors": 0, "responses": 0},
+                    }
+                }
+
+            def search(self, query, *, model, municipio, bucket):
+                self.telemetry["providers"]["gemini_paid"]["calls"] = 1
+                return GroundedAnswer(text="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with self.assertRaises(PolicyFailure):
+                run_rescue(
+                    [Target("camaqua", "concurso_publico", "pista")],
+                    client=ViolatingClient(), fetcher=FakeFetcher(), max_searches=1,
+                    sleep_seconds=0, output_dir=output, free_only=True,
+                )
+            unit = json.loads((output / "unidad_camaqua_concurso_publico.json").read_text(encoding="utf-8"))
+        self.assertEqual("FALLO_DE_POLITICA", unit["estado"])
+
+    def test_quota_governor_enforces_twelve_rpm_with_injected_clock(self) -> None:
+        clock = FakeClock()
+        log: list[tuple] = []
+        free = SequencedClient("free", [sdk_response(), sdk_response()], log)
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE"},
+            client_factory=lambda **_: free,
+            free_only=True,
+            clock=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        client.search("q1", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
+        client.search("q2", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
+        self.assertEqual([5.0], clock.sleeps)
+        self.assertEqual(2, client.telemetry["model_requests"])
+
+    def test_free2_429_honors_retry_after_then_succeeds(self) -> None:
+        clock = FakeClock()
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient(
+                "free", [HttpError(429, "minute quota", headers={"Retry-After": "5"})], log
+            ),
+            "FREE2": SequencedClient(
+                "free2", [HttpError(429, "minute quota", headers={"Retry-After": "7"}), sdk_response()], log
+            ),
+        }
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE", "GEMINI_API_KEY_FREE_2": "FREE2"},
+            client_factory=lambda *, api_key, vertexai: clients[api_key],
+            free_only=True,
+            clock=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        answer = client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
+        self.assertEqual("gemini_free_2", answer.provider)
+        self.assertIn(5.0, clock.sleeps)
+        self.assertIn(7.0, clock.sleeps)
+        self.assertEqual(2, client.telemetry["quota_429"])
+        self.assertEqual(0, client.telemetry["paid_calls"])
+
+    def test_missing_search_count_metadata_records_unknown_without_estimate(self) -> None:
+        log: list[tuple] = []
+        free = SequencedClient("free", [sdk_response()], log)
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE"}, client_factory=lambda **_: free,
+            free_only=True, sleep=lambda _: None,
+        )
+        client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
+        self.assertEqual(0, client.telemetry["google_search_queries"])
+        self.assertEqual(1, client.telemetry["query_count_unknown"])
+        self.assertEqual(1, client.telemetry["grounded_responses"])
+
+    def test_real_search_query_metadata_is_counted_exactly(self) -> None:
+        log: list[tuple] = []
+        response = sdk_response()
+        response.candidates[0]["grounding_metadata"]["web_search_queries"] = ["q1", "q2"]
+        free = SequencedClient("free", [response], log)
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE"}, client_factory=lambda **_: free,
+            free_only=True, sleep=lambda _: None,
+        )
+        client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
+        self.assertEqual(2, client.telemetry["google_search_queries"])
+        self.assertEqual(0, client.telemetry["query_count_unknown"])
+
+    def test_preventive_brake_stops_before_request_450(self) -> None:
+        governor = QuotaGovernor(global_call_budget=500, sleep=lambda _: None)
+        with self.assertRaises(PreventiveQuotaStop):
+            governor.before_request(model_requests=449, google_search_queries=0)
+        with self.assertRaises(PreventiveQuotaStop):
+            governor.before_request(model_requests=0, google_search_queries=449)
+        budget = QuotaGovernor(global_call_budget=3, sleep=lambda _: None)
+        with self.assertRaises(PreventiveQuotaStop):
+            budget.before_request(model_requests=3, google_search_queries=0)
+
+    def test_quota_backoff_is_exponential_with_jitter_without_retry_after(self) -> None:
+        governor = QuotaGovernor(
+            global_call_budget=10, sleep=lambda _: None, jitter=lambda: 0.25
+        )
+        self.assertEqual(1.25, governor.backoff_seconds(1, None))
+        self.assertEqual(2.25, governor.backoff_seconds(2, None))
+        self.assertEqual(9.0, governor.backoff_seconds(3, 9.0))
+
+    def test_preview_or_legacy_model_is_rejected_before_any_call(self) -> None:
+        log: list[tuple] = []
+        free = SequencedClient("free", [sdk_response()], log)
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE"}, client_factory=lambda **_: free,
+            free_only=True,
+        )
+        with self.assertRaises(ValueError):
+            client.search(
+                "q", model="gemini-3.1-flash-lite-preview",
+                municipio="camaqua", bucket="concurso_publico",
+            )
+        self.assertEqual([], log)
+
+    def test_daily_free2_exhaustion_checkpoints_and_stops_without_paid(self) -> None:
+        clock = FakeClock()
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient("free", [HttpError(429, "minute quota")], log),
+            "FREE2": SequencedClient("free2", [HttpError(429, "requests per day exhausted")], log),
+        }
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE", "GEMINI_API_KEY_FREE_2": "FREE2"},
+            client_factory=lambda *, api_key, vertexai: clients[api_key],
+            free_only=True, clock=clock.monotonic, sleep=clock.sleep,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _, summary = run_rescue(
+                [Target("camaqua", "concurso_publico", "pista")],
+                client=client, fetcher=FakeFetcher(), max_searches=1,
+                sleep_seconds=0, output_dir=output, free_only=True,
+            )
+            unit = json.loads((output / "unidad_camaqua_concurso_publico.json").read_text(encoding="utf-8"))
+        self.assertEqual("DETENIDA_CUOTA_DIARIA_FREE2", unit["estado"])
+        self.assertEqual("checkpoint_atomico_cuota_diaria_free2", unit["causa"])
+        self.assertEqual(0, summary["global"]["paid_calls"])
 
     def test_outputs_never_confirm_or_write_url_map(self) -> None:
         client = FakeGroundedClient([

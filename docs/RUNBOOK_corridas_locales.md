@@ -50,19 +50,40 @@ GEMINI_API_KEY=
 
 ### Credenciales Gemini V2
 
-El orden del router es `GEMINI_API_KEY_FREE` (FREE1) ->
-`GEMINI_API_KEY_FREE_2` (FREE2 opcional) -> `GEMINI_API_KEY` (pagada, ultimo
-recurso). FREE2 solo se intenta cuando FREE1 falla por cuota/rate limit o una
-indisponibilidad transitoria reconocida; la pagada solo se intenta cuando los
-dos niveles free configurados fallan por causas elegibles. Errores de
-autenticacion, peticion, esquema, contenido, programacion o gate cierran la
-unidad sin rotar.
+El rescate grounded usa exclusivamente `gemini-3.1-flash-lite`. Producción
+puede seguir `FREE1 -> FREE2 -> PAID` únicamente si la configuración y Luis
+autorizan paid de forma explícita. Golden, holdout, evaluación y rescate usan
+siempre `FREE1 -> FREE2 -> STOP` con `--free-only`: el cliente paid no se
+construye ni forma parte de la secuencia, y `paid_calls` debe permanecer en
+cero antes y después de la corrida. El cargador free-only solo requiere
+`GEMINI_API_KEY_FREE`; FREE2 es opcional y la credencial paid no se exige ni
+se devuelve al cliente.
 
-Una corrida `--provider gemini_free` nunca alcanza la credencial pagada. Si el
-archivo antiguo solo contiene FREE1 y PAID, FREE2 se omite y se conserva el
-comportamiento anterior. Pase el archivo privado con `--credentials-file`; no
-pegue ni registre valores de claves. Si FREE1 y FREE2 pertenecen al mismo
-proyecto Google, probablemente comparten cuota y FREE2 no agrega capacidad.
+Las cuotas son por proyecto GCP; dos claves del mismo proyecto no duplican
+capacidad. El gobernador limita a 12 RPM (mínimo aproximado de cinco segundos
+entre solicitudes), respeta `Retry-After` en cada 429 y usa backoff exponencial
+con jitter si ese header falta. También aplica un presupuesto global de
+llamadas y frena antes del 90% de la cuota activa: con límites diarios 500/500,
+no emite la solicitud que alcanzaría 450 model requests o Search queries.
+
+### Rescate grounded en modo free-only
+
+Canary operativo (el archivo `.env` es local, privado y nunca se versiona):
+
+```powershell
+python -m scripts.fase2_municipios.v2.eval.grounded_rescue --targets staging/fase2_v2/eval/misiones_20260713/rescate_targets.csv --output-dir staging/fase2_v2/eval/misiones_20260713/canary_grounded_flash_lite_free_only --credentials-file .env --model gemini-3.1-flash-lite --max-searches 1 --global-call-budget 3 --daily-model-limit 500 --daily-search-limit 500 --free-only --resume
+```
+
+Cada unidad terminada o detenida se guarda mediante reemplazo JSON atómico.
+Si FREE2 informa agotamiento diario, la unidad queda en
+`DETENIDA_CUOTA_DIARIA_FREE2`, se conserva el checkpoint y la corrida se
+detiene sin pasar a paid. El freno preventivo usa `DETENIDA_FRENO_CUOTA`; una
+variación de `paid_calls` usa `FALLO_DE_POLITICA`. `summary.json` expone por
+separado `model_requests`, `successful_model_responses`,
+`google_search_queries`, `query_count_unknown`, `grounded_responses`,
+`calls_by_provider`, `responses_by_provider`, `errors_by_provider`,
+`quota_429` y `paid_calls`. `google_search_queries` solo procede de metadatos
+reales; si faltan, aumenta `query_count_unknown` y nunca se estima.
 
 ## Cómo correr (por letras, con append, sin re-gastar Gemini)
 
