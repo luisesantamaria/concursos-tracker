@@ -47,6 +47,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 from scripts.fase2_municipios.v2 import authority
 from scripts.fase2_municipios.v2.agents import certifier
 from scripts.fase2_municipios.v2.eval.live_abc_adapter import render_page_networkidle
+from scripts.fase2_municipios.v2.eval.f3_adapters_dispatch import dispatch_f3_adapter
 from scripts.fase2_municipios.v2.eval.live_model_policy import (
     ErrorCategory,
     classify_error,
@@ -84,6 +85,9 @@ OUTPUT_COLUMNS = (
     "http_status",
     "fuente",
     "redirector_original",
+    "disposition",
+    "confirmed",
+    "provenance",
 )
 PROVIDERS = ("gemini_free_1", "gemini_free_2", "gemini_paid")
 TELEMETRY_COUNTERS = (
@@ -137,6 +141,15 @@ class CandidateRow:
     http_status: str
     fuente: str = "grounding"
     redirector_original: str = ""
+    disposition: str = "propose"
+    confirmed: bool = False
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.confirmed:
+            raise ValueError("candidate_rows_never_confirm")
+        if self.disposition not in {"propose", "revisar"}:
+            raise ValueError("candidate_disposition_must_be_propose_or_revisar")
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_COLUMNS}
@@ -1214,6 +1227,8 @@ def micro_acquire_unit(
     renderer: Callable[[str], Any] = render_page_networkidle,
     selection_reason: str = "url_candidata_unica_evaluada",
     prior_redirector: str = "",
+    adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
+    adapter_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Perform exactly one controlled fetch+render acquisition and persist it."""
     initial_url = url
@@ -1222,6 +1237,7 @@ def micro_acquire_unit(
     snapshot_text = ""
     status: Any = None
     render_obtained = False
+    adapter_result: dict[str, Any] = {}
     redirect_chain = [item for item in (prior_redirector, initial_url) if item]
     error = ""
     if not initial_url:
@@ -1232,18 +1248,42 @@ def micro_acquire_unit(
             final_url = _clean_url(fetched.final_url or initial_url) or initial_url
             if final_url and final_url != redirect_chain[-1]:
                 redirect_chain.append(final_url)
-            rendered = renderer(final_url)
-            if rendered is not None:
-                render_obtained = True
-                final_url = _clean_url(getattr(rendered, "final_url", "") or final_url) or final_url
-                if final_url and final_url != redirect_chain[-1]:
-                    redirect_chain.append(final_url)
-                snapshot_text = str(getattr(rendered, "text", "") or "")
-                status = getattr(rendered, "status", None)
-            else:
+            dispatch_context = dict(adapter_context or {})
+            dispatch_context.setdefault("status_code", fetched.status_code)
+            try:
+                adapter_result = dict(adapter_dispatcher(
+                    url=final_url,
+                    page_html=fetched.html,
+                    municipio=target.municipio,
+                    bucket=target.bucket,
+                    current_year=datetime.now().year,
+                    context=dispatch_context,
+                ) or {})
+            except RescueInterrupted:
+                raise
+            except BaseException as exc:
+                adapter_result = {
+                    "platform": None,
+                    "candidates": [],
+                    "refusal_reason": f"dispatcher_error:{type(exc).__name__}",
+                }
+            if adapter_result.get("candidates"):
                 _, snapshot_text = extract_title_and_text(fetched.html)
                 status = fetched.status_code
-                trigger = "fetch+render_page_networkidle_sin_resultado"
+                trigger = f'f3_adapter:{adapter_result.get("adapter", "unknown")}'
+            else:
+                rendered = renderer(final_url)
+                if rendered is not None:
+                    render_obtained = True
+                    final_url = _clean_url(getattr(rendered, "final_url", "") or final_url) or final_url
+                    if final_url and final_url != redirect_chain[-1]:
+                        redirect_chain.append(final_url)
+                    snapshot_text = str(getattr(rendered, "text", "") or "")
+                    status = getattr(rendered, "status", None)
+                else:
+                    _, snapshot_text = extract_title_and_text(fetched.html)
+                    status = fetched.status_code
+                    trigger = "fetch+render_page_networkidle_sin_resultado"
         except RescueInterrupted:
             raise
         except BaseException as exc:
@@ -1276,11 +1316,46 @@ def micro_acquire_unit(
     }
     if error:
         payload["error_tipo"] = error
+    if adapter_result.get("candidates") or adapter_result.get("hook"):
+        payload["adaptador"] = adapter_result
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"micro_{target.municipio}_{target.bucket}.json"
     _atomic_write_json(path, payload)
     return payload
+
+
+def _adapter_candidate_rows(
+    target: Target,
+    payload: Mapping[str, Any],
+    *,
+    query: str,
+    snippet: str,
+    host_reason: str,
+    fuente: str,
+    redirector_original: str,
+) -> list[CandidateRow]:
+    dispatch = payload.get("adaptador", {}) or {}
+    rows: list[CandidateRow] = []
+    for raw in dispatch.get("candidates", ()) or ():
+        if raw.get("confirmed") is not False or raw.get("disposition") not in {"propose", "revisar"}:
+            continue
+        rows.append(CandidateRow(
+            municipio=target.municipio,
+            bucket=target.bucket,
+            url_candidata=str(raw.get("url_candidata") or dispatch.get("source_url") or ""),
+            query_usada=query,
+            snippet_grounding=snippet,
+            host_oficial_check=host_reason,
+            item_markers=int(raw.get("item_markers") or 0),
+            http_status=f'f3_adapter:{dispatch.get("platform", "unknown")}',
+            fuente=f'adapter:{dispatch.get("adapter", "unknown")}',
+            redirector_original=redirector_original,
+            disposition=str(raw["disposition"]),
+            confirmed=False,
+            provenance=dict(raw.get("provenance", {}) or {}),
+        ))
+    return rows
 
 
 def _select_micro_target(target: Target, pending: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1325,6 +1400,8 @@ def run_micro_acquisitions(
     timestamp_run: str,
     fetch_timeout: int = 30,
     renderer: Callable[[str], Any] = render_page_networkidle,
+    adapter_context_provider: Callable[[Target, str], Mapping[str, Any]] | None = None,
+    adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
 ) -> list[CandidateRow]:
     """Run one controlled acquisition per unresolved render-incierto unit.
 
@@ -1352,10 +1429,27 @@ def run_micro_acquisitions(
             renderer=renderer,
             selection_reason=selected["selection_reason"],
             prior_redirector=selected.get("redirector_original", ""),
+            adapter_dispatcher=adapter_dispatcher,
+            adapter_context=(
+                adapter_context_provider(target, selected["url"])
+                if adapter_context_provider is not None else None
+            ),
         )
         unit["micro_archivo"] = f"micro_{target.municipio}_{target.bucket}.json"
         unit["micro_veredicto"] = payload["veredicto_gate"]
-        if payload["veredicto_gate"]["pasa"]:
+        adapter_rows = _adapter_candidate_rows(
+            target,
+            payload,
+            query=selected["query"],
+            snippet=selected["snippet"],
+            host_reason=selected["host_oficial_check"],
+            fuente=selected["fuente"],
+            redirector_original=selected.get("redirector_original", ""),
+        )
+        if adapter_rows:
+            result_rows.extend(adapter_rows)
+            unit["candidatas"] = len(adapter_rows)
+        elif payload["veredicto_gate"]["pasa"]:
             result_rows.append(CandidateRow(
                 municipio=target.municipio,
                 bucket=target.bucket,
@@ -1393,6 +1487,8 @@ def run_rescue(
     interruption: InterruptionState | None = None,
     timestamp_factory: Callable[[], str] = _utc_timestamp,
     free_only: bool = False,
+    adapter_context_provider: Callable[[Target, str], Mapping[str, Any]] | None = None,
+    adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
     if model != REQUIRED_MODEL:
         raise ValueError(f"model_debe_ser_exactamente_{REQUIRED_MODEL}")
@@ -1679,8 +1775,24 @@ def run_rescue(
                     renderer=renderer,
                     selection_reason=selected["selection_reason"],
                     prior_redirector=selected.get("redirector_original", ""),
+                    adapter_dispatcher=adapter_dispatcher,
+                    adapter_context=(
+                        adapter_context_provider(target, selected["url"])
+                        if adapter_context_provider is not None else None
+                    ),
                 )
-                if micro_result["veredicto_gate"]["pasa"]:
+                adapter_rows = _adapter_candidate_rows(
+                    target,
+                    micro_result,
+                    query=selected["query"],
+                    snippet=selected["snippet"],
+                    host_reason=selected["host_oficial_check"],
+                    fuente=selected["fuente"],
+                    redirector_original=selected["redirector_original"],
+                )
+                if adapter_rows:
+                    unit_candidates.extend(adapter_rows)
+                elif micro_result["veredicto_gate"]["pasa"]:
                     unit_candidates.append(CandidateRow(
                         municipio=target.municipio,
                         bucket=target.bucket,
@@ -1876,7 +1988,12 @@ def write_outputs(output_dir: Path, rows: Sequence[CandidateRow], summary: Mappi
     with csv_tmp.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
-        writer.writerows(row.as_dict() for row in rows)
+        for row in rows:
+            csv_row = row.as_dict()
+            csv_row["provenance"] = json.dumps(
+                csv_row["provenance"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            writer.writerow(csv_row)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(csv_tmp, csv_path)
