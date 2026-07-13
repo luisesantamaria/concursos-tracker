@@ -264,6 +264,27 @@ que pase el gate determinista. Tras el rescate: replay completo + 7/7
 regresiones FP + auditoría de toda confirmación nueva → GO a r3 solo con
 proyección ≥75/88 y 0 FP.
 
+**MINI-WAVE F3 CONDICIONAL (Luis, 13-jul)**: si el rescate grounded válido +
+su auditoría dejan la proyección <75/88, NO forzar r3 — activar mini-wave
+adelantada de F3 con reglas generales: (1) F3.P1: completar SOLO patrones
+generales de plataforma respaldados por repetición en el corpus (candidatos
+medidos por M6: /site/concursos ~48 municipios, pg.php?area=PUBLICACOES ~20,
+/portal/editais ~25), medir sobre los 497, WRNG=0 contra confirmados
+auditados, cero parches por municipio. (2) F3.P3: validar el agente navegador
+A CIEGAS sobre 20 municipios custom ya confirmados — gate: ≥70% propone la
+URL correcta y 0 evidencia inventada; solo después aplicarlo a los residuales
+url_mala que el grounding no resolvió; provenance completo de ruta
+menú/clics; propone-nunca-confirma. (3) F3.P5 adelantada (condición de
+entrada cumplida: 10 render_incierto > 5 exigidas): exploración Playwright
+acotada y reproducible; whitelist estricta: paginación ≤3 páginas,
+año=todos/ano=0, búsqueda vacía, pestañas vigente/encerrado; máx 5
+interacciones por unidad; snapshot y provenance POR ESTADO; citas verificadas
+contra el estado que las contiene; jamás login/datos personales/CAPTCHA/
+evasión antibot. (4) Computer Use sigue reservado para lo que quede como
+revisión humana después de F3.P5. (5) Tras la mini-wave: replay completo +
+auditoría de toda confirmación nueva + regresión de los 7 FP → GO a r3 solo
+con ≥75/88 RATIFICAR proyectadas y 0 FP. NO implementar F3.P2 ni F3.P4 aún.
+
 **POLÍTICA COMPUTER USE (Luis, 13-jul)**: reservado para DESPUÉS de agotar
 búsqueda, HTML, endpoints XHR y render automatizado; solo cola residual que
 requiera filtros/botones, JS interactivo, paginación visual, cookies o
