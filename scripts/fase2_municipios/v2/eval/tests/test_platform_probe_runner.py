@@ -198,10 +198,58 @@ def test_gate_accepts_real_page_with_keyword_in_body() -> None:
     assert outcome == "ok"
 
 
-def test_gate_accepts_via_title_keyword_alone() -> None:
+def test_gate_rejects_title_keyword_alone_without_structural_markers() -> None:
+    """Contract change (F3.P1 fix, rule 2): a lone keyword mention -- even in
+    the title -- is no longer sufficient on its own. The structural gate
+    requires >=2 item markers or list/table rows; this page has exactly one
+    ("Processo Seletivo 001/2026" in the title) and must now be rejected.
+    """
     html = (
         "<html><head><title>Processo Seletivo 001/2026</title></head>"
         "<body><main><p>Informações administrativas gerais do município.</p></main></body></html>"
+    )
+    title, text = runner.extract_title_and_text(html)
+    outcome = runner.classify_probe(status_code=200, title=title, visible_text=text, html=html)
+    assert outcome is None
+
+
+# ---------------------------------------------------------------------------
+# 4b (F3.P1 fix, rule 2). Structural index gate: >=2 item markers required
+# ---------------------------------------------------------------------------
+def bento_news_article_html() -> str:
+    # Real F3.P1 dictamen case: a single WordPress news post that mentions
+    # "processo seletivo" but reports on one event, not an index of many.
+    return (
+        "<html><head><title>Processo Seletivo da Secretaria de Educação em Fase Final</title></head>"
+        "<body><main><article>"
+        "<h1>Processo Seletivo da Secretaria de Educação em Fase Final</h1>"
+        "<p>A Secretaria Municipal de Educação informa que o processo seletivo "
+        "simplificado está em fase final de avaliação dos candidatos inscritos.</p>"
+        "<p>Publicado em 10 de julho de 2026 pela Assessoria de Imprensa.</p>"
+        "</article></main></body></html>"
+    )
+
+
+def test_gate_rejects_single_news_article_with_keyword_but_no_index_structure() -> None:
+    """F3.P1 dictamen case 1 (Bento Goncalves): a single news post mentioning
+    'processo seletivo' must fail the structural gate -- an index lists
+    multiple editais/certames, a news article reports on one.
+    """
+    html = bento_news_article_html()
+    title, text = runner.extract_title_and_text(html)
+    outcome = runner.classify_probe(status_code=200, title=title, visible_text=text, html=html)
+    assert outcome is None
+
+
+def test_gate_accepts_prose_listing_with_two_distinct_edital_markers() -> None:
+    """A real index doesn't need <li>/<tr> markup: >=2 distinct "keyword +
+    no/ano" mentions in plain prose is enough."""
+    html = (
+        "<html><head><title>Concursos e Processos Seletivos</title></head>"
+        "<body><main>"
+        "<p>Concurso Público nº 001/2026 - Auxiliar Administrativo - inscrições abertas.</p>"
+        "<p>Concurso Público nº 002/2025 - Motorista - resultado final publicado.</p>"
+        "</main></body></html>"
     )
     title, text = runner.extract_title_and_text(html)
     outcome = runner.classify_probe(status_code=200, title=title, visible_text=text, html=html)
@@ -300,6 +348,153 @@ def test_probe_unit_skips_otro_platform_without_any_fetch() -> None:
     assert proposal.probe_result == "skip"
     assert proposal.plataforma == "otro"
     assert fetcher.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 6b (F3.P1 fix, rules 1 and 3). Redirect discipline
+# ---------------------------------------------------------------------------
+def test_probe_unit_redirect_to_unrelated_news_post_is_flagged_as_redirect_drift() -> None:
+    """F3.P1 dictamen case 1 (Bento Goncalves): the rs_gov '/processo-seletivo'
+    template redirected (WordPress redirect-guess) to an unrelated news post
+    about a different secretaria. Even served content that would otherwise
+    pass the structural gate must never be proposed once its path drifted.
+    """
+    base = "https://www.bentogoncalves.rs.gov.br"
+    first = f"{base}/processos-seletivos"
+    second = f"{base}/processo-seletivo"
+    third = f"{base}/concursos-e-processos-seletivos"
+    drifted = f"{base}/processo-seletivo-da-secretaria-de-educacao-em-fase-final/"
+    fetcher = FakeFetcher({
+        first: result(stub_404_html()),
+        second: result(index_html(), final_url=drifted),
+        third: result(stub_404_html()),
+    })
+    proposal = runner.probe_unit(
+        fetcher, municipio="Bento Gonçalves", bucket="processo_seletivo",
+        site_base=base, sleep_fn=NO_SLEEP,
+    )
+    assert proposal.probe_result == "redirect_drift"
+    assert proposal.url_propuesta == ""
+    assert fetcher.calls == [first, second, third]
+
+
+def test_probe_unit_redirect_to_site_root_is_never_proposed() -> None:
+    """F3.P1 dictamen case 2 (Pelotas x2): every rs_gov template redirected to
+    the bare domain root. The root must never be proposed as an index, even
+    with otherwise-valid content.
+    """
+    base = "https://www.pelotas.rs.gov.br"
+    root = "https://www.pelotas.rs.gov.br"
+    fetcher = FakeFetcher({
+        f"{base}/concursos": result(index_html(), final_url=root),
+        f"{base}/concurso": result(index_html(), final_url=root),
+        f"{base}/portal-da-transparencia/concursos-publicos": result(index_html(), final_url=root),
+    })
+    proposal = runner.probe_unit(
+        fetcher, municipio="Pelotas", bucket="concurso_publico", site_base=base, sleep_fn=NO_SLEEP,
+    )
+    assert proposal.probe_result == "redirect_drift"
+    assert proposal.url_propuesta == ""
+    assert proposal.confianza == ""
+
+
+def test_probe_unit_redirect_crossing_into_a_different_bucket_path_is_flagged() -> None:
+    """F3.P1 dictamen case 3 (Porto Alegre): the PSS template redirected --
+    with a host change www -> www2 -- to '/concursos/', the concurso_publico
+    bucket's own template path. Cross-bucket contamination via redirect must
+    never be proposed.
+    """
+    base = "https://www.portoalegre.rs.gov.br"
+    first = f"{base}/processos-seletivos"
+    second = f"{base}/processo-seletivo"
+    third = f"{base}/concursos-e-processos-seletivos"
+    drifted = "https://www2.portoalegre.rs.gov.br/concursos/"
+    fetcher = FakeFetcher({
+        first: result(stub_404_html()),
+        second: result(stub_404_html()),
+        third: result(index_html(), final_url=drifted),
+    })
+    proposal = runner.probe_unit(
+        fetcher, municipio="Porto Alegre", bucket="processo_seletivo",
+        site_base=base, sleep_fn=NO_SLEEP,
+    )
+    assert proposal.probe_result == "redirect_drift"
+    assert proposal.url_propuesta == ""
+
+
+def test_probe_unit_redirect_to_error_path_is_never_proposed_even_as_spa_shell() -> None:
+    """F3.P1 dictamen case 4 (Porto Lucena): a rs_gov template's app shell
+    redirected to /error and used to be accepted as spa_shell_probable at
+    confianza=alta just because the requested URL was an exact template. A
+    redirect landing on an error stub must never be proposed, at any
+    confidence.
+    """
+    base = "https://www.portolucena.rs.gov.br"
+    first = f"{base}/concursos"
+    second = f"{base}/concurso"
+    third = f"{base}/portal-da-transparencia/concursos-publicos"
+    error_url = f"{base}/error"
+    fetcher = FakeFetcher({
+        first: result(spa_shell_html(title="Carregando..."), final_url=error_url),
+        second: result(spa_shell_html(title="Carregando..."), final_url=error_url),
+        third: result(spa_shell_html(title="Carregando..."), final_url=error_url),
+    })
+    proposal = runner.probe_unit(
+        fetcher, municipio="Porto Lucena", bucket="concurso_publico",
+        site_base=base, sleep_fn=NO_SLEEP,
+    )
+    assert proposal.probe_result == "redirect_drift"
+    assert proposal.url_propuesta == ""
+    assert proposal.confianza == ""
+
+
+def test_probe_unit_benign_www_and_trailing_slash_redirect_is_still_accepted() -> None:
+    """The tolerance in rule 1: a redirect that only adds/drops 'www.', a
+    trailing slash, or changes scheme is benign and must still be accepted."""
+    base = "https://www.agudo.rs.gov.br"
+    requested = f"{base}/concursos"
+    benign_final = "https://agudo.rs.gov.br/concursos/"
+    fetcher = FakeFetcher({requested: result(index_html(), final_url=benign_final)})
+    proposal = runner.probe_unit(
+        fetcher, municipio="Agudo", bucket="concurso_publico", site_base=base, sleep_fn=NO_SLEEP,
+    )
+    assert proposal.probe_result == "ok"
+    assert proposal.url_propuesta == benign_final
+    assert proposal.confianza == "alta"
+
+
+def test_probe_unit_spa_shell_confidence_downgraded_when_redirect_changes_host() -> None:
+    """Rule 3: even without path drift, a spa_shell_probable classification
+    following a redirect to a different host is inherently less certain and
+    must not keep confianza=alta.
+    """
+    base = "https://acegua.atende.net"
+    requested = f"{base}/transparencia/item/concursos-publicos"
+    same_path_diff_host = "https://acegua2.atende.net/transparencia/item/concursos-publicos"
+    fetcher = FakeFetcher({
+        requested: result(spa_shell_html(title="Carregando..."), final_url=same_path_diff_host),
+    })
+    proposal = runner.probe_unit(
+        fetcher, municipio="Aceguá", bucket="concurso_publico", site_base=base, sleep_fn=NO_SLEEP,
+    )
+    assert proposal.probe_result == "spa_shell_probable"
+    assert proposal.confianza == "baja"
+    assert proposal.url_propuesta == same_path_diff_host
+
+
+def test_audit_redirect_reports_path_drift_host_change_and_blocked_path() -> None:
+    requested = "https://www.agudo.rs.gov.br/concursos"
+    assert runner.audit_redirect(requested, "https://agudo.rs.gov.br/concursos/") == runner.RedirectAudit(
+        path_drift=False, host_changed=False, blocked_path=False,
+    )
+    assert runner.audit_redirect(requested, "https://agudo.rs.gov.br/outra-pagina") == runner.RedirectAudit(
+        path_drift=True, host_changed=False, blocked_path=False,
+    )
+    assert runner.audit_redirect(requested, "https://agudo.rs.gov.br/").not_proposable
+    assert runner.audit_redirect(requested, "https://agudo.rs.gov.br/error").not_proposable
+    assert runner.audit_redirect(
+        requested, "https://www2.agudo.rs.gov.br/concursos"
+    ) == runner.RedirectAudit(path_drift=False, host_changed=True, blocked_path=False)
 
 
 # ---------------------------------------------------------------------------

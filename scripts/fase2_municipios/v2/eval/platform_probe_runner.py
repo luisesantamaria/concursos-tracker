@@ -12,6 +12,18 @@ here is imported from or imports ``cascade_municipios.py`` /
 ``verdict_extract.py`` (both intocables); the content-gate keyword/stub lists
 below are an independent, self-contained replica of the same spirit as
 cascade's ``_probe_page_is_index_like``.
+
+Two additional guards close the redirect-drift family of false proposals
+found in the F3.P1 corrida 1 dictamen
+(``staging/fase2_v2/eval/f3p1_probe_20260712/DICTAMEN_wrng.md``): (1) a
+redirect-discipline audit in ``probe_unit`` that degrades any proposal whose
+final path drifted away from the requested template path -- or landed on the
+site root or an error/not-found stub -- to ``probe_result="redirect_drift"``
+(never proposable); and (2) a structural-index requirement in
+``classify_probe`` that an "ok" page must show at least two distinct
+edital/concurso/processo-seletivo item markers (numbered entries or list/table
+rows), so a single news article that merely mentions the keyword no longer
+qualifies as an index.
 """
 
 from __future__ import annotations
@@ -144,6 +156,18 @@ RELEVANT_KEYWORDS: tuple[str, ...] = (
 SPA_SHELL_TEXT_MAX_CHARS = 500
 SPA_SHELL_HTML_MIN_CHARS = 2000
 
+# Structural index gate (F3.P1 fix, rule 2): a keyword mention alone is not
+# enough for "ok" -- an index page lists multiple editais/certames, a single
+# news article reports on one. Accept either >=2 prose markers like "Edital
+# 001/2026" / "Concurso Publico no 02/2025", or >=2 list/table rows that each
+# look like an item (keyword or number/year present in that row's text).
+MIN_STRUCTURAL_MARKERS = 2
+ITEM_MARKER_PATTERN = re.compile(
+    r"\b(?:edital|concurso(?:\s+publico)?|processo\s+seletivo)\b[^0-9\n]{0,25}"
+    r"\d{1,4}\s*/\s*\d{4}"
+)
+_NUMBER_YEAR_PATTERN = re.compile(r"\d{1,4}\s*/\s*\d{4}")
+
 
 def _norm(text: str) -> str:
     text = unicodedata.normalize("NFKD", text or "")
@@ -167,6 +191,39 @@ def extract_title_and_text(html: str) -> tuple[str, str]:
     return title, text
 
 
+def _count_item_markers(normalized_text: str) -> int:
+    """Count distinct "edital/concurso/processo seletivo + no/ano" markers."""
+    return len(ITEM_MARKER_PATTERN.findall(normalized_text))
+
+
+def _count_list_or_table_items(html: str) -> int:
+    """Count ``<li>``/``<tr>`` rows that individually look like index items."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    count = 0
+    for tag in soup.find_all(["li", "tr"]):
+        item_text = _norm(tag.get_text(" "))
+        if not item_text:
+            continue
+        has_keyword = any(kw in item_text for kw in RELEVANT_KEYWORDS)
+        has_number_year = bool(_NUMBER_YEAR_PATTERN.search(item_text))
+        if has_keyword or has_number_year:
+            count += 1
+    return count
+
+
+def _has_index_structure(visible_text: str, html: str) -> bool:
+    """Structural content gate (F3.P1 fix, rule 2).
+
+    A single news article that happens to mention "processo seletivo" must
+    fail this gate (see the F3.P1 dictamen's Bento Goncalves case); a real
+    index lists multiple editais/certames, either as prose markers ("Edital
+    001/2026") or as list/table rows.
+    """
+    if _count_item_markers(_norm(visible_text)) >= MIN_STRUCTURAL_MARKERS:
+        return True
+    return _count_list_or_table_items(html) >= MIN_STRUCTURAL_MARKERS
+
+
 def classify_probe(
     *, status_code: int, title: str, visible_text: str, html: str,
     is_template_exact: bool = True,
@@ -180,6 +237,11 @@ def classify_probe(
     "spa_shell_probable" when the title carries the keyword OR the URL probed
     is an exact platform template (always true for this runner, since every
     URL it probes comes straight from PLATFORM_TEMPLATES).
+
+    A non-shell "ok" additionally requires the structural index gate (F3.P1
+    fix, rule 2): the keyword hit alone is not enough, the page must show
+    >=2 distinct item markers (see ``_has_index_structure``). This rejects a
+    single news article that merely mentions the keyword once.
     """
     if status_code != 200:
         return None
@@ -195,7 +257,9 @@ def classify_probe(
         if title_has_keyword or is_template_exact:
             return "spa_shell_probable"
         return None
-    if title_has_keyword or text_has_keyword:
+    if not (title_has_keyword or text_has_keyword):
+        return None
+    if _has_index_structure(visible_text, html):
         return "ok"
     return None
 
@@ -253,6 +317,61 @@ class RequestsFetcher:
 
 
 # ---------------------------------------------------------------------------
+# Redirect discipline (F3.P1 fix, rules 1 and 3)
+# ---------------------------------------------------------------------------
+# Paths that must never be proposed as an index, whether reached by redirect
+# or requested directly. "" covers the bare site root (empty path).
+BLOCKED_INDEX_PATHS: frozenset[str] = frozenset({
+    "", "/error", "/404", "/not-found", "/pagina-nao-encontrada",
+})
+
+
+def _normalize_path_for_drift(path: str) -> str:
+    return (path or "").strip().rstrip("/").lower()
+
+
+def _normalize_host_for_drift(host: str) -> str:
+    host = (host or "").strip().lower()
+    if host.startswith("www."):
+        host = host[len("www."):]
+    return host
+
+
+@dataclass(frozen=True)
+class RedirectAudit:
+    path_drift: bool
+    host_changed: bool
+    blocked_path: bool
+
+    @property
+    def not_proposable(self) -> bool:
+        """True if the final URL must never be proposed as an index."""
+        return self.path_drift or self.blocked_path
+
+
+def audit_redirect(requested_url: str, final_url: str) -> RedirectAudit:
+    """Compare the requested template URL to where the fetch actually landed.
+
+    Tolerates a trailing slash, a leading "www.", and scheme/case
+    differences; anything else in the path is a "redirect_drift" (see the
+    F3.P1 dictamen's Bento Goncalves / Pelotas / Porto Alegre cases). Landing
+    on the bare site root or an error/not-found stub is blocked outright,
+    drift or not.
+    """
+    requested = urlsplit(requested_url)
+    final = urlsplit(final_url or requested_url)
+    requested_path = _normalize_path_for_drift(requested.path)
+    final_path = _normalize_path_for_drift(final.path)
+    requested_host = _normalize_host_for_drift(requested.hostname or "")
+    final_host = _normalize_host_for_drift(final.hostname or "")
+    return RedirectAudit(
+        path_drift=requested_path != final_path,
+        host_changed=requested_host != final_host,
+        blocked_path=final_path in BLOCKED_INDEX_PATHS,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-unit probing
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -287,7 +406,18 @@ def probe_unit(
     sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> ProbeProposal:
-    """Probe every template for one (municipio, bucket); accept the first hit."""
+    """Probe every template for one (municipio, bucket); accept the first hit.
+
+    A content-gate hit is only proposed if it also survives the redirect
+    audit (F3.P1 fix): the final URL's path must match the requested
+    template path (tolerating trailing slash / www. / scheme / case), and it
+    must not be the bare site root or an error/not-found stub. A hit that
+    fails this audit is recorded as ``probe_result="redirect_drift"`` and the
+    runner falls through to the next template, exactly like a rejected
+    content classification. ``spa_shell_probable`` additionally loses its
+    high confidence (downgrades to "baja") if the redirect crossed to a
+    different host, even without path drift.
+    """
     platform = detect_platform(site_base)
     candidates = build_template_urls(site_base, platform, bucket)
     if not candidates:
@@ -296,12 +426,12 @@ def probe_unit(
             url_propuesta="", probe_result="skip", confianza="", template_usada="",
         )
 
-    last_error = ""
+    last_reason = ""
     for template, url in candidates:
         try:
             result = fetcher.get(url, timeout)
         except ProbeFetchError as exc:
-            last_error = f"error:{exc.cls_name}"
+            last_reason = f"error:{exc.cls_name}"
             sleep_fn(sleep_seconds)
             continue
         sleep_fn(sleep_seconds)
@@ -310,17 +440,25 @@ def probe_unit(
             status_code=result.status_code, title=title, visible_text=text,
             html=result.html, is_template_exact=True,
         )
-        if outcome is not None:
-            return ProbeProposal(
-                municipio=municipio, bucket=bucket, plataforma=platform,
-                url_propuesta=result.final_url or url, probe_result=outcome,
-                confianza=PLATFORM_CONFIDENCE.get(platform, ""),
-                template_usada=template,
-            )
+        if outcome is None:
+            continue
+        final_url = result.final_url or url
+        audit = audit_redirect(url, final_url)
+        if audit.not_proposable:
+            last_reason = "redirect_drift"
+            continue
+        confianza = PLATFORM_CONFIDENCE.get(platform, "")
+        if outcome == "spa_shell_probable" and audit.host_changed:
+            confianza = "baja"
+        return ProbeProposal(
+            municipio=municipio, bucket=bucket, plataforma=platform,
+            url_propuesta=final_url, probe_result=outcome,
+            confianza=confianza, template_usada=template,
+        )
 
     return ProbeProposal(
         municipio=municipio, bucket=bucket, plataforma=platform,
-        url_propuesta="", probe_result=(last_error or "no_match"),
+        url_propuesta="", probe_result=(last_reason or "no_match"),
         confianza="", template_usada="",
     )
 
