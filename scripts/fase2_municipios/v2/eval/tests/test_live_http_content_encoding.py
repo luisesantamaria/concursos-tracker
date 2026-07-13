@@ -237,6 +237,11 @@ def test_utf8_bom_precedes_conflicting_header_and_is_diagnosed(monkeypatch) -> N
 
 
 def test_declared_non_utf8_charset_decodes_strictly(monkeypatch) -> None:
+    """SUB-CAUSA 2d control (holdout 12-jul): header y body de verdad
+    coinciden en iso-8859-1 -- sigue decodificando bien, sin desviarse a
+    utf-8 (0 matches del fingerprint, decode utf-8 estricto falla, ver
+    test_declared_iso8859_header_with_genuine_utf8_body_prefers_utf8 abajo
+    para el caso contrario que SI se corrige)."""
     html = fx.HTML.replace("Fixture", "Ação")
     install_connections(
         monkeypatch,
@@ -250,6 +255,51 @@ def test_declared_non_utf8_charset_decodes_strictly(monkeypatch) -> None:
 
     assert fetched.html == html
     assert "Ação" in fetched.content
+    assert fetched.decode_diagnostics == ("header_charset:iso8859-1",)
+
+
+def test_declared_iso8859_header_with_genuine_utf8_body_prefers_utf8(monkeypatch) -> None:
+    """SUB-CAUSA 2c fix (holdout 12-jul: doutormauriciocardoso/
+    saodomingosdosul/inhacora/estrela). iso-8859-1 decodifica CUALQUIER byte
+    sin excepcion -- un decode 'exitoso' no prueba que el charset declarado
+    sea correcto (a diferencia de utf-8, auto-validante). Cuando el body
+    completo TAMBIEN decodifica limpio como utf-8 estricto, se prefiere
+    utf-8 sobre el header mentiroso y las citas con tildes verifican."""
+    install_connections(
+        monkeypatch,
+        FakeResponse(html_bytes(), content_type="text/html; charset=iso-8859-1"),
+    )
+
+    fetched = OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=1)
+
+    assert fetched.html == fx.HTML
+    assert "Situação" in fetched.content
+    assert "Inscrições" in fetched.content
+    assert any(
+        item.startswith("utf8_strict_overrides_header:iso8859-1")
+        for item in fetched.decode_diagnostics
+    )
+
+
+def test_document_meta_charset_overrides_lying_permissive_header(monkeypatch) -> None:
+    """SUB-CAUSA 2a fix (holdout 12-jul): cuando el header declara un charset
+    permisivo (iso-8859-1/cp1252, jamas lanza) pero el propio documento
+    declara un <meta charset> distinto, se prioriza el meta -- el exito
+    silencioso del header permisivo no es evidencia de que sea correcto."""
+    html = fx.HTML.replace("<head>", '<head><meta charset="utf-8">')
+    install_connections(
+        monkeypatch,
+        FakeResponse(html.encode("utf-8"), content_type="text/html; charset=iso-8859-1"),
+    )
+
+    fetched = OrionHTTPFetcher().fetch(fx.URL, timeout_seconds=1)
+
+    assert fetched.html == html
+    assert "Situação" in fetched.content
+    assert any(
+        item.startswith("document_charset_overrides_header:utf-8")
+        for item in fetched.decode_diagnostics
+    )
 
 
 def test_document_charset_is_used_without_header_charset(monkeypatch) -> None:

@@ -250,38 +250,39 @@ def _ambiguous_snapshot():
     ),))
 
 
-def test_ambiguous_citation_triggers_single_repair_and_succeeds() -> None:
-    first = {
+def test_ambiguous_citation_anchors_immediately_without_repair() -> None:
+    """SUB-CAUSA 1 fix (12-jul): existencia de evidencia alcanza -- una quote
+    duplicada ('Concurso 01' aparece en el cuerpo Y en el rodape) ya no
+    dispara la ronda de reparacion, ancla a la primera ocurrencia en el
+    primer intento."""
+    ambiguous = {
         "decision": "indice_oficial",
         "citations": [{"source_id": "main", "quote": "Concurso 01"}],
     }
-    fixed = {
-        "decision": "indice_oficial",
-        "citations": [{"source_id": "main", "quote": "Concurso 01 aberto"}],
-    }
-    client = SequencedClient([first, fixed])
+    client = SequencedClient([ambiguous])
     result = _repair_runner(client).run(
         snapshot=_ambiguous_snapshot(), task="certify fixture"
     )
 
     assert isinstance(result, base.AgentRunResult)
-    assert len(client.calls) == 2
-    repair_text = client.calls[1][0][-1]["parts"][0]["text"]
-    assert "CITATION_REPAIR" in repair_text
-    assert "quote_ambiguous" in repair_text
+    assert len(client.calls) == 1
     hydrated = result.output["citations"][0]
     snapshot = _ambiguous_snapshot()
     text = snapshot.sources[0].content
-    assert text[hydrated["start"]:hydrated["end"]] == "Concurso 01 aberto"
-    assert result.steps == 2
+    assert hydrated["start"] == text.index("Concurso 01")
+    assert text[hydrated["start"]:hydrated["end"]] == "Concurso 01"
+    assert result.steps == 1
 
 
 def test_repair_is_bounded_to_one_attempt_then_fail_closed() -> None:
-    still_ambiguous = {
+    """La cita ambigua ya no dispara reparacion (ver test arriba); el techo
+    de UNA sola reparacion sigue vigente para fallos que SI son reales
+    (quote_not_found persistente tras el reintento)."""
+    still_missing = {
         "decision": "indice_oficial",
-        "citations": [{"source_id": "main", "quote": "Concurso 01"}],
+        "citations": [{"source_id": "main", "quote": "no existe en el snapshot"}],
     }
-    client = SequencedClient([still_ambiguous, dict(still_ambiguous)])
+    client = SequencedClient([still_missing, dict(still_missing)])
     result = _repair_runner(client).run(
         snapshot=_ambiguous_snapshot(), task="certify fixture"
     )

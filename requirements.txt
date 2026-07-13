@@ -22,6 +22,11 @@ rapidfuzz>=3.6          # fuzzy matching para deduplicação
 # Validation / models
 pydantic>=2.5
 
+# TLS chain repair (AIA) for live V2 fetch -- both already present transitively
+# (google-auth, requests) but now imported directly by live_abc_adapter.py.
+cryptography>=42.0
+certifi>=2024.2.2
+
 # Utilities
 tqdm>=4.66
 python-dotenv>=1.0

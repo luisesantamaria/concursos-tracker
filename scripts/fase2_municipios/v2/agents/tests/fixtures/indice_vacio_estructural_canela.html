@@ -1,0 +1,73 @@
+<!--
+R-T1 fixture (FP real, holdout 12-jul): indice oficial ESTRUCTURALMENTE valido
+(dominio oficial, filtros por entidade/tipo/ano, busqueda funcional) pero VACIO
+en toda su historia -- cero concursos/PSS publicados desde 2013 hasta hoy.
+
+Fuente real: https://servicosonline.canela.rs.gov.br:8383/sys523/publico/concursosPublicos.xhtml
+(modulo "Edital de Concursos e Selecoes Publicas" del Portal da Transparencia
+de Canela/RS). Reducido a los elementos estructurales que llevaron al
+certificador A a confirmar "indice_oficial" citando el propio mensaje de
+ausencia como evidencia de bucket -- exactamente el patron que
+certifier._is_absence_message()/_certifier_invariants() ahora rechaza
+(reason=indice_vacio_sin_items). No usar como fixture de datos+cassettes:
+es documentacion/regresion del patron HTML, no un caso ejecutable del
+fixture envenenado v2 (que exige checkpoint de un run real, ver
+scripts/fase2_municipios/v2/eval/poison_report.py).
+-->
+<!doctype html>
+<html lang="pt-br">
+<head><title>Concursos Publicos</title></head>
+<body>
+  <header>
+    <h1>Portal da Transparência | Município de Canela</h1>
+  </header>
+  <nav>Página Inicial &gt; Recursos Humanos &gt; Edital de Concursos e Seleções Públicas</nav>
+  <main>
+    <form id="filtros-concursos">
+      <fieldset>
+        <legend>Filtros</legend>
+        <label>Entidade
+          <select name="entidade">
+            <option>Todas</option>
+            <option>PREFEITURA MUNICIPAL DE CANELA</option>
+            <option>Câmara Municipal de Vereadores de Canela</option>
+          </select>
+        </label>
+        <label>Tipo de Publicação
+          <select name="tipo">
+            <option>Todos</option>
+            <option>Concurso</option>
+            <option>Processo Seletivo</option>
+          </select>
+        </label>
+        <label>Período de Publicação Inicial/Final
+          <select name="ano_inicial">
+            <option>Todos</option>
+            <option>2026</option>
+            <option>2025</option>
+            <option>2024</option>
+            <!-- ... 2023-2013 omitidos: rango real completo en la fuente -->
+            <option>2013</option>
+          </select>
+        </label>
+        <button type="submit">Pesquisar</button>
+        <button type="reset">Limpar</button>
+      </fieldset>
+    </form>
+    <section id="resultado-busca">
+      <p class="mensagem-ausencia">
+        Não foram encontrados Concursos / Processos Seletivos com os filtros selecionados.
+      </p>
+      <table>
+        <thead>
+          <tr><th>Descrição</th><th>Publicação</th><th>Nível do Provimento de Cargo</th><th>Status do Concurso</th></tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="4">Nenhum registro encontrado.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+  <footer>Licenciado para: Prefeitura Municipal de Canela</footer>
+</body>
+</html>

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import re
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,52 @@ REQUIRED_CONFIRMATION_CITATION_DIMENSIONS = frozenset({
     "authority", "identity", "page_role", "bucket", "stability",
 })
 
+# R-T1 (FP real Canela, holdout 12-jul): un modulo de transparencia con
+# filtros de entidad/tipo/ano funcionales pero CERO concursos en la historia
+# fue confirmado ("indice_oficial") usando como UNICA cita de bucket el
+# propio mensaje de ausencia ("Nao foram encontrados Concursos / Processos
+# Seletivos com os filtros selecionados."). Blocklist content-neutral (misma
+# lista para cualquier municipio/plataforma, no un hardcode municipal):
+# frases pt-BR genericas de "sem resultados", verificadas contra los
+# artefactos del holdout 12-jul y variantes razonables del mismo patron.
+# \s+ tolera saltos de linea/espacios multiples del texto ya renderizado.
+_ABSENCE_MESSAGE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"nao\s+foram\s+encontrados",
+        r"nenhum\s+registro",
+        r"nenhum\s+resultado",
+        r"nao\s+ha\s+registros",
+        r"nenhum\s+item\s+encontrado",
+        r"nao\s+existem\s+registros",
+        r"sem\s+resultados",
+        r"nada\s+encontrado",
+        r"nenhum\s+concurso\s+encontrado",
+        r"nenhuma\s+publicacao\s+encontrada",
+        r"sem\s+registros",
+        r"nenhum\s+dado\s+encontrado",
+    )
+)
+
+
+def _fold_accents(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _is_absence_message(quote: str) -> bool:
+    """True when a citation's literal text is itself a pt-BR "no results" message.
+
+    A citation whose quote matches (or is contained in) an absence message
+    cannot serve as evidence that a bucket actually has items -- it proves
+    the opposite. Matching is case- and accent-insensitive and does not
+    depend on municipio/platform (content-neutral).
+    """
+    if not isinstance(quote, str) or not quote:
+        return False
+    folded = _fold_accents(quote).lower()
+    return any(pattern.search(folded) for pattern in _ABSENCE_MESSAGE_PATTERNS)
+
 
 def _certifier_citations(output: Mapping[str, Any]) -> tuple[Citation, ...]:
     return tuple(
@@ -58,10 +106,12 @@ def _prepare_certifier_output(
     failures: list[CitationVerificationError] = []
     for item in prepared["citations"]:
         # Politica 12-jul (aprobada por Luis): el modelo entrega source_id+quote
-        # y el codigo computa los offsets exigiendo ocurrencia literal UNICA
-        # (quote_not_found/quote_ambiguous rechazan). Los offsets que el modelo
-        # emita se DESCARTAN: son ruido demostrado (canario r1: 20/20 sin end;
-        # r2: longitudes erroneas), nunca evidencia. El gate final re-verifica
+        # y el codigo computa los offsets exigiendo ocurrencia literal (solo
+        # quote_not_found rechaza; una quote repetida ancla a su primera
+        # ocurrencia -- existencia de evidencia, no unicidad de offset, ver
+        # snapshot.anchor_citation). Los offsets que el modelo emita se
+        # DESCARTAN: son ruido demostrado (canario r1: 20/20 sin end; r2:
+        # longitudes erroneas), nunca evidencia. El gate final re-verifica
         # slice-equality sobre los offsets computados (require_offsets=True en
         # orchestration._strict_citations), sin cambios.
         item.pop("start", None)
@@ -97,20 +147,43 @@ def _certifier_invariants(output: Mapping[str, Any]) -> None:
             role="certifier",
             reason="missing_confirmation_citation_dimensions:" + ",".join(sorted(missing)),
         )
+    bucket_quotes_all = [
+        item.get("quote") for item in citations
+        if item.get("dimension") == "bucket"
+    ]
+    non_absence_bucket_quotes = {
+        quote for quote in bucket_quotes_all
+        if isinstance(quote, str) and not _is_absence_message(quote)
+    }
+    if not non_absence_bucket_quotes:
+        # R-T1: un bucket confirmado exige >=1 cita de bucket VERIFICADA cuyo
+        # texto NO sea un mensaje de ausencia (ver _is_absence_message). Un
+        # indice estructuralmente valido (filtros, busqueda) pero vacio en
+        # toda su historia no es un indice utilizable: degradar a revisar en
+        # vez de confirmar sobre "nao encontramos nada".
+        raise AgentOutputRejected(
+            role="certifier",
+            reason="indice_vacio_sin_items",
+        )
     if decision == "indice_oficial_combinado":
         # Politica 12-jul (hueco FP real): una superficie combinada exige DOS
         # evidencias de bucket textualmente distintas -- una cita bucket sola
         # solo prueba un tipo, no la combinacion. Cardinalidad pura: el codigo
         # cuenta quotes distintos, no decide cuales tipos son (eso es semantica
         # de A/B/C, fuera del alcance del codigo).
-        bucket_quotes = {
-            item.get("quote") for item in citations
-            if item.get("dimension") == "bucket"
-        }
+        bucket_quotes = set(bucket_quotes_all)
         if len(bucket_quotes) < 2:
             raise AgentOutputRejected(
                 role="certifier",
                 reason="combined_requires_two_distinct_bucket_citations",
+            )
+        if len(non_absence_bucket_quotes) < 2:
+            # R-T1 para combinado: AMBOS tipos necesitan su propia evidencia
+            # no-ausencia. Dos quotes distintos donde uno es un mensaje de
+            # ausencia solo prueba UN tipo, no la combinacion de ambos.
+            raise AgentOutputRejected(
+                role="certifier",
+                reason="indice_vacio_sin_items:combinado_solo_un_tipo_con_items",
             )
 
 

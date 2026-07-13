@@ -142,10 +142,12 @@ def test_model_offsets_are_ignored_and_recomputed_deterministically() -> None:
         assert text[item["start"]:item["end"]] == item["quote"]
 
 
-def test_ambiguous_quote_is_rejected_at_the_model_seam() -> None:
-    """La unicidad es el guardarrail del anclaje: quote repetida en la fuente
-    no ancla (el modelo debe extender la cita hasta hacerla unica)."""
-    snapshot = _snapshot("Concurso Publico 01 ... Concurso Publico 02")
+def test_ambiguous_quote_anchors_to_first_occurrence_at_the_model_seam() -> None:
+    """SUB-CAUSA 1 fix (12-jul, holdout): existencia de evidencia es el
+    guardarrail del anclaje, no unicidad de offset. Una quote repetida en la
+    fuente ancla a su primera ocurrencia en vez de rechazar."""
+    text = "Concurso Publico 01 ... Concurso Publico 02"
+    snapshot = _snapshot(text)
     output = {
         "decision": "indice_oficial",
         "citations": [{
@@ -155,8 +157,10 @@ def test_ambiguous_quote_is_rejected_at_the_model_seam() -> None:
             "source_id": "main",
         }],
     }
-    with pytest.raises(CitationVerificationError, match="quote_ambiguous"):
-        certifier._prepare_certifier_output(snapshot, output)
+    prepared = certifier._prepare_certifier_output(snapshot, output)
+    item = prepared["citations"][0]
+    assert item["start"] == text.index("Concurso Publico")
+    assert text[item["start"]:item["end"]] == "Concurso Publico"
 
 
 def _combined_output(*, bucket_quotes: tuple[str, ...], decision: str = "indice_oficial_combinado"):
@@ -317,7 +321,11 @@ def test_C_reason_is_bounded() -> None:
 def test_prepare_collects_all_anchor_failures_for_repair() -> None:
     """El anclaje reporta TODOS los fallos de una vez (no solo el primero):
     la ronda de reparacion necesita la lista completa para corregir en un
-    solo intento (canario r4: NH/Canoas arreglaron solo el primer fallo)."""
+    solo intento (canario r4: NH/Canoas arreglaron solo el primer fallo).
+    'dup A' (ambigua, 2 ocurrencias) ya NO es un fallo (SUB-CAUSA 1 fix,
+    12-jul): se ancla a la primera ocurrencia y se mezcla junto a dos fallos
+    reales (quote_not_found + missing_required_fields) para probar que la
+    coleccion de fallos sigue siendo completa."""
     snapshot = _snapshot("dup A dup A unico B fim")
     output = {
         "decision": "indice_oficial",
@@ -325,6 +333,8 @@ def test_prepare_collects_all_anchor_failures_for_repair() -> None:
             {"dimension": "identity", "quote": "dup A",
              "source_field": "main_content", "source_id": "main"},
             {"dimension": "bucket", "quote": "no-existe-en-snapshot",
+             "source_field": "main_content", "source_id": "main"},
+            {"dimension": "authority",
              "source_field": "main_content", "source_id": "main"},
             {"dimension": "stability", "quote": "unico B",
              "source_field": "main_content", "source_id": "main"},
@@ -335,7 +345,7 @@ def test_prepare_collects_all_anchor_failures_for_repair() -> None:
     failures = getattr(raised.value, "failures", ())
     assert len(failures) == 2
     reasons = sorted(getattr(f, "reason", "") for f in failures)
-    assert reasons == ["quote_ambiguous", "quote_not_found"]
+    assert reasons == ["missing_required_fields", "quote_not_found"]
 
 
 def test_api_facing_schema_strips_unsupported_array_bounds() -> None:

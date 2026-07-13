@@ -366,10 +366,11 @@ class AgentRunner:
         self, *, snapshot: EvidenceSnapshot, task: str
     ) -> AgentRunResult | SnapshotInvalidOutput:
         # Politica 12-jul (aprobada por Luis): ante rechazo del anclaje de citas
-        # (quote_ambiguous/quote_not_found/formato), UNA sola re-invocacion con
-        # el detalle exacto del fallo. El validador determinista re-verifica
-        # completo; si la reparacion tambien falla, fail-closed tipado. Los
-        # rechazos NO relacionados con citas jamas se reparan ni reintentan.
+        # (quote_not_found/formato -- quote_ambiguous ya NO rechaza, ver
+        # snapshot.anchor_citation), UNA sola re-invocacion con el detalle
+        # exacto del fallo. El validador determinista re-verifica completo; si
+        # la reparacion tambien falla, fail-closed tipado. Los rechazos NO
+        # relacionados con citas jamas se reparan ni reintentan.
         contents = self._direct_contents(snapshot, task)
         raw: Any | None = None
         repair_used = False

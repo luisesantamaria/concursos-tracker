@@ -204,24 +204,23 @@ def _pelotas_like_snapshot():
     ),))
 
 
-def test_real_ambiguous_repair_flow_carries_occurrence_count_and_strategy() -> None:
+def test_real_ambiguous_quote_now_anchors_on_first_call_without_repair() -> None:
+    """SUB-CAUSA 1 fix (12-jul, holdout): el mismo caso real Pelotas/CP (chrome
+    duplicado en header Y footer, r1==r2 repitiendo la cita ambigua) ya NO
+    dispara la ronda de reparacion. Ambiguedad de offset prueba EXISTENCIA de
+    evidencia y ancla a la primera ocurrencia; el repair loop de
+    quote_ambiguous queda sin caso real que lo dispare."""
     ambiguous = {
         "decision": "indice_oficial",
         "citations": [{"source_id": "chrome", "quote": "Prefeitura Municipal de Pelotas"}],
     }
-    client = SequencedClient([ambiguous, dict(ambiguous)])
+    client = SequencedClient([ambiguous])
 
     result = _repair_runner(client).run(
         snapshot=_pelotas_like_snapshot(), task="certify fixture"
     )
 
-    # Un solo techo de reparacion (politica 12-jul): repetir la misma cita
-    # ambigua en la reparacion sigue siendo fail-closed, sin rondas extra.
-    assert isinstance(result, base.SnapshotInvalidOutput)
-    assert len(client.calls) == 2
-
-    repair_text = client.calls[1][0][-1]["parts"][0]["text"]
-    assert "CITATION_REPAIR" in repair_text
-    assert "quote_ambiguous" in repair_text
-    assert "la cita aparece 2 veces" in repair_text
-    assert "Estrategia recomendada" in repair_text
+    assert isinstance(result, base.AgentRunResult)
+    assert len(client.calls) == 1
+    assert result.output["citations"][0]["start"] == 0
+    assert result.output["citations"][0]["end"] == len("Prefeitura Municipal de Pelotas")

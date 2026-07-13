@@ -88,9 +88,28 @@ def structural_candidate(
         identity = "confirmada"
     else:
         identity = cascade._candidate_identity_state(page, municipio, ())
+        # Mision D (12-jul), regla (b) -- universo (site_base): escape hatch
+        # SOLO para subir a 'confirmada'; nunca baja lo que cascade ya dijo.
+        # Exige DOS hechos independientes (site_base match + mencion literal
+        # del municipio en el contenido) -- ver docstring de
+        # ``universe_identity_confirms``. Cubre los casos donde cascade
+        # rechaza por slug (conector da/de/do/das/dos retenido en el host, o
+        # abreviatura no estandar como pmfv/pmgentil) antes de leer contenido.
+        if identity != "confirmada" and authority.universe_identity_confirms(
+            municipio, final_url, page,
+        ):
+            identity = "confirmada"
 
-    provenance_total = tuple(provenance) + authority.registry_provenance(
-        municipio, final_url,
+    provenance_total = (
+        tuple(provenance)
+        + authority.registry_provenance(municipio, final_url)
+        # Mision D (12-jul), reglas (a)/(b): fuentes de autoridad nuevas para
+        # municipios NUEVOS (fuera del registro curado). Ninguna de las dos
+        # alimenta identidad por si sola -- ver los docstrings de cada
+        # funcion y el comentario "provenance de REDIRECT" arriba: el mismo
+        # principio aplica aqui.
+        + authority.delegated_platform_provenance(municipio, final_url, page)
+        + authority.universe_provenance(municipio, final_url)
     )
     source_kind, authority_state = cascade._candidate_source_and_authority(
         page, municipio, provenance_total, identity, source,

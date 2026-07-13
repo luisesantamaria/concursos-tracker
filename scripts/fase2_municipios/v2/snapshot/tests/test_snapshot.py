@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
+import unicodedata
 
 import pytest
 
@@ -201,6 +202,40 @@ def test_unicode_offsets_are_python_str_character_indices() -> None:
     verify_citation(snapshot, citation)
 
 
+def test_nfd_quote_anchors_and_verifies_against_nfc_snapshot_text() -> None:
+    """SUB-CAUSA 2c fix (holdout 12-jul: doutormauriciocardoso/saodomingosdosul
+    /inhacora/estrela). El snapshot llega NFC-canonico desde la capa de decode
+    (eval/live_abc_adapter.py); una cita en forma NFD (p.ej. copiada de un
+    render que descompone acentos) debe anclar y verificar igual -- la forma
+    Unicode no es motivo de rechazo, solo la ausencia literal lo es."""
+    nfc_text = unicodedata.normalize(
+        "NFC", "Processo Seletivo - Educação Municipal"
+    )
+    assert nfc_text == "Processo Seletivo - Educação Municipal"  # ya viene compuesto
+    snapshot = build_snapshot([source("main", nfc_text)])
+
+    nfd_quote = unicodedata.normalize("NFD", "Educação Municipal")
+    assert nfd_quote != "Educação Municipal"  # confirma que son formas distintas
+
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": nfd_quote})
+    assert citation.quote == nfd_quote  # se preserva lo que dijo el modelo
+    verify_citation(snapshot, citation)
+
+    # El mismo NFD tambien verifica cuando llega con offsets explicitos (ruta
+    # que toma el gate final tras el anclaje del certifier/prosecutor).
+    explicit = anchor_citation(
+        snapshot,
+        {
+            "source_id": "main",
+            "start": citation.start,
+            "end": citation.end,
+            "quote": nfd_quote,
+        },
+        require_offsets=True,
+    )
+    verify_citation(snapshot, explicit)
+
+
 def test_main_and_chrome_citations_are_distinct_even_with_same_quote() -> None:
     snapshot = build_snapshot([
         source("main", "Editais oficiais"),
@@ -215,39 +250,48 @@ def test_main_and_chrome_citations_are_distinct_even_with_same_quote() -> None:
         anchor_citation(snapshot, {"quote": "Editais oficiais"})
 
 
-def test_repeated_quote_without_offsets_fails_closed_but_explicit_offsets_disambiguate() -> None:
+def test_repeated_quote_without_offsets_anchors_first_occurrence_and_explicit_offsets_still_disambiguate() -> None:
+    """SUB-CAUSA 1 fix (holdout 12-jul): existencia de evidencia alcanza --
+    ambiguedad de offset ya no rechaza. Sin offsets se ancla a la primera
+    ocurrencia (con el flag informativo); offsets explicitos siguen
+    permitiendo anclar a cualquier otra ocurrencia puntual."""
     snapshot = build_snapshot([source("main", "Edital / Edital")])
-    with pytest.raises(CitationVerificationError) as ambiguous:
-        anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
-    assert ambiguous.value.reason == "quote_ambiguous"
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
+    assert citation.start == 0
+    assert citation.end == len("Edital")
+    assert citation.ambiguous_occurrences == 2
+    verify_citation(snapshot, citation)
 
-    citation = anchor_citation(
+    other = anchor_citation(
         snapshot,
         {"source_id": "main", "start": 9, "end": 15, "quote": "Edital"},
     )
-    verify_citation(snapshot, citation)
+    assert other.start == 9
+    assert other.ambiguous_occurrences is None  # explicit offsets skip the check
+    verify_citation(snapshot, other)
 
 
-def test_ambiguous_citation_reports_real_non_overlapping_occurrence_count() -> None:
+def test_ambiguous_citation_records_real_non_overlapping_occurrence_count() -> None:
     """Ambiguedad hoy solo era binaria (find(quote, position+1) >= 0). El
-    conteo real deja de ser 'aparece mas de una vez' para decir cuantas."""
+    conteo real deja de ser 'aparece mas de una vez' para decir cuantas, y
+    ahora se registra como flag informativo en la cita anclada, no en un
+    fallo."""
     snapshot = build_snapshot([source("main", "Edital / Edital / Edital")])
-    with pytest.raises(CitationVerificationError) as raised:
-        anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
-    assert raised.value.reason == "quote_ambiguous"
-    assert raised.value.occurrence_count == 3
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
+    assert citation.ambiguous_occurrences == 3
+    verify_citation(snapshot, citation)
 
 
 def test_two_occurrences_are_counted_exactly_as_two() -> None:
     snapshot = build_snapshot([source("main", "Concurso 01 aberto / Concurso 01 fim")])
-    with pytest.raises(CitationVerificationError) as raised:
-        anchor_citation(snapshot, {"source_id": "main", "quote": "Concurso 01"})
-    assert raised.value.occurrence_count == 2
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": "Concurso 01"})
+    assert citation.ambiguous_occurrences == 2
 
 
-def test_non_ambiguous_failure_reasons_leave_occurrence_count_none() -> None:
-    """occurrence_count solo tiene sentido para quote_ambiguous: los demas
-    fallos (quote_not_found, empty_source, etc.) no deben inventar un conteo."""
+def test_quote_not_found_is_the_only_remaining_absence_failure() -> None:
+    """La UNICA razon que sigue rechazando por ausencia real de evidencia: el
+    texto no existe en la fuente. occurrence_count no aplica a estos fallos
+    (quote_not_found, empty_source) -- nunca inventa un conteo."""
     snapshot = build_snapshot([source("main", "unico texto sin repetir")])
     with pytest.raises(CitationVerificationError) as not_found:
         anchor_citation(snapshot, {"source_id": "main", "quote": "no existe"})
@@ -261,15 +305,15 @@ def test_non_ambiguous_failure_reasons_leave_occurrence_count_none() -> None:
     assert empty.value.occurrence_count is None
 
 
-def test_existing_reason_and_quote_preview_reader_code_is_unaffected() -> None:
-    """Compatibilidad: codigo existente que solo lee .reason/.quote_preview
-    (sin conocer occurrence_count) sigue funcionando igual."""
+def test_existing_citation_reader_code_unaware_of_ambiguity_flag_is_unaffected() -> None:
+    """Compatibilidad: codigo existente que solo lee .source_id/.start/.end/
+    .quote (sin conocer ambiguous_occurrences) sigue funcionando igual, y la
+    cita anclada de una quote ambigua se comporta como cualquier otra."""
     snapshot = build_snapshot([source("main", "Edital / Edital")])
-    with pytest.raises(CitationVerificationError) as raised:
-        anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
-    assert raised.value.reason == "quote_ambiguous"
-    assert raised.value.quote_preview == "Edital"
-    assert "reason=quote_ambiguous" in str(raised.value)
+    citation = anchor_citation(snapshot, {"source_id": "main", "quote": "Edital"})
+    assert citation.source_id == "main"
+    assert citation.quote == "Edital"
+    assert (citation.start, citation.end) == (0, len("Edital"))
 
 
 def test_verify_all_forwards_occurrence_count_into_citation_failure_when_present() -> None:

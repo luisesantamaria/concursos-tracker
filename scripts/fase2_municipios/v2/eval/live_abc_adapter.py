@@ -17,20 +17,44 @@ from datetime import datetime, timezone
 from enum import Enum
 import gzip
 import hashlib
+from html.parser import HTMLParser
 import http.client
+import os
 import re
 import socket
+import ssl
+import tempfile
 import time
+import unicodedata
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
 import zlib
 
+import certifi
 from pydantic import ValidationError
 
 try:
     import brotli as _brotli
 except ImportError:  # Optional: do not advertise br when no decoder is installed.
     _brotli = None
+
+# SUB-CAUSA 2 (holdout 12-jul: saovendelino/multi24h). cryptography ya es
+# dependencia transitiva real (google-auth, pdfminer.six -- ver pip show), no
+# opcional como brotli; se protege igual con try/except para que la ausencia
+# nunca tumbe el import del modulo, solo desactive la recuperacion AIA (el
+# SSLCertVerificationError original sigue propagando sin mascarar nada).
+try:
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives import serialization as _x509_serialization
+    from cryptography.x509.oid import (
+        AuthorityInformationAccessOID as _AIA_OID,
+        ExtensionOID as _EXTENSION_OID,
+    )
+except ImportError:  # pragma: no cover - always present transitively today.
+    _x509 = None
+    _x509_serialization = None
+    _AIA_OID = None
+    _EXTENSION_OID = None
 
 from scripts.fase2_municipios import cascade_municipios as cascade
 from scripts.fase2_municipios.v2 import authority
@@ -189,6 +213,15 @@ _MOJIBAKE_UTF8_FINGERPRINT_RE = re.compile(rb"\xc3[\x80-\xbf]")
 # porto-alegrenses produce cientos de matches, muy por encima de este umbral.
 _MOJIBAKE_UTF8_FINGERPRINT_MIN_MATCHES = 3
 
+# SUB-CAUSA 2 (holdout 12-jul: doutormauriciocardoso/saodomingosdosul/inhacora/
+# estrela). iso-8859-1 y cp1252 son "permisivos": decodifican CUALQUIER byte
+# 0x00-0xFF sin excepcion nunca, asi que un decode exitoso con uno de estos NO
+# prueba que el charset declarado sea correcto (a diferencia de utf-8, que es
+# auto-validante -- una secuencia de bytes al azar casi nunca es utf-8 valido).
+# Cuando el header declara uno de estos dos, se lo contrasta ANTES de confiar
+# ciegamente: ver la cadena de precedencia documentada en _decode_response_payload.
+_PERMISSIVE_SINGLE_BYTE_CHARSETS = frozenset({"iso8859-1", "cp1252"})
+
 
 def _decode_response_payload(
     payload: bytes, declared_charset: str | None
@@ -213,6 +246,41 @@ def _decode_response_payload(
             return payload.decode(decoder), tuple((f"bom:{bom_name}", *diagnostics))
         except UnicodeDecodeError as exc:
             raise LiveFetchError("response_decode_failed") from exc
+
+    if canonical_header in _PERMISSIVE_SINGLE_BYTE_CHARSETS:
+        # Precedencia (documentada, SUB-CAUSA 2 12-jul) antes de confiar en un
+        # header permisivo: (a) el <meta charset> del propio documento, si
+        # CONTRADICE al header y decodifica limpio -- el exito silencioso del
+        # header no es evidencia a su favor; (b) un decode utf-8 ESTRICTO del
+        # body completo -- solo posible si el body es utf-8 genuino, porque un
+        # byte latin-1/cp1252 suelto con acento (ej. 0xE3 'ã') casi nunca
+        # completa una secuencia utf-8 valida. Si ninguno aplica, cae al
+        # header declarado (comportamiento previo -- sigue sirviendo iso8859
+        # real, ver test_declared_non_utf8_charset_decodes_strictly).
+        meta = _DOCUMENT_CHARSET_RE.search(payload[:8192])
+        if meta is not None:
+            raw_meta = meta.group(1).decode("ascii")
+            document_charset = _canonical_charset(raw_meta)
+            if document_charset is None:
+                diagnostics.append("invalid_document_charset")
+            elif document_charset != canonical_header:
+                try:
+                    return payload.decode(document_charset), tuple((
+                        f"document_charset_overrides_header:{document_charset}",
+                        f"header_charset:{canonical_header}",
+                        *diagnostics,
+                    ))
+                except UnicodeDecodeError:
+                    diagnostics.append(
+                        f"declared_charset_decode_failed:{document_charset}"
+                    )
+        if _MOJIBAKE_UTF8_FINGERPRINT_RE.search(payload) is not None:
+            try:
+                return payload.decode("utf-8"), tuple((
+                    f"utf8_strict_overrides_header:{canonical_header}", *diagnostics
+                ))
+            except UnicodeDecodeError:
+                pass  # body no es utf-8 genuino: cae al header declarado abajo
 
     if canonical_header is not None:
         try:
@@ -301,6 +369,167 @@ def _live_request_headers() -> dict[str, str]:
             if item.strip().lower() != "br"
         )
     return headers
+
+
+# SUB-CAUSA 1 (holdout 12-jul: canudosdovale, Vercel). Un 200 con HTML real
+# puede llegar sin cabecera Content-Type. Decidir SOLO por la cabecera
+# (ausente == binario) descarta evidencia buena; cuando la cabecera falta se
+# huele el cuerpo en vez de rechazar a ciegas. Cuando la cabecera SI esta
+# presente y es claramente no-texto (pdf/image/octet-stream/etc.), el
+# rechazo original se mantiene intacto -- este sniff nunca se ejecuta ahi.
+_CONTENT_TYPE_SNIFF_BYTES = 2048
+_HTML_SNIFF_MARKERS = (b"<html", b"<!doctype", b"<head", b"<title")
+
+
+def _looks_like_html_or_text(head: bytes) -> bool:
+    if not head:
+        return False
+    if head.lstrip().startswith(b"<"):
+        return True
+    lowered = head.lower()
+    return any(marker in lowered for marker in _HTML_SNIFF_MARKERS)
+
+
+# SUB-CAUSA 2 (holdout 12-jul: saovendelino.multi24h.com.br). El servidor
+# sirve su leaf cert sin el intermedio (GlobalSign GCC R6 AlphaSSL CA 2025):
+# SSLCertVerificationError "unable to get local issuer certificate". curl lo
+# resuelve porque arma la cadena via AIA (Authority Information Access,
+# CA Issuers). Se reproduce esa recuperacion UNA vez: leer el leaf cert con
+# un handshake sin verificar (solo para inspeccionarlo, jamas para la
+# peticion real), seguir su URI de CA Issuers, descargar el intermedio y
+# verificar el reintento contra un bundle temporal certifi+intermedio.
+_SSL_INCOMPLETE_CHAIN_MESSAGE = "unable to get local issuer certificate"
+
+
+def _is_incomplete_chain_error(exc: ssl.SSLCertVerificationError) -> bool:
+    """True solo para la cadena rota (AIA la arregla); False para cualquier
+    otro fallo de verificacion (hostname mismatch, cert expirado, cert
+    self-signed, etc.) -- esos jamas intentan recuperacion, propagan tal
+    cual (ver test de SSL error distinto)."""
+
+    message = (getattr(exc, "verify_message", "") or str(exc)).lower()
+    return _SSL_INCOMPLETE_CHAIN_MESSAGE in message
+
+
+def _fetch_leaf_certificate_der(host: str, port: int, timeout: float) -> bytes:
+    """Handshake SIN verificar, solo para leer los bytes del leaf cert.
+
+    verify_mode=CERT_NONE esta deliberadamente confinado a esta lectura: la
+    peticion de contenido real jamas pasa por este contexto (ver
+    _recover_ssl_context_via_aia, que construye un contexto VERIFICADO nuevo
+    para el reintento).
+    """
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        with context.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+            der = tls_sock.getpeercert(binary_form=True)
+    if not der:
+        raise LiveFetchError("ssl_aia_leaf_certificate_unavailable")
+    return der
+
+
+def _aia_ca_issuer_uris(der_cert: bytes) -> tuple[str, ...]:
+    """Extrae las URI "CA Issuers" de la extension Authority Information
+    Access del leaf cert. Devuelve () si la extension no existe -- el
+    llamador trata eso como recuperacion imposible, nunca como error."""
+
+    certificate = _x509.load_der_x509_certificate(der_cert)
+    try:
+        aia = certificate.extensions.get_extension_for_oid(
+            _EXTENSION_OID.AUTHORITY_INFORMATION_ACCESS
+        )
+    except _x509.ExtensionNotFound:
+        return ()
+    return tuple(
+        description.access_location.value
+        for description in aia.value
+        if description.access_method == _AIA_OID.CA_ISSUERS
+        and isinstance(description.access_location, _x509.UniformResourceIdentifier)
+    )
+
+
+def _download_intermediate_pem(uri: str, timeout: float) -> str:
+    """Descarga el certificado intermedio referenciado por la URI CA Issuers
+    y lo devuelve en PEM. El body puede llegar en DER (application/pkix-cert,
+    lo mas comun) o ya en PEM -- se prueba DER primero y se cae a PEM."""
+
+    parsed = urlsplit(uri)
+    if parsed.scheme not in {"http", "https"}:
+        raise LiveFetchError("ssl_aia_uri_scheme_unsupported")
+    connection_cls = (
+        http.client.HTTPSConnection if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_cls(parsed.hostname, port=parsed.port, timeout=timeout)
+    try:
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        connection.request("GET", path, headers=_live_request_headers())
+        response = connection.getresponse()
+        body = response.read()
+        if response.status < 200 or response.status >= 400:
+            raise LiveFetchError(
+                "ssl_aia_issuer_fetch_failed", status_code=response.status
+            )
+    finally:
+        connection.close()
+    try:
+        certificate = _x509.load_der_x509_certificate(body)
+    except ValueError:
+        certificate = _x509.load_pem_x509_certificate(body)
+    return certificate.public_bytes(
+        _x509_serialization.Encoding.PEM
+    ).decode("ascii")
+
+
+def _write_temp_ca_bundle(intermediate_pem: str) -> str:
+    """Bundle temporal certifi + intermedio. El SSLContext parsea el archivo
+    dentro de create_default_context; el archivo se borra apenas se
+    construye el contexto (ver _recover_ssl_context_via_aia), no hace falta
+    conservarlo mas alla de esa llamada."""
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".pem", delete=False, encoding="ascii"
+    ) as bundle_file:
+        with open(certifi.where(), "r", encoding="ascii") as certifi_bundle:
+            bundle_file.write(certifi_bundle.read())
+        bundle_file.write("\n")
+        bundle_file.write(intermediate_pem)
+        return bundle_file.name
+
+
+def _recover_ssl_context_via_aia(
+    host: str | None, port: int, timeout: float
+) -> ssl.SSLContext | None:
+    """Recuperacion AIA de un solo intento. Devuelve ``None`` ante cualquier
+    fallo (cryptography ausente, extension AIA ausente, descarga fallida,
+    parseo fallido) para que el llamador propague el SSLCertVerificationError
+    ORIGINAL sin mascarar -- esta funcion nunca inventa exito."""
+
+    if not host or _x509 is None:
+        return None
+    try:
+        leaf_der = _fetch_leaf_certificate_der(host, port, timeout)
+        for uri in _aia_ca_issuer_uris(leaf_der):
+            try:
+                intermediate_pem = _download_intermediate_pem(uri, timeout)
+            except Exception:
+                continue
+            bundle_path = _write_temp_ca_bundle(intermediate_pem)
+            try:
+                return ssl.create_default_context(cafile=bundle_path)
+            finally:
+                try:
+                    os.unlink(bundle_path)
+                except OSError:
+                    pass
+    except Exception:
+        return None
+    return None
 
 
 class LiveCauseKind(str, Enum):
@@ -456,7 +685,7 @@ class OrionHTTPFetcher:
         )
 
     @staticmethod
-    def _connection(parsed, timeout_seconds: float):
+    def _connection(parsed, timeout_seconds: float, *, ssl_context=None):
         host = parsed.hostname
         if not host:
             raise LiveFetchError("fetch_host_missing")
@@ -466,6 +695,7 @@ class OrionHTTPFetcher:
                 host,
                 port=port,
                 timeout=timeout_seconds,
+                context=ssl_context,
             )
         elif parsed.scheme == "http":
             connection = http.client.HTTPConnection(
@@ -489,13 +719,24 @@ class OrionHTTPFetcher:
         read_timeout = self._read_timeout_seconds or float(timeout_seconds)
         response = None
         payload = b""
+        ssl_aia_recovered = False
         for redirect_count in range(self._max_redirects + 1):
             parsed = urlsplit(current_url)
             path = parsed.path or "/"
             if parsed.query:
                 path += "?" + parsed.query
+            # SUB-CAUSA 2: contexto recuperado via AIA para ESTE host, si
+            # hizo falta. None hasta que un SSLCertVerificationError de
+            # cadena incompleta dispare la recuperacion (una vez por host,
+            # nunca en tests que no la ejercitan -- ver comentario en
+            # _connection sobre no pasar el kwarg salvo que sea necesario).
+            ssl_context_override = None
             for fetch_attempt in range(2):
-                connection = self._connection(parsed, connect_timeout)
+                connection = (
+                    self._connection(parsed, connect_timeout, ssl_context=ssl_context_override)
+                    if ssl_context_override is not None
+                    else self._connection(parsed, connect_timeout)
+                )
                 try:
                     connection.request("GET", path, headers=_live_request_headers())
                     sock = getattr(connection, "sock", None)
@@ -506,6 +747,17 @@ class OrionHTTPFetcher:
                     break
                 except ExternalAccessBlocked:
                     raise
+                except ssl.SSLCertVerificationError as exc:
+                    if ssl_context_override is not None or not _is_incomplete_chain_error(exc):
+                        raise
+                    recovered_context = _recover_ssl_context_via_aia(
+                        parsed.hostname, parsed.port or 443, connect_timeout
+                    )
+                    if recovered_context is None:
+                        raise
+                    ssl_context_override = recovered_context
+                    ssl_aia_recovered = True
+                    continue
                 except (TimeoutError, OSError):
                     if fetch_attempt == 1:
                         raise
@@ -526,15 +778,35 @@ class OrionHTTPFetcher:
         if status < 200 or status >= 400:
             raise LiveFetchError("http_status", status_code=status)
         content_type = str(response.getheader("content-type", ""))
-        if "text/html" not in content_type and "text/plain" not in content_type:
+        header_says_text = "text/html" in content_type or "text/plain" in content_type
+        if not header_says_text and content_type.strip():
+            # Cabecera PRESENTE y claramente no-texto: rechazo original
+            # intacto, sin gastar tiempo en decompress/sniff.
             raise LiveFetchError("response_not_html_or_text")
         content_encoding = str(response.getheader("content-encoding", ""))
         payload = _decompress_payload(payload, content_encoding)
+        content_type_sniffed = False
+        if not header_says_text:
+            # Cabecera AUSENTE (SUB-CAUSA 1): huele el cuerpo ya
+            # descomprimido antes de rechazar.
+            if not _looks_like_html_or_text(payload[:_CONTENT_TYPE_SNIFF_BYTES]):
+                raise LiveFetchError("response_not_html_or_text")
+            content_type_sniffed = True
         raw_payload_sha256 = hashlib.sha256(payload).hexdigest()
         declared_charset = response.headers.get_content_charset()
         response_text, decode_diagnostics = _decode_response_payload(
             payload, declared_charset
         )
+        if content_type_sniffed:
+            decode_diagnostics = ("content_type_sniffed=true", *decode_diagnostics)
+        if ssl_aia_recovered:
+            decode_diagnostics = ("ssl_aia_recovered=true", *decode_diagnostics)
+        # SUB-CAUSA 2c (12-jul): normalizar a NFC de una sola vez, en el unico
+        # choke point de decode, para que el snapshot completo (content/html/
+        # title, todos derivados de response_text) sea NFC canonico. Con esto
+        # la comparacion de citas en snapshot.py solo necesita normalizar el
+        # quote foraneo (posible NFD), nunca el texto ya-NFC del snapshot.
+        response_text = unicodedata.normalize("NFC", response_text)
         raw_payload_head_b64 = ""
         raw_payload_truncated = False
         if _decode_diagnostics_show_charset_anomaly(decode_diagnostics):
@@ -542,10 +814,20 @@ class OrionHTTPFetcher:
             raw_payload_head_b64 = base64.b64encode(head).decode("ascii")
             raw_payload_truncated = len(payload) > _RAW_PAYLOAD_HEAD_BYTES
         final_url = current_url
+        # content_type_sniffed: cascade._page_from_html tiene su PROPIO gate
+        # "text/html" in content_type que no podemos tocar (prohibido editar
+        # cascade_municipios.py). Sin esto, un content_type="" real haria que
+        # _page_from_html devuelva error="not_html" y page.text/page.title
+        # queden vacios pese a que ya decidimos aceptar el body. Reusa el
+        # mismo content-type sintetico que RenderFallbackFetcher usa para el
+        # mismo problema (ningun header HTTP real en ese punto tampoco).
+        page_content_type = (
+            _RENDER_REVALIDATION_CONTENT_TYPE if content_type_sniffed else content_type
+        )
         page = cascade._page_from_html(
             final_url,
             status,
-            content_type,
+            page_content_type,
             response_text,
             requested_url=requested_url,
         )
@@ -595,6 +877,137 @@ def _is_thin_shell(page: "cascade.Page") -> bool:
     )
 
 
+# Nav-only shell OBJETIVO (QA 12-jul, palanca render_interactivo): atende.net
+# serves a mega-menu (200-450KB of HTML, THOUSANDS of chars of visible text --
+# the mega-menu itself) as static HTML, and injects the real editais listing
+# by JS/AJAX after boot. _is_thin_shell never fires there because the served
+# text is far above _THIN_SHELL_MAX_TEXT_CHARS; it just is not the listing.
+# Two content-neutral signals below (no per-municipality hardcode), verified
+# live against lagoabonitadosul/camponovo/estrela (holdout 12-jul):
+#
+#   * atende_shell -- host is on the atende.net delegated-portal platform and
+#     the item vocabulary never appears anywhere in the served text.
+#   * nav_heavy -- platform-agnostic: the item vocabulary is either absent
+#     everywhere, or present only inside a persistent-navigation container
+#     (<nav>/<header>/<footer>, or a menu/nav/submenu/breadcrumb class or id
+#     -- the same convention atende.net's own "menu-item"/"menu_central"
+#     follows, not a hardcode for that one platform).
+#
+# A page whose real listing lives in the body always keeps its item markers
+# outside those containers, so neither signal fires on an already-working
+# index page (verified live against chiapetta.rs.gov.br and crissiumal.rs.gov.br).
+_ITEM_MARKER_RE = re.compile(
+    r"(edital|concurso|processos?\s+seletivos?|pss)\b[^\n]{0,40}?"
+    r"(n[ºo°.]?\s*\d{1,4}\b|\d{1,4}\s*/\s*\d{2,4})",
+    re.IGNORECASE,
+)
+
+_ATENDE_HOST_SUFFIX = ".atende.net"
+
+_NAV_LANDMARK_TAGS = {"nav", "header", "footer"}
+_SKIP_CONTENT_TAGS = {"script", "style"}
+_NAV_HINT_RE = re.compile(r"\b(menu|nav|submenu|breadcrumb)\b", re.IGNORECASE)
+
+# Cap on how much HTML the nav-aware extractor walks: mirrors the same
+# safety valve _page_from_html applies to its SPA-marker scan, so a
+# pathologically large page cannot make the trigger check itself expensive.
+_NAV_EXTRACT_HTML_CHARS = 400_000
+
+
+def _is_atende_host(url: str) -> bool:
+    try:
+        host = (urlsplit(url).netloc or "").lower()
+    except Exception:
+        return False
+    return host == "atende.net" or host.endswith(_ATENDE_HOST_SUFFIX)
+
+
+class _NavAwareTextExtractor(HTMLParser):
+    """Visible text like ``cascade.extract_text``, but excludes anything
+    inside a persistent-navigation container (landmark tag or menu/nav-ish
+    class/id) so the render trigger can tell "the only mention of an item
+    is a mega-menu link" apart from a real listing in the page body.
+
+    Best-effort on malformed HTML: an unmatched end tag is tolerated (the
+    tag stack is unwound up to the first match, like a browser would), and
+    any parse failure yields empty text -- which only makes the trigger
+    over-fire (safe: ``RenderFallbackFetcher`` never regresses evidence),
+    never under-fire and hide a real listing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._stack: list[tuple[str, bool]] = []
+        self._chunks: list[str] = []
+
+    def _is_skippable(self, tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+        if tag in _NAV_LANDMARK_TAGS or tag in _SKIP_CONTENT_TAGS:
+            return True
+        for name, value in attrs:
+            if name in ("class", "id") and value and _NAV_HINT_RE.search(value):
+                return True
+        return False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        skip = self._is_skippable(tag, attrs)
+        if skip:
+            self._skip_depth += 1
+        self._stack.append((tag, skip))
+
+    def handle_endtag(self, tag: str) -> None:
+        for i in range(len(self._stack) - 1, -1, -1):
+            if self._stack[i][0] == tag:
+                popped = self._stack[i:]
+                del self._stack[i:]
+                for _, skip in popped:
+                    if skip and self._skip_depth > 0:
+                        self._skip_depth -= 1
+                break
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._chunks.append(data)
+
+    def text(self) -> str:
+        return re.sub(r"\s+", " ", " ".join(self._chunks)).strip()
+
+
+def _text_outside_nav(html: str) -> str:
+    parser = _NavAwareTextExtractor()
+    try:
+        parser.feed((html or "")[:_NAV_EXTRACT_HTML_CHARS])
+    except Exception:
+        return ""
+    return parser.text()
+
+
+def _nav_shell_render_trigger(page: "cascade.Page") -> str:
+    """Return ``"atende_shell"``, ``"nav_heavy"``, or ``""`` (no render
+    needed) -- see the module comment above for the two signals."""
+    if not page.ok:
+        return ""
+    text = page.text or ""
+    has_markers_anywhere = bool(_ITEM_MARKER_RE.search(text))
+    if not has_markers_anywhere and not text.strip():
+        return ""  # nothing to strip; empty page is _is_thin_shell's job
+    body_text = _text_outside_nav(page.html or "")
+    if _ITEM_MARKER_RE.search(body_text):
+        return ""  # real listing content already present -- never render
+    if _is_atende_host(page.url) or _is_atende_host(page.requested_url):
+        return "atende_shell"
+    if has_markers_anywhere:
+        return "nav_heavy"  # markers exist, but only inside nav containers
+    if len(text.strip()) >= _THIN_SHELL_MAX_TEXT_CHARS and len(body_text) < _THIN_SHELL_MAX_TEXT_CHARS:
+        # Substantial served text overall, yet almost none of it survives
+        # stripping nav containers: the page is nav, not content. (Pages
+        # thin overall are already _is_thin_shell's responsibility -- this
+        # arm requires the raw text to clear that bar first, so the two
+        # never double-tag the same page.)
+        return "nav_heavy"
+    return ""
+
+
 def render_page_networkidle(url: str):
     """Render-once V2: como ``cascade.render_page_sync`` pero esperando a que
     el SPA cargue datos reales.
@@ -639,10 +1052,18 @@ def render_page_networkidle(url: str):
         except Exception:
             pass  # networkidle puede no llegar (polling/analytics); sondeamos.
         body_text = ""
-        for _ in range(16):
+        # ~10s poll (mission render_interactivo, 12-jul): wait for real item
+        # markers to appear, or for the "Por favor, aguarde..." loading
+        # placeholder to clear with substantial content behind it. The
+        # atende.net shells resolve their AJAX-loaded listing within ~4-7s
+        # in practice (verified live: lagoabonitadosul/camponovo/estrela).
+        for _ in range(20):
             body_text = browser_page.locator("body").inner_text()
-            if len(body_text.strip()) >= _THIN_SHELL_MAX_TEXT_CHARS:
-                break
+            stripped = body_text.strip()
+            if _ITEM_MARKER_RE.search(stripped):
+                break  # real listing content has loaded
+            if len(stripped) >= _THIN_SHELL_MAX_TEXT_CHARS and "aguarde" not in stripped.lower():
+                break  # cleared the loading placeholder with real content
             browser_page.wait_for_timeout(500)
         links = browser_page.eval_on_selector_all(
             "a[href]",
@@ -734,7 +1155,8 @@ class RenderFallbackFetcher:
             html=fetched.html,
             requested_url=fetched.requested_url,
         )
-        if not (page.is_antibot or page.is_spa or _is_thin_shell(page)):
+        nav_trigger = _nav_shell_render_trigger(page)
+        if not (page.is_antibot or page.is_spa or _is_thin_shell(page) or nav_trigger):
             return fetched
         if self._waf.is_frozen(url):
             return fetched  # Provider already frozen: do not burn a pass.
@@ -758,12 +1180,29 @@ class RenderFallbackFetcher:
         rendered_text = (rendered.text or "").strip()
         if rendered_page.is_spa or not rendered_text:
             return fetched
-        # El render debe MEJORAR estrictamente el texto visible: un render que
-        # no aporta mas contenido que el shell original no justifica sustituir
-        # la evidencia (fail-closed; la original queda intacta).
-        if len(rendered_text) <= len((fetched.content or "").strip()):
+        original_text = (fetched.content or "").strip()
+        # El render debe MEJORAR el texto visible: por longitud (regla
+        # original), O por contenido -- gana marcadores de item que el shell
+        # original no tenia. La segunda regla es necesaria para los shells
+        # atende.net: el HTML estatico duplica el mega-menu (mobile+desktop),
+        # asi que a veces es MAS LARGO en caracteres que el render que ya
+        # cargo el listado real (verificado en vivo 12-jul: lagoabonitadosul,
+        # HTTP 5578 chars/0 marcadores vs. render 3388 chars/marcadores
+        # reales) -- exigir solo longitud descartaria evidencia util.
+        strictly_longer = len(rendered_text) > len(original_text)
+        gained_item_markers = (
+            bool(_ITEM_MARKER_RE.search(rendered_text))
+            and not _ITEM_MARKER_RE.search(original_text)
+        )
+        if not (strictly_longer or gained_item_markers):
             return fetched
 
+        # render_trigger=... records WHY only for the nav-shell signals (the
+        # trigger tag stays absent, as before, for the pre-existing
+        # antibot/is_spa/_is_thin_shell paths). Inserted before the fixed
+        # "render_fallback_applied" tail so existing ``[-1]`` assertions on
+        # that marker are unaffected.
+        trigger_diagnostics = (f"render_trigger={nav_trigger}",) if nav_trigger else ()
         return replace(
             fetched,
             final_url=rendered.final_url or fetched.final_url,
@@ -778,7 +1217,7 @@ class RenderFallbackFetcher:
             title=rendered.title or fetched.title,
             evidence_state="renderizada",
             decode_diagnostics=(
-                *fetched.decode_diagnostics, "render_fallback_applied",
+                *fetched.decode_diagnostics, *trigger_diagnostics, "render_fallback_applied",
             ),
         )
 
