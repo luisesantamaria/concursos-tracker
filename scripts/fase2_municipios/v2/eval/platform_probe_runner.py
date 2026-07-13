@@ -18,12 +18,59 @@ found in the F3.P1 corrida 1 dictamen
 (``staging/fase2_v2/eval/f3p1_probe_20260712/DICTAMEN_wrng.md``): (1) a
 redirect-discipline audit in ``probe_unit`` that degrades any proposal whose
 final path drifted away from the requested template path -- or landed on the
-site root or an error/not-found stub -- to ``probe_result="redirect_drift"``
-(never proposable); and (2) a structural-index requirement in
-``classify_probe`` that an "ok" page must show at least two distinct
-edital/concurso/processo-seletivo item markers (numbered entries or list/table
-rows), so a single news article that merely mentions the keyword no longer
-qualifies as an index.
+site root or an error/not-found stub -- away from a bare accept; and (2) a
+structural-index requirement in ``classify_probe`` that an "ok" page must
+show at least two distinct edital/concurso/processo-seletivo item markers
+(numbered entries or list/table rows), so a single news article that merely
+mentions the keyword no longer qualifies as an index.
+
+F3.P1 corrida 2 (``staging/fase2_v2/eval/f3p1_probe_20260713_r2/``) showed
+that guard (1) was too blunt: it dropped coverage 56%->36% because it
+treated every path drift as fatal, including *good* drifts (e.g. Arroio do
+Sal's ``/concursos`` -> ``/category/publicacoes-oficiais/concursos/``, which
+IS its real index, confirmed by V2 in the holdout). Rule 1 below softens
+this without reopening the WRNG hole the guard was built to close:
+
+Confidence-gate policy (read this before changing ``ACCEPTED_RESULTS`` or
+the comparison/summary code):
+
+1. **Recoverable path drift -> propose but flag for review.** When the
+   final URL's path drifted from the requested template (tolerating
+   trailing slash / "www." / scheme / case) but the page reached there
+   still clears the structural index gate (``_has_index_structure`` --
+   >=2 distinct item markers, NOT the thin-text ``spa_shell_probable``
+   shortcut) and did not land on the site root or an error/not-found stub,
+   the runner now proposes it as ``probe_result="drift_candidata"`` at
+   ``confianza="baja"`` instead of discarding it. A drift to the root, to
+   an error/not-found stub, or to a page that fails the structural gate
+   (including any ``spa_shell_probable`` hit, since that classification
+   never evaluated the structural gate) still never proposes anything and
+   stays ``probe_result="redirect_drift"``.
+2. **Any host change -> confianza="baja", always.** Not just
+   ``spa_shell_probable`` (the old rule): an "ok" or "drift_candidata" hit
+   whose final host differs from the requested host by more than a leading
+   "www." (www -> www2, or a wholly different domain) is downgraded to
+   confianza="baja" too. This never blocks the proposal by itself -- only
+   path drift to root/error/no-structure does that.
+3. **The hard WRNG==0 gate applies only to what the probe AFFIRMS**: results
+   in ``ACCEPTED_RESULTS`` (``ok``, ``spa_shell_probable``,
+   ``drift_candidata``) at confianza in {"alta", "media"} ("media" is
+   reserved for a future confidence tier; no platform emits it today).
+   ``build_summary`` reports ``cobertura_alta_media_pct`` (the gated
+   number) separately from ``cobertura_total_pct`` (includes confianza=
+   "baja"), and ``compare_against_confirmed`` / the ``--confirmed`` CLI
+   output likewise split into a ``gate_duro`` block (confianza != "baja";
+   WRNG here must stay at/near zero) and an ``informativo_baja`` block
+   (confianza == "baja"; these are V2-adjudication candidates, not
+   affirmations -- a nonzero wrng there is expected and not gating).
+
+Every proposal row also now carries two diagnostic-only fields appended at
+the end of ``PROPOSAL_FIELDS`` for CSV backward-compatibility:
+``drift_reason`` (one of "" / "path_drift" / "host_drift" / "root" /
+"error_path" / "no_structure") and ``url_final_redirect`` (the actual URL
+the fetch landed on, recorded even when the proposal is not proposable, so
+a ``redirect_drift`` row no longer loses ``template_usada`` and the
+redirect destination the way corrida 2's CSV did).
 """
 
 from __future__ import annotations
@@ -345,7 +392,14 @@ class RedirectAudit:
 
     @property
     def not_proposable(self) -> bool:
-        """True if the final URL must never be proposed as an index."""
+        """True if the final URL can never be a bare, unflagged accept.
+
+        Note this is *not* "never proposable at all" any more: ``probe_unit``
+        may still emit a ``drift_candidata`` proposal for a ``path_drift``
+        hit that clears the structural gate (F3.P1 corrida 2 fix, rule 1).
+        Only ``blocked_path`` (root / error stub) or a structural-gate miss
+        keeps a drifted hit fully unproposable.
+        """
         return self.path_drift or self.blocked_path
 
 
@@ -353,10 +407,10 @@ def audit_redirect(requested_url: str, final_url: str) -> RedirectAudit:
     """Compare the requested template URL to where the fetch actually landed.
 
     Tolerates a trailing slash, a leading "www.", and scheme/case
-    differences; anything else in the path is a "redirect_drift" (see the
-    F3.P1 dictamen's Bento Goncalves / Pelotas / Porto Alegre cases). Landing
-    on the bare site root or an error/not-found stub is blocked outright,
-    drift or not.
+    differences; anything else in the path is flagged as drift (see the
+    F3.P1 dictamen's Bento Goncalves / Pelotas / Porto Alegre cases, and
+    corrida 2's Arroio do Sal counter-example). Landing on the bare site
+    root or an error/not-found stub is blocked outright, drift or not.
     """
     requested = urlsplit(requested_url)
     final = urlsplit(final_url or requested_url)
@@ -383,6 +437,10 @@ class ProbeProposal:
     probe_result: str
     confianza: str
     template_usada: str
+    # Diagnostic-only fields (F3.P1 corrida 2 fix, rule 3). Defaulted so
+    # existing positional call sites keep working unchanged.
+    drift_reason: str = ""
+    url_final_redirect: str = ""
 
     def as_row(self) -> dict[str, str]:
         return {
@@ -393,11 +451,19 @@ class ProbeProposal:
             "probe_result": self.probe_result,
             "confianza": self.confianza,
             "template_usada": self.template_usada,
+            "drift_reason": self.drift_reason,
+            "url_final_redirect": self.url_final_redirect,
         }
 
 
 def _noop_sleep(_seconds: float) -> None:
     return None
+
+
+def _blocked_path_reason(final_url: str) -> str:
+    """Classify a blocked final path as "root" or "error_path"."""
+    final_path = _normalize_path_for_drift(urlsplit(final_url).path)
+    return "root" if final_path == "" else "error_path"
 
 
 def probe_unit(
@@ -408,15 +474,26 @@ def probe_unit(
 ) -> ProbeProposal:
     """Probe every template for one (municipio, bucket); accept the first hit.
 
-    A content-gate hit is only proposed if it also survives the redirect
-    audit (F3.P1 fix): the final URL's path must match the requested
-    template path (tolerating trailing slash / www. / scheme / case), and it
-    must not be the bare site root or an error/not-found stub. A hit that
-    fails this audit is recorded as ``probe_result="redirect_drift"`` and the
-    runner falls through to the next template, exactly like a rejected
-    content classification. ``spa_shell_probable`` additionally loses its
-    high confidence (downgrades to "baja") if the redirect crossed to a
-    different host, even without path drift.
+    See the module docstring's confidence-gate policy for the full rules.
+    In short, once a template clears the content gate:
+
+    - Landing on the site root or an error/not-found stub is always
+      unproposable (``redirect_drift``, ``drift_reason`` "root"/"error_path").
+    - A drifted path that does NOT clear the structural index gate (this
+      includes every ``spa_shell_probable`` hit, which never evaluates that
+      gate) is also unproposable (``redirect_drift``, ``drift_reason``
+      "no_structure").
+    - A drifted path that DOES clear the structural gate (i.e. a full "ok"
+      classification) is proposed as ``drift_candidata`` at confianza="baja"
+      (``drift_reason`` "path_drift").
+    - Otherwise the hit is accepted as-is (``ok``/``spa_shell_probable``),
+      except any host change downgrades confianza to "baja" regardless of
+      the platform's baseline confidence (``drift_reason`` "host_drift").
+
+    Any redirect_drift/drift_candidata outcome falls through to the next
+    template, exactly like a rejected content classification -- only the
+    *last* attempted template's diagnostics are kept if every template ends
+    up unproposable.
     """
     platform = detect_platform(site_base)
     candidates = build_template_urls(site_base, platform, bucket)
@@ -427,6 +504,9 @@ def probe_unit(
         )
 
     last_reason = ""
+    last_template = ""
+    last_drift_reason = ""
+    last_redirect_final = ""
     for template, url in candidates:
         try:
             result = fetcher.get(url, timeout)
@@ -444,22 +524,48 @@ def probe_unit(
             continue
         final_url = result.final_url or url
         audit = audit_redirect(url, final_url)
-        if audit.not_proposable:
+        redirect_final = final_url if final_url != url else ""
+
+        if audit.blocked_path:
             last_reason = "redirect_drift"
+            last_template = template
+            last_drift_reason = _blocked_path_reason(final_url)
+            last_redirect_final = redirect_final
             continue
+
+        if audit.path_drift:
+            if outcome == "ok":
+                return ProbeProposal(
+                    municipio=municipio, bucket=bucket, plataforma=platform,
+                    url_propuesta=final_url, probe_result="drift_candidata",
+                    confianza="baja", template_usada=template,
+                    drift_reason="path_drift", url_final_redirect=redirect_final,
+                )
+            last_reason = "redirect_drift"
+            last_template = template
+            last_drift_reason = "no_structure"
+            last_redirect_final = redirect_final
+            continue
+
         confianza = PLATFORM_CONFIDENCE.get(platform, "")
-        if outcome == "spa_shell_probable" and audit.host_changed:
+        drift_reason = ""
+        if audit.host_changed:
             confianza = "baja"
+            drift_reason = "host_drift"
         return ProbeProposal(
             municipio=municipio, bucket=bucket, plataforma=platform,
             url_propuesta=final_url, probe_result=outcome,
             confianza=confianza, template_usada=template,
+            drift_reason=drift_reason, url_final_redirect=redirect_final,
         )
 
+    is_drift = last_reason == "redirect_drift"
     return ProbeProposal(
         municipio=municipio, bucket=bucket, plataforma=platform,
         url_propuesta="", probe_result=(last_reason or "no_match"),
-        confianza="", template_usada="",
+        confianza="", template_usada=(last_template if is_drift else ""),
+        drift_reason=(last_drift_reason if is_drift else ""),
+        url_final_redirect=(last_redirect_final if is_drift else ""),
     )
 
 
@@ -519,14 +625,9 @@ def compare_result(proposed_url: str, confirmed_url: str) -> str:
     return "wrng"
 
 
-def compare_against_confirmed(
-    proposals: Iterable[ProbeProposal], confirmed_rows: Iterable[Mapping[str, str]],
+def _compare_subset(
+    proposals: Iterable[ProbeProposal], confirmed_map: Mapping[tuple[str, str], str],
 ) -> dict[str, Any]:
-    confirmed_map = {
-        (str(row.get("municipio", "")).strip(), str(row.get("bucket", "")).strip()):
-            str(row.get("url", "")).strip()
-        for row in confirmed_rows
-    }
     counts: Counter[str] = Counter()
     details: list[dict[str, str]] = []
     for proposal in proposals:
@@ -546,34 +647,81 @@ def compare_against_confirmed(
     return {"counts": dict(sorted(counts.items())), "details": details}
 
 
+def compare_against_confirmed(
+    proposals: Iterable[ProbeProposal], confirmed_rows: Iterable[Mapping[str, str]],
+) -> dict[str, Any]:
+    """Compare proposals to known-confirmed URLs, split by the confidence gate.
+
+    Two independent blocks (see the module docstring's confidence-gate
+    policy): ``gate_duro`` covers every proposal at confianza != "baja"
+    (alta/media, and units where the probe made no proposal at all, which
+    trivially can't contribute a wrng) -- this is what the WRNG-must-be-zero
+    gate applies to, since it is what the probe affirmatively claims.
+    ``informativo_baja`` covers only confianza == "baja" proposals (elotech
+    best-guess, drift_candidata, host-drifted hits) -- these are candidates
+    for V2 adjudication, not affirmations, so their match/host_match/wrng
+    counts are reported separately and are not gated.
+    """
+    confirmed_map = {
+        (str(row.get("municipio", "")).strip(), str(row.get("bucket", "")).strip()):
+            str(row.get("url", "")).strip()
+        for row in confirmed_rows
+    }
+    proposals = list(proposals)
+    gate_duro = [p for p in proposals if p.confianza != "baja"]
+    informativo_baja = [p for p in proposals if p.confianza == "baja"]
+    return {
+        "gate_duro": _compare_subset(gate_duro, confirmed_map),
+        "informativo_baja": _compare_subset(informativo_baja, confirmed_map),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Output: CSV of proposals + JSON summary
 # ---------------------------------------------------------------------------
 PROPOSAL_FIELDS: tuple[str, ...] = (
     "municipio", "bucket", "plataforma", "url_propuesta", "probe_result",
     "confianza", "template_usada",
+    # New columns appended at the end (F3.P1 corrida 2 fix, rule 3) --
+    # back-compatible with any consumer keyed on the original 7 columns.
+    "drift_reason", "url_final_redirect",
 )
-ACCEPTED_RESULTS = frozenset({"ok", "spa_shell_probable"})
+# "drift_candidata" counts as an accepted proposal (it has a url_propuesta
+# and contributes to coverage) -- it is distinguished from "ok" /
+# "spa_shell_probable" purely by always carrying confianza="baja", which is
+# what keeps it out of the alta/media hard gate below. See the module
+# docstring's confidence-gate policy.
+ACCEPTED_RESULTS = frozenset({"ok", "spa_shell_probable", "drift_candidata"})
+HIGH_CONFIDENCE_LEVELS = frozenset({"alta", "media"})
 
 
 def build_summary(proposals: Sequence[ProbeProposal]) -> dict[str, Any]:
     total_municipios = len({p.municipio for p in proposals})
     accepted = [p for p in proposals if p.probe_result in ACCEPTED_RESULTS]
+    accepted_alta_media = [p for p in accepted if p.confianza in HIGH_CONFIDENCE_LEVELS]
     municipios_con_propuesta = {p.municipio for p in accepted}
+    municipios_con_propuesta_alta_media = {p.municipio for p in accepted_alta_media}
     propuestas_por_plataforma = Counter(p.plataforma for p in accepted)
     resultado_counts = Counter(p.probe_result for p in proposals)
-    cobertura_pct = (
-        round(100.0 * len(municipios_con_propuesta) / total_municipios, 2)
-        if total_municipios else 0.0
-    )
+
+    def _pct(count: int) -> float:
+        return round(100.0 * count / total_municipios, 2) if total_municipios else 0.0
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "total_municipios": total_municipios,
         "total_propuestas": len(accepted),
+        "total_propuestas_alta_media": len(accepted_alta_media),
         "propuestas_por_plataforma": dict(sorted(propuestas_por_plataforma.items())),
         "resultado_counts": dict(sorted(resultado_counts.items())),
         "municipios_con_propuesta": len(municipios_con_propuesta),
-        "cobertura_pct": cobertura_pct,
+        "municipios_con_propuesta_alta_media": len(municipios_con_propuesta_alta_media),
+        # cobertura_alta_media_pct is the gated number (what the probe
+        # affirms); cobertura_total_pct additionally includes confianza=
+        # "baja" proposals (drift_candidata / host-drifted / elotech), which
+        # are review candidates, not affirmations.
+        "cobertura_alta_media_pct": _pct(len(municipios_con_propuesta_alta_media)),
+        "cobertura_total_pct": _pct(len(municipios_con_propuesta)),
     }
 
 
@@ -619,8 +767,11 @@ def main(argv: list[str] | None = None, *, fetcher: Fetcher | None = None) -> in
     summary = build_summary(proposals)
     if args.confirmed is not None:
         comparison = compare_against_confirmed(proposals, _read_csv(args.confirmed))
-        summary["comparison"] = comparison["counts"]
-        print(json.dumps(comparison["counts"], ensure_ascii=False, sort_keys=True))
+        summary["comparison"] = {
+            "gate_duro": comparison["gate_duro"]["counts"],
+            "informativo_baja": comparison["informativo_baja"]["counts"],
+        }
+        print(json.dumps(summary["comparison"], ensure_ascii=False, sort_keys=True))
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8",
