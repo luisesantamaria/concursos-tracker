@@ -912,7 +912,7 @@ def run_golden_live(
     logger: EventLogger | None = None
     artifact_redactions = tuple(
         value for name, value in environ.items()
-        if name in {"GEMINI_API_KEY_FREE", "GEMINI_API_KEY"}
+        if name in {"GEMINI_API_KEY_FREE", "GEMINI_API_KEY_FREE_2", "GEMINI_API_KEY"}
         and isinstance(value, str)
     )
     incomplete_tracker: IncompleteRunTracker | None = IncompleteRunTracker(
@@ -923,7 +923,7 @@ def run_golden_live(
             destination / "events.jsonl",
             redactions=tuple(
                 value for name, value in environ.items()
-                if name in {"GEMINI_API_KEY_FREE", "GEMINI_API_KEY"}
+                if name in {"GEMINI_API_KEY_FREE", "GEMINI_API_KEY_FREE_2", "GEMINI_API_KEY"}
                 and isinstance(value, str)
             ),
         )
@@ -1065,6 +1065,10 @@ def run_golden_live(
                 "paid_fallback_reasons": {}, "tokens": 0,
                 "quota_429": 0, "approx_rpm": 0, "approx_tpm": 0,
                 "approx_rpd": 0,
+                "providers": {
+                    name: {"calls": 0, "tokens": 0, "errors": 0, "quota_rate": 0}
+                    for name in ("gemini_free_1", "gemini_free_2", "gemini_paid")
+                },
             }
         )
         audit_path = destination / AUDIT_FILENAME

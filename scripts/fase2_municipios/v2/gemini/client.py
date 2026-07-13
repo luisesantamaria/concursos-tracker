@@ -25,6 +25,7 @@ from scripts.fase2_municipios.v2.loader import load_canonical_resources
 
 LOGGER = logging.getLogger(__name__)
 FREE_API_KEY_ENV = "GEMINI_API_KEY_FREE"
+SECOND_FREE_API_KEY_ENV = "GEMINI_API_KEY_FREE_2"
 FORBIDDEN_ENV_NAMES = (
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_API_KEY",

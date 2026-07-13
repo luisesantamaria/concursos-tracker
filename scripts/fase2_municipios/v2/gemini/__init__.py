@@ -2,6 +2,7 @@
 
 from .client import (
     FREE_API_KEY_ENV,
+    SECOND_FREE_API_KEY_ENV,
     GeminiClientError,
     GroundingForbiddenError,
     MissingFreeApiKeyError,
@@ -26,6 +27,7 @@ from .schema_validation import validate_json_schema
 
 __all__ = [
     "FREE_API_KEY_ENV",
+    "SECOND_FREE_API_KEY_ENV",
     "GeminiClientError",
     "GroundingForbiddenError",
     "MissingFreeApiKeyError",

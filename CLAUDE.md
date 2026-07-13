@@ -179,3 +179,8 @@ python scripts/eval/medir_golden_set.py --golden data/golden_set_v1.csv --pipeli
 ## Safety
 
 Never commit `.env`, local API keys, generated outputs, logs, model files, Cloud Run/RunPod secrets, or `.claude/settings.local.json`.
+
+Gemini V2 credential order is `GEMINI_API_KEY_FREE` -> optional
+`GEMINI_API_KEY_FREE_2` -> `GEMINI_API_KEY` (paid, last resort), and rotation is
+allowed only for quota/rate-limit or recognized transient availability errors.
+Free-only runs must keep the paid tier structurally unreachable.

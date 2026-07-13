@@ -1516,12 +1516,38 @@ class _FreeTelemetryTransport:
             response = self._inner.generate(model, contents, config)
         except Exception as exc:
             self._telemetry.record_call(
-                "gemini_free", None, model=model, status="error",
+                "gemini_free_1", None, model=model, status="error",
                 error_class=type(exc).__name__,
             )
             raise
-        self._telemetry.record_call("gemini_free", response, model=model)
+        self._telemetry.record_call("gemini_free_1", response, model=model)
         return response
+
+
+class _LazyCredentialTransport:
+    """Construct a provider only on its first eligible routing attempt."""
+
+    def __init__(
+        self, environ: Mapping[str, str], name: str, *, client_factory=None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self._environ = environ
+        self._name = name
+        self._client_factory = client_factory
+        self._timeout_seconds = timeout_seconds
+        self._transport = None
+
+    def generate(self, model, contents, config):
+        if self._transport is None:
+            key = self._environ.get(self._name)
+            if not isinstance(key, str) or not key.strip():
+                raise LiveABCConfigurationError("model_credential_missing")
+            self._transport = RealGeminiTransport(
+                key,
+                client_factory=self._client_factory,
+                timeout_seconds=self._timeout_seconds,
+            )
+        return self._transport.generate(model, contents, config)
 
 
 # El camino free-only (from_free_environment) no tiene fallback pago -- a
@@ -1726,18 +1752,31 @@ class LiveABCAdapter:
     ) -> "LiveABCAdapter":
         free_key = resolve_free_api_key(environ)
         telemetry = ModelPolicyTelemetry()
-        # Orden: retry POR FUERA de la telemetria (ver docstring de
-        # _FreeQuotaRetryTransport) para que cada intento real -- incluidos
-        # los reintentos ante 429 -- quede contabilizado.
-        transport = _FreeQuotaRetryTransport(
-            _FreeTelemetryTransport(
-                RealGeminiTransport(
-                    free_key,
-                    client_factory=sdk_client_factory,
-                ),
-                telemetry,
-            ),
+        free_1_transport = RealGeminiTransport(
+            free_key, client_factory=sdk_client_factory,
         )
+        if environ is not None and "GEMINI_API_KEY_FREE_2" in environ:
+            free_2_transport = _LazyCredentialTransport(
+                environ, "GEMINI_API_KEY_FREE_2", client_factory=sdk_client_factory,
+            )
+            # Free-only is structural: paid_transport=None makes the paid tier
+            # unreachable even after both eligible free-tier failures.
+            transport = PolicyTransport(
+                free_transport=free_1_transport,
+                free_2_transport=free_2_transport,
+                paid_transport=None,
+                model=RoleModels().certifier_model,
+                stage="free_only",
+                telemetry=telemetry,
+                isolate_calls=False,
+            )
+        else:
+            # Preserve the original public free-only seam when no second free
+            # credential is configured: every real request is telemetered and
+            # only quota failures receive the bounded local retry.
+            transport = _FreeQuotaRetryTransport(
+                _FreeTelemetryTransport(free_1_transport, telemetry)
+            )
         shared_limiter = limiter or get_shared_limiter()
         models = RoleModels()
         certifier = build_certifier_agent(
@@ -1786,10 +1825,10 @@ class LiveABCAdapter:
         seed: int = 0,
     ) -> "LiveABCAdapter":
         free_key = environ.get("GEMINI_API_KEY_FREE")
-        paid_key = environ.get("GEMINI_API_KEY")
+        paid_present = "GEMINI_API_KEY" in environ
         if not isinstance(free_key, str) or not free_key.strip():
             raise LiveABCConfigurationError("free_model_credential_missing")
-        if not isinstance(paid_key, str) or not paid_key.strip():
+        if not paid_present:
             raise LiveABCConfigurationError("paid_fallback_credential_missing")
         models = RoleModels()
         telemetry = ModelPolicyTelemetry()
@@ -1798,8 +1837,17 @@ class LiveABCAdapter:
             client_factory=sdk_client_factory,
             timeout_seconds=gemini_timeout,
         )
-        paid_transport = RealGeminiTransport(
-            paid_key,
+        free_2_transport = None
+        if "GEMINI_API_KEY_FREE_2" in environ:
+            free_2_transport = _LazyCredentialTransport(
+                environ,
+                "GEMINI_API_KEY_FREE_2",
+                client_factory=sdk_client_factory,
+                timeout_seconds=gemini_timeout,
+            )
+        paid_transport = _LazyCredentialTransport(
+            environ,
+            "GEMINI_API_KEY",
             client_factory=sdk_client_factory,
             timeout_seconds=gemini_timeout,
         )
@@ -1811,6 +1859,7 @@ class LiveABCAdapter:
         policies = {
             stage: PolicyTransport(
                 free_transport=free_transport,
+                free_2_transport=free_2_transport,
                 paid_transport=paid_transport,
                 model=model,
                 stage=stage,

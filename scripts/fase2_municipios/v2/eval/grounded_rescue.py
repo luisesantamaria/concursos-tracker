@@ -157,9 +157,7 @@ class GeminiGroundedClient:
         client_factory: Callable[..., Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        free = credentials.get("GEMINI_API_KEY_FREE", "")
-        paid = credentials.get("GEMINI_API_KEY", "")
-        if not free or not paid:
+        if "GEMINI_API_KEY_FREE" not in credentials or "GEMINI_API_KEY" not in credentials:
             raise ValueError("gemini_authorized_credentials_missing")
         if client_factory is None:
             try:
@@ -167,26 +165,33 @@ class GeminiGroundedClient:
             except ImportError as exc:
                 raise RuntimeError("google-genai no esta instalado") from exc
             client_factory = genai.Client
-        self._secrets = (free, paid)
-        self._clients = {
-            "gemini_free_1": client_factory(api_key=free, vertexai=False),
-            "gemini_paid": client_factory(api_key=paid, vertexai=False),
-        }
+        self._credentials = credentials
+        self._client_factory = client_factory
+        self._clients: dict[str, Any] = {}
         self._sleep = sleep
         self._calls: Counter[str] = Counter()
         self._errors: Counter[str] = Counter()
         self._responses: Counter[str] = Counter()
+        self._tokens: Counter[str] = Counter()
+        self._quota_rate: Counter[str] = Counter()
+        self._fallback_events: list[dict[str, str]] = []
 
     @property
     def telemetry(self) -> dict[str, Any]:
         providers = {}
-        for provider in ("gemini_free_1", "gemini_paid"):
+        for provider in ("gemini_free_1", "gemini_free_2", "gemini_paid"):
             providers[provider] = {
                 "calls": self._calls[provider],
                 "errors": self._errors[provider],
                 "responses": self._responses[provider],
+                "tokens": self._tokens[provider],
+                "quota_rate": self._quota_rate[provider],
             }
-        return {"providers": providers}
+        return {
+            "providers": providers,
+            "fallback_events": list(self._fallback_events),
+            "paid_calls": self._calls["gemini_paid"],
+        }
 
     @staticmethod
     def _config() -> dict[str, Any]:
@@ -200,48 +205,76 @@ class GeminiGroundedClient:
     def _invoke(self, provider: str, model: str, prompt: str) -> Any:
         self._calls[provider] += 1
         try:
+            if provider not in self._clients:
+                credential_name = {
+                    "gemini_free_1": "GEMINI_API_KEY_FREE",
+                    "gemini_free_2": "GEMINI_API_KEY_FREE_2",
+                    "gemini_paid": "GEMINI_API_KEY",
+                }[provider]
+                key = self._credentials.get(credential_name, "")
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError("gemini_authorized_credential_missing")
+                self._clients[provider] = self._client_factory(
+                    api_key=key, vertexai=False
+                )
             response = self._clients[provider].models.generate_content(
                 model=model,
                 contents=prompt,
                 config=self._config(),
             )
-        except BaseException:
+        except BaseException as exc:
             self._errors[provider] += 1
+            if classify_error(exc).category is ErrorCategory.QUOTA_429:
+                self._quota_rate[provider] += 1
             raise
         self._responses[provider] += 1
+        usage = getattr(response, "usage_metadata", None)
+        total = getattr(usage, "total_token_count", 0) if usage is not None else 0
+        if isinstance(total, int) and not isinstance(total, bool) and total > 0:
+            self._tokens[provider] += total
         return response
 
     def _key_policy_call(self, model: str, prompt: str) -> tuple[Any, str, list[dict[str, str]]]:
         last: BaseException | None = None
         events: list[dict[str, str]] = []
-        for attempt in (1, 2):
+        free_steps = (
+            ("gemini_free_1", "gemini_free_2")
+            if "GEMINI_API_KEY_FREE_2" in self._credentials
+            else ("gemini_free_1", "gemini_free_1")
+        )
+        for attempt, provider in enumerate(free_steps, start=1):
             try:
-                return self._invoke("gemini_free_1", model, prompt), "gemini_free_1", events
+                return self._invoke(provider, model, prompt), provider, events
             except BaseException as exc:
                 if _is_explicit_model_rejection(exc, model):
-                    raise ExplicitProRejection(_safe_error(exc, self._secrets)) from exc
+                    raise ExplicitProRejection(_safe_error(exc, self._secret_values())) from exc
                 classified = classify_error(exc)
                 if not classified.fallback_eligible:
                     raise
                 last = exc
                 if attempt == 1:
-                    events.append({
-                        "from_provider": "gemini_free_1",
-                        "to_provider": "gemini_free_1",
+                    event = {
+                        "from_provider": provider,
+                        "to_provider": free_steps[1],
                         "cause": classified.category.value,
-                    })
-                    self._sleep(max(1.0, classified.retry_after or 0.0))
+                    }
+                    events.append(event)
+                    self._fallback_events.append(dict(event))
+                    if free_steps[1] == provider:
+                        self._sleep(max(1.0, classified.retry_after or 0.0))
         assert last is not None
-        events.append({
-            "from_provider": "gemini_free_1",
+        event = {
+            "from_provider": free_steps[-1],
             "to_provider": "gemini_paid",
             "cause": classify_error(last).category.value,
-        })
+        }
+        events.append(event)
+        self._fallback_events.append(dict(event))
         try:
             return self._invoke("gemini_paid", model, prompt), "gemini_paid", events
         except BaseException as exc:
             if _is_explicit_model_rejection(exc, model):
-                raise ExplicitProRejection(_safe_error(exc, self._secrets)) from exc
+                raise ExplicitProRejection(_safe_error(exc, self._secret_values())) from exc
             raise
 
     def search(self, query: str, *, model: str, municipio: str, bucket: str) -> GroundedAnswer:
@@ -270,9 +303,9 @@ class GeminiGroundedClient:
                 response, provider, key_fallbacks = self._key_policy_call(actual_model, prompt)
                 fallbacks.extend(key_fallbacks)
             except BaseException as fallback_exc:
-                raise RuntimeError(_safe_error(fallback_exc, self._secrets)) from fallback_exc
+                raise RuntimeError(_safe_error(fallback_exc, self._secret_values())) from fallback_exc
         except BaseException as exc:
-            raise RuntimeError(_safe_error(exc, self._secrets)) from exc
+            raise RuntimeError(_safe_error(exc, self._secret_values())) from exc
         urls, snippets = extract_grounding_metadata(response)
         return GroundedAnswer(
             text=str(getattr(response, "text", "") or ""),
@@ -281,6 +314,13 @@ class GeminiGroundedClient:
             model=actual_model,
             provider=provider,
             fallbacks=tuple(fallbacks),
+        )
+
+    def _secret_values(self) -> tuple[str, ...]:
+        return tuple(
+            value
+            for name in ("GEMINI_API_KEY_FREE", "GEMINI_API_KEY_FREE_2", "GEMINI_API_KEY")
+            if isinstance((value := self._credentials.get(name)), str) and value
         )
 
 

@@ -42,8 +42,27 @@ git checkout claude/skill-files-accuracy-vd6uyt
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
-export GEMINI_API_KEY=tu_llave                       # PowerShell: $env:GEMINI_API_KEY="..."
+# Para el router V2, usar un archivo privado (nunca versionado) con nombres:
+GEMINI_API_KEY_FREE=
+GEMINI_API_KEY_FREE_2=
+GEMINI_API_KEY=
 ```
+
+### Credenciales Gemini V2
+
+El orden del router es `GEMINI_API_KEY_FREE` (FREE1) ->
+`GEMINI_API_KEY_FREE_2` (FREE2 opcional) -> `GEMINI_API_KEY` (pagada, ultimo
+recurso). FREE2 solo se intenta cuando FREE1 falla por cuota/rate limit o una
+indisponibilidad transitoria reconocida; la pagada solo se intenta cuando los
+dos niveles free configurados fallan por causas elegibles. Errores de
+autenticacion, peticion, esquema, contenido, programacion o gate cierran la
+unidad sin rotar.
+
+Una corrida `--provider gemini_free` nunca alcanza la credencial pagada. Si el
+archivo antiguo solo contiene FREE1 y PAID, FREE2 se omite y se conserva el
+comportamiento anterior. Pase el archivo privado con `--credentials-file`; no
+pegue ni registre valores de claves. Si FREE1 y FREE2 pertenecen al mismo
+proyecto Google, probablemente comparten cuota y FREE2 no agrega capacidad.
 
 ## Cómo correr (por letras, con append, sin re-gastar Gemini)
 
