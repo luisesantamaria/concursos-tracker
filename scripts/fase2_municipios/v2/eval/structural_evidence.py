@@ -14,6 +14,7 @@ contenedor tecnico compartido, no una decision.
 
 from __future__ import annotations
 
+import html
 from urllib.parse import urlparse
 
 from scripts.fase2_municipios import cascade_municipios as cascade
@@ -51,6 +52,13 @@ def structural_candidate(
     page.title = evidence.title or page.title
     page.text = evidence.text or page.text
     page.links = list(evidence.links) or page.links
+    # Provenance general de identidad: algunos CMS entregan entidades HTML
+    # todavia literales en title/text (p.ej. ``Munic&#237;pio``). extract_text
+    # vive en el archivo V1 intocable; el punto correcto para reparar la
+    # comparacion V2 es este candidato local, antes de cualquier matching de
+    # identidad. No se altera el EvidenceSnapshot congelado ni las citas.
+    page.title = html.unescape(page.title or "")
+    page.text = html.unescape(page.text or "")
 
     evidence_state = (
         "error_fetch"
@@ -88,15 +96,16 @@ def structural_candidate(
         identity = "confirmada"
     else:
         identity = cascade._candidate_identity_state(page, municipio, ())
-        # Mision D (12-jul), regla (b) -- universo (site_base): escape hatch
+        # Mision D (12-jul), regla (b) -- universo: escape hatch
         # SOLO para subir a 'confirmada'; nunca baja lo que cascade ya dijo.
-        # Exige DOS hechos independientes (site_base match + mencion literal
-        # del municipio en el contenido) -- ver docstring de
+        # Exige DOS hechos independientes (site_base o URL exacta de bucket
+        # confirmada + mencion literal del municipio en el contenido) -- ver
+        # el docstring de
         # ``universe_identity_confirms``. Cubre los casos donde cascade
         # rechaza por slug (conector da/de/do/das/dos retenido en el host, o
         # abreviatura no estandar como pmfv/pmgentil) antes de leer contenido.
         if identity != "confirmada" and authority.universe_identity_confirms(
-            municipio, final_url, page,
+            municipio, final_url, page, bucket,
         ):
             identity = "confirmada"
 
@@ -109,7 +118,7 @@ def structural_candidate(
         # funcion y el comentario "provenance de REDIRECT" arriba: el mismo
         # principio aplica aqui.
         + authority.delegated_platform_provenance(municipio, final_url, page)
-        + authority.universe_provenance(municipio, final_url)
+        + authority.universe_provenance(municipio, final_url, bucket)
     )
     source_kind, authority_state = cascade._candidate_source_and_authority(
         page, municipio, provenance_total, identity, source,

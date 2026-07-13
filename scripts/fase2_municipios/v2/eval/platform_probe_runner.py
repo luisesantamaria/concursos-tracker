@@ -64,21 +64,27 @@ the comparison/summary code):
    (confianza == "baja"; these are V2-adjudication candidates, not
    affirmations -- a nonzero wrng there is expected and not gating).
 
-Every proposal row also now carries two diagnostic-only fields appended at
+Every proposal row also carries three diagnostic-only fields appended at
 the end of ``PROPOSAL_FIELDS`` for CSV backward-compatibility:
 ``drift_reason`` (one of "" / "path_drift" / "host_drift" / "root" /
 "error_path" / "no_structure") and ``url_final_redirect`` (the actual URL
 the fetch landed on, recorded even when the proposal is not proposable, so
 a ``redirect_drift`` row no longer loses ``template_usada`` and the
-redirect destination the way corrida 2's CSV did).
+redirect destination the way corrida 2's CSV did), plus ``ssl_recovered``
+to audit successful verified retries using an AIA intermediate bundle.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import http.client
 import json
+import os
 import re
+import socket
+import ssl
+import tempfile
 import time
 import unicodedata
 from collections import Counter
@@ -89,7 +95,21 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
+import certifi
 import requests
+
+try:
+    from cryptography import x509 as _x509
+    from cryptography.hazmat.primitives import serialization as _x509_serialization
+    from cryptography.x509.oid import (
+        AuthorityInformationAccessOID as _AIA_OID,
+        ExtensionOID as _EXTENSION_OID,
+    )
+except ImportError:  # pragma: no cover - present transitively in production.
+    _x509 = None
+    _x509_serialization = None
+    _AIA_OID = None
+    _EXTENSION_OID = None
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +340,109 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_SLEEP_SECONDS = 0.3
+TRANSIENT_RETRY_SLEEP_SECONDS = 2.0
+_SSL_INCOMPLETE_CHAIN_MESSAGE = "unable to get local issuer certificate"
+
+
+def _is_incomplete_chain_error(exc: requests.exceptions.SSLError) -> bool:
+    """Return true only for the missing-intermediate verification failure."""
+    return _SSL_INCOMPLETE_CHAIN_MESSAGE in str(exc).lower()
+
+
+def _fetch_leaf_certificate_der(host: str, port: int, timeout: float) -> bytes:
+    """Read the leaf certificate with an unverified TLS handshake.
+
+    This context is used only to inspect certificate bytes.  The actual HTTP
+    request is always performed by requests with verification enabled.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        with context.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+            der = tls_sock.getpeercert(binary_form=True)
+    if not der:
+        raise ValueError("ssl_aia_leaf_certificate_unavailable")
+    return der
+
+
+def _aia_ca_issuer_uris(der_cert: bytes) -> tuple[str, ...]:
+    """Extract HTTP(S) CA Issuers URIs from a DER leaf certificate."""
+    certificate = _x509.load_der_x509_certificate(der_cert)
+    try:
+        aia = certificate.extensions.get_extension_for_oid(
+            _EXTENSION_OID.AUTHORITY_INFORMATION_ACCESS
+        )
+    except _x509.ExtensionNotFound:
+        return ()
+    return tuple(
+        description.access_location.value
+        for description in aia.value
+        if description.access_method == _AIA_OID.CA_ISSUERS
+        and isinstance(description.access_location, _x509.UniformResourceIdentifier)
+    )
+
+
+def _download_intermediate_pem(uri: str, timeout: float) -> str:
+    """Download one AIA intermediate and normalize DER or PEM input to PEM."""
+    parsed = urlsplit(uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("ssl_aia_uri_unsupported")
+    connection_cls = (
+        http.client.HTTPSConnection if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_cls(parsed.hostname, port=parsed.port, timeout=timeout)
+    try:
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        connection.request("GET", path, headers={"User-Agent": DEFAULT_USER_AGENT})
+        response = connection.getresponse()
+        body = response.read()
+        if response.status < 200 or response.status >= 400:
+            raise ValueError(f"ssl_aia_issuer_fetch_failed:{response.status}")
+    finally:
+        connection.close()
+    try:
+        certificate = _x509.load_der_x509_certificate(body)
+    except ValueError:
+        certificate = _x509.load_pem_x509_certificate(body)
+    return certificate.public_bytes(
+        _x509_serialization.Encoding.PEM
+    ).decode("ascii")
+
+
+def _write_temp_ca_bundle(intermediate_pem: str) -> str:
+    """Write certifi roots plus one downloaded intermediate to a temp file."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".pem", delete=False, encoding="ascii"
+    ) as bundle_file:
+        with open(certifi.where(), "r", encoding="ascii") as certifi_bundle:
+            bundle_file.write(certifi_bundle.read())
+        bundle_file.write("\n")
+        bundle_file.write(intermediate_pem)
+        return bundle_file.name
+
+
+def _recover_ssl_bundle_via_aia(
+    host: str | None, port: int, timeout: float,
+) -> str | None:
+    """Attempt AIA recovery once and return a verified-request CA bundle."""
+    if not host or _x509 is None:
+        return None
+    try:
+        leaf_der = _fetch_leaf_certificate_der(host, port, timeout)
+        for uri in _aia_ca_issuer_uris(leaf_der):
+            try:
+                return _write_temp_ca_bundle(
+                    _download_intermediate_pem(uri, timeout)
+                )
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
 
 
 class ProbeFetchError(Exception):
@@ -335,6 +458,7 @@ class FetchResult:
     status_code: int
     html: str
     final_url: str
+    ssl_recovered: bool = False
 
 
 class Fetcher(Protocol):
@@ -342,7 +466,7 @@ class Fetcher(Protocol):
 
 
 class RequestsFetcher:
-    """Real HTTP fetcher used in production; never touched by offline tests."""
+    """Real verified HTTP fetcher with one-shot SSL and transient recovery."""
 
     def __init__(self, user_agent: str = DEFAULT_USER_AGENT) -> None:
         self._session = requests.Session()
@@ -352,14 +476,49 @@ class RequestsFetcher:
         })
 
     def get(self, url: str, timeout: int) -> FetchResult:
+        ssl_recovered = False
         try:
             response = self._session.get(url, timeout=timeout, allow_redirects=True)
+        except requests.exceptions.SSLError as exc:
+            if not _is_incomplete_chain_error(exc):
+                raise ProbeFetchError(type(exc).__name__, str(exc)) from exc
+            parsed = urlsplit(url)
+            bundle_path = _recover_ssl_bundle_via_aia(
+                parsed.hostname, parsed.port or 443, timeout
+            )
+            if bundle_path is None:
+                raise ProbeFetchError(type(exc).__name__, str(exc)) from exc
+            try:
+                response = self._session.get(
+                    url, timeout=timeout, allow_redirects=True, verify=bundle_path
+                )
+                ssl_recovered = True
+            except requests.exceptions.RequestException as retry_exc:
+                raise ProbeFetchError(
+                    type(retry_exc).__name__, str(retry_exc)
+                ) from retry_exc
+            finally:
+                try:
+                    os.unlink(bundle_path)
+                except OSError:
+                    pass
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
+            time.sleep(TRANSIENT_RETRY_SLEEP_SECONDS)
+            try:
+                response = self._session.get(
+                    url, timeout=timeout, allow_redirects=True
+                )
+            except requests.exceptions.RequestException as retry_exc:
+                raise ProbeFetchError(
+                    type(retry_exc).__name__, str(retry_exc)
+                ) from retry_exc
         except requests.exceptions.RequestException as exc:
             raise ProbeFetchError(type(exc).__name__, str(exc)) from exc
         return FetchResult(
             status_code=response.status_code,
             html=response.text or "",
             final_url=response.url or url,
+            ssl_recovered=ssl_recovered,
         )
 
 
@@ -441,8 +600,9 @@ class ProbeProposal:
     # existing positional call sites keep working unchanged.
     drift_reason: str = ""
     url_final_redirect: str = ""
+    ssl_recovered: bool = False
 
-    def as_row(self) -> dict[str, str]:
+    def as_row(self) -> dict[str, Any]:
         return {
             "municipio": self.municipio,
             "bucket": self.bucket,
@@ -453,6 +613,7 @@ class ProbeProposal:
             "template_usada": self.template_usada,
             "drift_reason": self.drift_reason,
             "url_final_redirect": self.url_final_redirect,
+            "ssl_recovered": self.ssl_recovered,
         }
 
 
@@ -507,6 +668,7 @@ def probe_unit(
     last_template = ""
     last_drift_reason = ""
     last_redirect_final = ""
+    ssl_recovered = False
     for template, url in candidates:
         try:
             result = fetcher.get(url, timeout)
@@ -514,6 +676,7 @@ def probe_unit(
             last_reason = f"error:{exc.cls_name}"
             sleep_fn(sleep_seconds)
             continue
+        ssl_recovered = ssl_recovered or result.ssl_recovered
         sleep_fn(sleep_seconds)
         title, text = extract_title_and_text(result.html)
         outcome = classify_probe(
@@ -540,6 +703,7 @@ def probe_unit(
                     url_propuesta=final_url, probe_result="drift_candidata",
                     confianza="baja", template_usada=template,
                     drift_reason="path_drift", url_final_redirect=redirect_final,
+                    ssl_recovered=ssl_recovered,
                 )
             last_reason = "redirect_drift"
             last_template = template
@@ -557,6 +721,7 @@ def probe_unit(
             url_propuesta=final_url, probe_result=outcome,
             confianza=confianza, template_usada=template,
             drift_reason=drift_reason, url_final_redirect=redirect_final,
+            ssl_recovered=ssl_recovered,
         )
 
     is_drift = last_reason == "redirect_drift"
@@ -566,6 +731,7 @@ def probe_unit(
         confianza="", template_usada=(last_template if is_drift else ""),
         drift_reason=(last_drift_reason if is_drift else ""),
         url_final_redirect=(last_redirect_final if is_drift else ""),
+        ssl_recovered=ssl_recovered,
     )
 
 
@@ -684,7 +850,7 @@ PROPOSAL_FIELDS: tuple[str, ...] = (
     "confianza", "template_usada",
     # New columns appended at the end (F3.P1 corrida 2 fix, rule 3) --
     # back-compatible with any consumer keyed on the original 7 columns.
-    "drift_reason", "url_final_redirect",
+    "drift_reason", "url_final_redirect", "ssl_recovered",
 )
 # "drift_candidata" counts as an accepted proposal (it has a url_propuesta
 # and contributes to coverage) -- it is distinguished from "ok" /

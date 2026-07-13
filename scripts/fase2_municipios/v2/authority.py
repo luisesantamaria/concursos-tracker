@@ -22,9 +22,10 @@ el mismo patron que ``cascade._official_host``.
 from __future__ import annotations
 
 import csv
+import html
 import re
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from scripts.fase2_municipios import cascade_municipios as cascade
 from scripts.shared import scope_rs
@@ -188,15 +189,17 @@ def registry_provenance(municipio: str, final_url: str) -> tuple[dict, ...]:
 # Dos fuentes de verdad NUEVAS, generales y con provenance, nunca hardcodes
 # por municipio:
 #   (a) plataforma delegada (atende.net/multi24h.com.br): SOLO autoridad.
-#   (b) universo (data/fase2/municipios_rs_local.csv, columna site_base):
+#   (b) universo (data/fase2/municipios_rs_local.csv): site_base, o la URL
+#       exacta del bucket cuando su confianza es ``confirmado``. Aporta
 #       autoridad + un camino adicional de identidad, pero solo cuando el
-#       contenido de la pagina TAMBIEN confirma -- nunca solo por el host.
+#       contenido de la pagina TAMBIEN confirma -- nunca solo por el binding.
 # ---------------------------------------------------------------------------
 
 _UNIVERSE_PATH = (
     Path(__file__).resolve().parents[3] / "data" / "fase2" / "municipios_rs_local.csv"
 )
 _universe_cache: dict[str, str] | None = None
+_universe_confirmed_url_cache: dict[tuple[str, str], tuple[str, ...]] | None = None
 
 
 def _load_universe_site_base() -> dict[str, str]:
@@ -239,37 +242,171 @@ def universe_site_base_host(municipio: str) -> str:
     return _load_universe_site_base().get(cascade.norm(municipio or ""), "")
 
 
+def _site_base_host_matches(municipio: str, candidate_host: str, base_host: str) -> bool:
+    """Compare normalized hosts, including the general Brazilian ``pm`` alias.
+
+    ``www``, scheme and port have already been removed by ``_lower_host`` /
+    ``_normalize_host``.  The only non-exact variant accepted here is a first
+    label equal to either ``slug`` or ``pm+slug`` for the requested municipality,
+    with every remaining DNS label identical.  ``pm`` is the conventional
+    abbreviation of *prefeitura municipal* across Brazilian municipal sites;
+    requiring the same municipality slug and parent suffix prevents an alias
+    for another city or another provider from crossing this boundary.
+    """
+    candidate = _normalize_host(candidate_host)
+    base = _normalize_host(base_host)
+    if not candidate or not base:
+        return False
+    if candidate == base:
+        return True
+    candidate_labels = candidate.split(".")
+    base_labels = base.split(".")
+    if len(candidate_labels) != len(base_labels) or len(candidate_labels) < 2:
+        return False
+    slug = _municipio_concat_slug(municipio)
+    aliases = {slug, f"pm{slug}"} if slug else set()
+    return bool(
+        candidate_labels[0] in aliases
+        and base_labels[0] in aliases
+        and candidate_labels[1:] == base_labels[1:]
+    )
+
+
 def universe_site_base_match(municipio: str, final_url: str) -> bool:
     """True when the candidate's host equals this municipality's own
     site_base host (never a different municipality's -- the lookup is keyed
     by ``municipio`` itself, so no cross-municipio leakage is possible)."""
     host = _normalize_host(_lower_host(final_url))
     base_host = universe_site_base_host(municipio)
-    return bool(host and base_host and host == base_host)
+    return _site_base_host_matches(municipio, host, base_host)
 
 
-def universe_provenance(municipio: str, final_url: str) -> tuple[dict, ...]:
+def _normalize_universe_url(url: str) -> str:
+    """Canonical URL for comparing a live target with a confirmed CSV target.
+
+    The discovery CSV stores URLs copied from HTML anchors, so query separators
+    can survive as ``&amp;``; after one fetch that semicolon can itself be
+    percent-encoded as ``&amp%3B``.  Decoding one URL-encoding layer and then
+    HTML entities is a serialization repair, not a fuzzy URL match.  The final
+    comparison remains exact after the project's normal URL canonicalization.
+    """
+    decoded = html.unescape(unquote((url or "").strip()))
+    return cascade._normalized_candidate_url(decoded) if decoded else ""
+
+
+def _load_universe_confirmed_urls() -> dict[tuple[str, str], tuple[str, ...]]:
+    """Load exact bucket URLs whose matching confidence column is confirmed.
+
+    Provenance is explicit and general: unlike ``site_base`` (a Tier-0 guess),
+    these are the universe row's own bucket targets and are admitted only when
+    that same bucket is marked ``confirmado``.  This safely covers custom
+    domains and raw-IP portals without promoting every path on a shared host.
+    """
+    global _universe_confirmed_url_cache
+    if _universe_confirmed_url_cache is None:
+        table: dict[tuple[str, str], list[str]] = {}
+        if _UNIVERSE_PATH.exists():
+            with _UNIVERSE_PATH.open(encoding="utf-8-sig", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    municipio_key = cascade.norm(row.get("municipio", ""))
+                    if not municipio_key:
+                        continue
+                    for bucket, url_column, confidence_column in (
+                        ("concurso_publico", "url_concursos", "confianza_concursos"),
+                        (
+                            "processo_seletivo",
+                            "url_processos_seletivos",
+                            "confianza_processos",
+                        ),
+                    ):
+                        if row.get(confidence_column, "") != "confirmado":
+                            continue
+                        normalized = _normalize_universe_url(row.get(url_column, ""))
+                        if normalized:
+                            table.setdefault((municipio_key, bucket), []).append(normalized)
+        _universe_confirmed_url_cache = {
+            key: tuple(dict.fromkeys(urls)) for key, urls in table.items()
+        }
+    return _universe_confirmed_url_cache
+
+
+def universe_confirmed_url_match(
+    municipio: str, final_url: str, bucket: str | None = None,
+) -> bool:
+    """True only for an exact URL confirmed for this municipality/bucket.
+
+    With ``bucket`` omitted both canonical buckets are checked for backwards-
+    compatible diagnostic calls.  Runtime passes the requested bucket, so a
+    confirmed concursos URL cannot authorize a different PSS target.
+    """
+    target = _normalize_universe_url(final_url)
+    municipio_key = cascade.norm(municipio or "")
+    if not target or not municipio_key:
+        return False
+    canonical = cascade._canonical_bucket(bucket) if isinstance(bucket, str) else ""
+    buckets = (
+        (canonical,)
+        if canonical in {"concurso_publico", "processo_seletivo"}
+        else ("concurso_publico", "processo_seletivo")
+    )
+    table = _load_universe_confirmed_urls()
+    return any(target in table.get((municipio_key, item), ()) for item in buckets)
+
+
+def _universe_match_source(
+    municipio: str, final_url: str, bucket: str | None = None,
+) -> str:
+    if universe_site_base_match(municipio, final_url):
+        return "site_base"
+    if universe_confirmed_url_match(municipio, final_url, bucket):
+        return "confirmed_bucket_url"
+    return ""
+
+
+def universe_provenance(
+    municipio: str, final_url: str, bucket: str | None = None,
+) -> tuple[dict, ...]:
     """Provenance ``official_brand`` (kind aceptado por
     ``cascade._provenance_confirms``) cuando el host candidato es el
-    ``site_base`` registrado del universo para ESTE municipio. Regla (b) de
-    Mision D: confirma AUTORIDAD (via ``_candidate_source_and_authority``,
-    para hosts no .rs.gov.br) -- nunca identidad por si sola; ver
+    ``site_base`` registrado, o su URL exacta es la URL del bucket marcada
+    ``confirmado``, para ESTE municipio. Regla (b) de Mision D: confirma
+    AUTORIDAD (via ``_candidate_source_and_authority``, para hosts no
+    .rs.gov.br) -- nunca identidad por si sola; ver
     ``universe_identity_confirms`` para el camino de identidad, que exige
     ademas el chequeo de contenido."""
-    if not universe_site_base_match(municipio, final_url):
+    match_source = _universe_match_source(municipio, final_url, bucket)
+    if not match_source:
         return ()
     host = _normalize_host(_lower_host(final_url))
+    label = (
+        "universo_site_base"
+        if match_source == "site_base"
+        else "universo_url_bucket_confirmada"
+    )
+    evidence = (
+        f"{host} == site_base (data/fase2/municipios_rs_local.csv)"
+        if match_source == "site_base"
+        else (
+            "URL exacta del bucket == URL confirmada "
+            "(data/fase2/municipios_rs_local.csv)"
+        )
+    )
     return (
         {
             "kind": "official_brand",
             "municipio": municipio,
-            "label": "universo_site_base",
-            "evidence": f"{host} == site_base (data/fase2/municipios_rs_local.csv)",
+            "label": label,
+            "evidence": evidence,
         },
     )
 
 
-def universe_identity_confirms(municipio: str, final_url: str, page: "cascade.Page") -> bool:
+def universe_identity_confirms(
+    municipio: str,
+    final_url: str,
+    page: "cascade.Page",
+    bucket: str | None = None,
+) -> bool:
     """Escape hatch for ``cascade._candidate_identity_state``'s .rs.gov.br
     slug-label check, which returns 'rechazada' the instant
     ``cascade.slugify(municipio)`` is not one of the host's dot-separated
@@ -282,19 +419,22 @@ def universe_identity_confirms(municipio: str, final_url: str, page: "cascade.Pa
     sight unseen.
 
     Two independent facts must BOTH hold; neither alone is enough:
-    (1) ``universe_site_base_match`` -- the candidate host equals this
-        municipio's own site_base (a prior structural fact, RS-scoped, keyed
-        by this exact municipio -- a homonym in another UF simply is not in
-        this table under this key);
+    (1) the candidate matches this municipio's own site_base OR the exact
+        bucket URL marked ``confirmado`` (a prior structural fact, RS-scoped,
+        keyed by this exact municipio and bucket);
     (2) the municipality's own name literally appears in this page's
         title/body -- the SAME content bar cascade already applies to
         non-.rs.gov.br hosts, just not gated behind the slug-label match.
     Fails closed like everything else here: without BOTH, no identity.
     """
-    if not universe_site_base_match(municipio, final_url):
+    if not _universe_match_source(municipio, final_url, bucket):
         return False
     target = cascade.norm(municipio or "")
-    blob = cascade.norm(f"{page.title}\n{page.text[:3000]}")
+    # General HTML provenance repair: titles/text copied from municipal CMSs
+    # may retain numeric/named entities (e.g. ``Munic&#237;pio``). Decode entities
+    # before identity normalization; this never changes the target name and
+    # cannot turn a different municipality into a match.
+    blob = cascade.norm(html.unescape(f"{page.title}\n{page.text[:3000]}"))
     return bool(target and target in blob)
 
 
@@ -389,8 +529,12 @@ def delegated_platform_provenance(
     slug = _municipio_concat_slug(municipio)
     if not slug:
         return ()
+    # ``pm`` is the nationwide abbreviation for "prefeitura municipal" in
+    # Brazilian public hosts.  Both exact slug and pm+slug remain exact
+    # municipality bindings; no initials, substrings or fuzzy variants pass.
+    delegated_labels = {slug, f"pm{slug}"}
     for suffix in _DELEGATED_PLATFORM_SUFFIXES:
-        if host == f"{slug}{suffix}":
+        if any(host == f"{label}{suffix}" for label in delegated_labels):
             if page is not None and _content_signals_other_uf(page):
                 return ()
             return (
@@ -398,7 +542,10 @@ def delegated_platform_provenance(
                     "kind": "official_brand",
                     "municipio": municipio,
                     "label": "plataforma_delegada",
-                    "evidence": f"{host} slug=={slug} (plataforma delegada oficial)",
+                    "evidence": (
+                        f"{host} label municipal exacta en "
+                        f"{{{slug}, pm{slug}}} (plataforma delegada oficial)"
+                    ),
                 },
             )
     return ()
@@ -411,6 +558,7 @@ __all__ = [
     "registry_provenance",
     "universe_site_base_host",
     "universe_site_base_match",
+    "universe_confirmed_url_match",
     "universe_provenance",
     "universe_identity_confirms",
     "delegated_platform_provenance",

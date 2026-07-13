@@ -432,6 +432,7 @@ def test_municipio_concat_slug_keeps_connector_words() -> None:
         ("www.cristaldosul.atende.net", "Cristal Do Sul"),
         ("doisirmaos.atende.net", "Dois Irmãos"),
         ("saopedrodosul.multi24h.com.br", "São Pedro Do Sul"),
+        ("pmfloresdacunha.multi24h.com.br", "Flores Da Cunha"),
     ],
 )
 def test_delegated_platform_provenance_matches_correct_slug(
@@ -446,13 +447,23 @@ def test_delegated_platform_provenance_matches_correct_slug(
     assert cascade._provenance_confirms(provenance, expected_slug_source) is True
 
 
-def test_delegated_platform_provenance_empty_for_slug_mismatch() -> None:
-    # "pmfloresdacunha" (prefijo pm) no es el slug de "Flores Da Cunha"
-    # (florescunha... da_cunha -> floresdacunha exacto, sin "pm"): el host
-    # real de este municipio en multi24h agrega un prefijo que la regla NO
-    # debe adivinar -- fail-closed, no aproximado.
-    assert authority.delegated_platform_provenance(
+def test_delegated_platform_provenance_accepts_pm_plus_exact_slug() -> None:
+    provenance = authority.delegated_platform_provenance(
         "Flores Da Cunha", "https://pmfloresdacunha.multi24h.com.br/x",
+    )
+    assert provenance
+    assert provenance[0]["label"] == "plataforma_delegada"
+
+
+def test_delegated_platform_pm_prefix_rejects_other_municipality_slug() -> None:
+    assert authority.delegated_platform_provenance(
+        "Flores Da Cunha", "https://pmoutracidade.multi24h.com.br/x",
+    ) == ()
+
+
+def test_delegated_platform_pm_prefix_adversarial_cross_municipio() -> None:
+    assert authority.delegated_platform_provenance(
+        "Outra Cidade", "https://pmfloresdacunha.multi24h.com.br/x",
     ) == ()
 
 
@@ -655,6 +666,106 @@ def test_universe_provenance_authority_only(monkeypatch: pytest.MonkeyPatch) -> 
     ) == ()
 
 
+def test_universe_site_base_normalizes_scheme_www_port_and_pm_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        authority, "_universe_cache",
+        {"acme municipio": "acmemunicipio.portal.gov.br"},
+    )
+    assert authority.universe_site_base_match(
+        "Acme Municipio", "http://www.pmacmemunicipio.portal.gov.br:8443/x",
+    ) is True
+
+
+def test_universe_site_base_pm_alias_rejects_different_parent_or_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        authority, "_universe_cache",
+        {"acme municipio": "acmemunicipio.portal.gov.br"},
+    )
+    assert authority.universe_site_base_match(
+        "Acme Municipio", "https://pmacmemunicipio.outro.gov.br/x",
+    ) is False
+    assert authority.universe_site_base_match(
+        "Acme Municipio", "https://pmoutracidade.portal.gov.br/x",
+    ) is False
+
+
+def test_universe_site_base_pm_alias_adversarial_other_municipio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        authority, "_universe_cache",
+        {"outro municipio": "outromunicipio.portal.gov.br"},
+    )
+    assert authority.universe_site_base_match(
+        "Outro Municipio", "https://pmacmemunicipio.portal.gov.br/x",
+    ) is False
+
+
+def test_universe_confirmed_bucket_url_matches_html_and_percent_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    csv_url = "http://198.51.100.7:8080/portal?entidade=1&amp;id=13099"
+    monkeypatch.setattr(
+        authority,
+        "_universe_confirmed_url_cache",
+        {
+            ("acme municipio", "concurso_publico"): (
+                authority._normalize_universe_url(csv_url),
+            ),
+        },
+    )
+    assert authority.universe_confirmed_url_match(
+        "Acme Municipio",
+        "http://198.51.100.7:8080/portal?entidade=1&amp%3Bid=13099",
+        "concurso_publico",
+    ) is True
+
+
+def test_universe_confirmed_bucket_url_rejects_different_query_or_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    confirmed = authority._normalize_universe_url(
+        "http://198.51.100.7:8080/portal?entidade=1&id=13099"
+    )
+    monkeypatch.setattr(
+        authority,
+        "_universe_confirmed_url_cache",
+        {("acme municipio", "concurso_publico"): (confirmed,)},
+    )
+    assert authority.universe_confirmed_url_match(
+        "Acme Municipio",
+        "http://198.51.100.7:8080/portal?entidade=2&id=13099",
+        "concurso_publico",
+    ) is False
+    assert authority.universe_confirmed_url_match(
+        "Acme Municipio",
+        "http://198.51.100.7:8080/portal?entidade=1&id=13099",
+        "processo_seletivo",
+    ) is False
+
+
+def test_universe_confirmed_bucket_url_adversarial_same_ip_other_municipio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    confirmed = authority._normalize_universe_url(
+        "http://198.51.100.7:8080/portal?entidade=1&id=13099"
+    )
+    monkeypatch.setattr(
+        authority,
+        "_universe_confirmed_url_cache",
+        {("acme municipio", "concurso_publico"): (confirmed,)},
+    )
+    assert authority.universe_confirmed_url_match(
+        "Outro Municipio",
+        "http://198.51.100.7:8080/portal?entidade=1&id=13099",
+        "concurso_publico",
+    ) is False
+
+
 def test_universe_identity_confirms_requires_both_facts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -686,6 +797,114 @@ def test_universe_identity_confirms_requires_both_facts(
     assert authority.universe_identity_confirms(
         "Acme Municipio", "https://otrodominio.rs.gov.br/x", page_with_content,
     ) is False
+
+
+def test_structural_identity_unescapes_html_entity_before_matching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_url = "https://portal-acme.example/concursos"
+    monkeypatch.setattr(authority, "_universe_cache", {})
+    monkeypatch.setattr(
+        authority,
+        "_universe_confirmed_url_cache",
+        {
+            ("acme municipio", "concurso_publico"): (
+                authority._normalize_universe_url(final_url),
+            ),
+        },
+    )
+    snapshot = cascade.EvidenceSnapshot(
+        html="",
+        text="Prefeitura de Acme Munic&#237;pio. Concurso Publico 01/2026.",
+        title="Acme Munic&#237;pio",
+        final_url=final_url,
+        requested_url=final_url,
+        status=200,
+        source="orion_http",
+        evidence_state="completa",
+    )
+
+    candidate = structural_candidate(
+        requested_url=final_url,
+        source="orion_http",
+        tier="live",
+        municipio="Acme Municipio",
+        bucket="concurso_publico",
+        evidence=snapshot,
+    )
+
+    assert candidate.identity == "confirmada"
+    assert candidate.authority == "confirmada"
+
+
+def test_structural_identity_entity_decode_does_not_replace_missing_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_url = "https://portal-acme.example/concursos"
+    monkeypatch.setattr(authority, "_universe_cache", {})
+    monkeypatch.setattr(
+        authority,
+        "_universe_confirmed_url_cache",
+        {
+            ("acme municipio", "concurso_publico"): (
+                authority._normalize_universe_url(final_url),
+            ),
+        },
+    )
+    snapshot = cascade.EvidenceSnapshot(
+        html="",
+        text="Lista de editais e cronogramas.",
+        title="Concursos P&#250;blicos",
+        final_url=final_url,
+        requested_url=final_url,
+        status=200,
+        source="orion_http",
+        evidence_state="completa",
+    )
+    candidate = structural_candidate(
+        requested_url=final_url,
+        source="orion_http",
+        tier="live",
+        municipio="Acme Municipio",
+        bucket="concurso_publico",
+        evidence=snapshot,
+    )
+    assert candidate.identity != "confirmada"
+
+
+def test_structural_identity_entity_adversarial_other_name_does_not_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    final_url = "https://portal-acme.example/concursos"
+    monkeypatch.setattr(authority, "_universe_cache", {})
+    monkeypatch.setattr(
+        authority,
+        "_universe_confirmed_url_cache",
+        {
+            ("acme municipio", "concurso_publico"): (
+                authority._normalize_universe_url(final_url),
+            ),
+        },
+    )
+    snapshot = cascade.EvidenceSnapshot(
+        html="",
+        text="Prefeitura de Outra Cid&#225;de. Concurso Publico 01/2026.",
+        title="Outra Cid&#225;de",
+        final_url=final_url,
+        requested_url=final_url,
+        status=200,
+        source="orion_http",
+        evidence_state="completa",
+    )
+    candidate = structural_candidate(
+        requested_url=final_url,
+        source="orion_http",
+        tier="live",
+        municipio="Acme Municipio",
+        bucket="concurso_publico",
+        evidence=snapshot,
+    )
+    assert candidate.identity != "confirmada"
 
 
 def test_structural_candidate_universe_confirms_identity_for_connector_slug_mismatch() -> None:

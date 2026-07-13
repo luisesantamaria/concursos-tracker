@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -619,6 +620,122 @@ def test_network_error_on_every_template_yields_error_row_not_a_crash() -> None:
     assert proposal.url_propuesta == ""
 
 
+# ---------------------------------------------------------------------------
+# M6. RequestsFetcher recovery remains verified and bounded to one retry
+# ---------------------------------------------------------------------------
+def test_incomplete_chain_ssl_error_recovers_via_aia_with_verified_bundle() -> None:
+    url = "https://www.agudo.rs.gov.br/concursos"
+    ssl_error = runner.requests.exceptions.SSLError(
+        "certificate verify failed: unable to get local issuer certificate"
+    )
+    response = Mock(status_code=200, text=index_html(), url=url)
+    fetcher = runner.RequestsFetcher()
+    fetcher._session = Mock()
+    fetcher._session.get.side_effect = [ssl_error, response]
+
+    with patch.object(
+        runner, "_recover_ssl_bundle_via_aia", return_value="recovered-bundle.pem"
+    ) as recover, patch.object(runner.os, "unlink") as unlink:
+        proposal = runner.probe_unit(
+            fetcher, municipio="Agudo", bucket="concurso_publico",
+            site_base="https://www.agudo.rs.gov.br", sleep_fn=NO_SLEEP,
+        )
+
+    assert proposal.probe_result == "ok"
+    assert proposal.ssl_recovered is True
+    recover.assert_called_once_with("www.agudo.rs.gov.br", 443, runner.DEFAULT_TIMEOUT_SECONDS)
+    assert fetcher._session.get.call_args_list == [
+        call(url, timeout=runner.DEFAULT_TIMEOUT_SECONDS, allow_redirects=True),
+        call(
+            url, timeout=runner.DEFAULT_TIMEOUT_SECONDS, allow_redirects=True,
+            verify="recovered-bundle.pem",
+        ),
+    ]
+    unlink.assert_called_once_with("recovered-bundle.pem")
+
+
+def test_hostname_mismatch_ssl_error_does_not_attempt_aia_recovery() -> None:
+    url = "https://www.agudo.rs.gov.br/concursos"
+    ssl_error = runner.requests.exceptions.SSLError(
+        "certificate verify failed: hostname mismatch"
+    )
+    fetcher = runner.RequestsFetcher()
+    fetcher._session = Mock()
+    fetcher._session.get.side_effect = ssl_error
+
+    with patch.object(runner, "_recover_ssl_bundle_via_aia") as recover:
+        with pytest.raises(ProbeFetchError) as raised:
+            fetcher.get(url, runner.DEFAULT_TIMEOUT_SECONDS)
+
+    assert raised.value.cls_name == "SSLError"
+    assert raised.value.__cause__ is ssl_error
+    recover.assert_not_called()
+
+
+def test_incomplete_chain_aia_failure_surfaces_original_ssl_error() -> None:
+    url = "https://www.agudo.rs.gov.br/concursos"
+    ssl_error = runner.requests.exceptions.SSLError(
+        "certificate verify failed: unable to get local issuer certificate"
+    )
+    fetcher = runner.RequestsFetcher()
+    fetcher._session = Mock()
+    fetcher._session.get.side_effect = ssl_error
+
+    with patch.object(
+        runner, "_recover_ssl_bundle_via_aia", return_value=None
+    ) as recover:
+        with pytest.raises(ProbeFetchError) as raised:
+            fetcher.get(url, runner.DEFAULT_TIMEOUT_SECONDS)
+
+    assert raised.value.cls_name == "SSLError"
+    assert raised.value.__cause__ is ssl_error
+    assert getattr(raised.value, "ssl_recovered", False) is False
+    recover.assert_called_once_with("www.agudo.rs.gov.br", 443, runner.DEFAULT_TIMEOUT_SECONDS)
+
+
+def test_connection_error_retries_once_after_two_seconds_then_proposes() -> None:
+    url = "https://www.agudo.rs.gov.br/concursos"
+    response = Mock(status_code=200, text=index_html(), url=url)
+    fetcher = runner.RequestsFetcher()
+    fetcher._session = Mock()
+    fetcher._session.get.side_effect = [
+        runner.requests.exceptions.ConnectionError("temporary disconnect"),
+        response,
+    ]
+
+    with patch.object(runner.time, "sleep") as sleep:
+        proposal = runner.probe_unit(
+            fetcher, municipio="Agudo", bucket="concurso_publico",
+            site_base="https://www.agudo.rs.gov.br", sleep_fn=NO_SLEEP,
+        )
+
+    assert proposal.probe_result == "ok"
+    assert proposal.ssl_recovered is False
+    assert fetcher._session.get.call_count == 2
+    sleep.assert_called_once_with(2.0)
+
+
+def test_read_timeout_on_both_attempts_yields_error_result_without_crash() -> None:
+    fetcher = runner.RequestsFetcher()
+    fetcher._session = Mock()
+    fetcher._session.get.side_effect = [
+        runner.requests.exceptions.ReadTimeout("read timed out")
+        for _ in range(6)
+    ]
+
+    with patch.object(runner.time, "sleep") as sleep:
+        proposal = runner.probe_unit(
+            fetcher, municipio="Agudo", bucket="concurso_publico",
+            site_base="https://www.agudo.rs.gov.br", sleep_fn=NO_SLEEP,
+        )
+
+    assert proposal.probe_result == "error:ReadTimeout"
+    assert proposal.url_propuesta == ""
+    assert proposal.ssl_recovered is False
+    assert fetcher._session.get.call_count == 6  # two attempts x three templates
+    assert sleep.call_args_list == [call(2.0), call(2.0), call(2.0)]
+
+
 def test_run_probes_continues_past_a_broken_municipio_to_the_next_one() -> None:
     broken_base = "https://broken.rs.gov.br"
     ok_base = "https://www.agudo.rs.gov.br"
@@ -819,12 +936,13 @@ def test_write_proposals_csv_matches_the_spec_schema(tmp_path: Path) -> None:
             "municipio": "A", "bucket": "concurso_publico", "plataforma": "atende",
             "url_propuesta": "https://a/x", "probe_result": "ok", "confianza": "alta",
             "template_usada": "/x", "drift_reason": "", "url_final_redirect": "",
+            "ssl_recovered": "False",
         },
         {
             "municipio": "B", "bucket": "processo_seletivo", "plataforma": "rs_gov",
             "url_propuesta": "", "probe_result": "redirect_drift", "confianza": "",
             "template_usada": "/concursos", "drift_reason": "root",
-            "url_final_redirect": "https://b/",
+            "url_final_redirect": "https://b/", "ssl_recovered": "False",
         },
     ]
     assert list(rows[0]) == list(runner.PROPOSAL_FIELDS)
@@ -834,6 +952,7 @@ def test_write_proposals_csv_matches_the_spec_schema(tmp_path: Path) -> None:
         "municipio", "bucket", "plataforma", "url_propuesta", "probe_result",
         "confianza", "template_usada",
     ]
+    assert runner.PROPOSAL_FIELDS[-1] == "ssl_recovered"
 
 
 # ---------------------------------------------------------------------------

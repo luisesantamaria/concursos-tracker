@@ -67,6 +67,45 @@ _ABSENCE_MESSAGE_PATTERNS = tuple(
     )
 )
 
+# R-T1 iteracion 2 (FP real Canela/concurso_publico, holdout 12-jul, run
+# r2_postpalancas): la unica cita de bucket fue la ETIQUETA del filtro
+# ('Concurso ou Processo Seletivo') -- no matchea el blocklist de ausencia de
+# arriba (no es un mensaje de "nao encontrado"), pero tampoco prueba que
+# exista un solo item real: es el nombre de la categoria del formulario, no
+# evidencia de contenido. El gate se endurece de "no-ausencia" a
+# "ITEM-POSITIVO": una cita de bucket confirmatoria debe contener una
+# keyword de bucket content-neutral (edital/concurso/processo seletivo o
+# simplificado/selecao) Y ADEMAS un marcador de instancia (numero de
+# edital, par numero/ano, fecha completa, o un ano de 4 digitos pegado a la
+# keyword). Filosofia identica a ITEM_MARKER_PATTERN en
+# eval/platform_probe_runner.py (ya validado ahi: exige keyword + numero/ano
+# adyacente para que una pagina cuente como indice estructural), replicada
+# aqui de forma independiente y self-contained para una cita individual
+# (ver docstring de ese modulo sobre no importar de/hacia cascade
+# intocable).
+# Formas singular Y plural del mismo keyword content-neutral (fix tras medir
+# impacto en las 56 confirmadas de r2: "PROCESSOS SELETIVOS 2026"/"Processos
+# Seletivos 2025" -- ambas palabras en plural -- no matcheaban la forma
+# singular-only original y se rechazaban de mas). Plural es la MISMA
+# categoria semantica, no un ablandamiento del criterio.
+_ITEM_KEYWORD_PATTERN = re.compile(
+    r"\b(?:editais|edital|concursos?|processos?\s+seletivos?"
+    r"|processos?\s+simplificados?|selecao|selecoes)\b"
+)
+_ITEM_INSTANCE_MARKER_PATTERN = re.compile(
+    r"(?:"
+    r"\bn[o°]\.?\s*\d+"        # nº 001 / n° 12 / no. 5 (nº folds to "no")
+    r"|\bnum\.?\s*\d+"               # num. 001 / núm 5
+    r"|\d{1,4}\s*/\s*\d{2,4}"        # 001/2026 (numero/ano)
+    r"|\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{2,4}"  # dd/mm/yyyy
+    r")"
+)
+_ITEM_KEYWORD_YEAR_ADJACENT_PATTERN = re.compile(
+    r"\b(?:editais|edital|concursos?|processos?\s+seletivos?"
+    r"|processos?\s+simplificados?|selecao|selecoes)\b"
+    r"[^\d\n]{0,40}\b20\d{2}\b"
+)
+
 
 def _fold_accents(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
@@ -85,6 +124,31 @@ def _is_absence_message(quote: str) -> bool:
         return False
     folded = _fold_accents(quote).lower()
     return any(pattern.search(folded) for pattern in _ABSENCE_MESSAGE_PATTERNS)
+
+
+def _is_item_positive_quote(quote: str) -> bool:
+    """True when a bucket citation is content-neutral POSITIVE evidence of
+    an item (not just a non-empty, non-absence quote).
+
+    Requires a bucket keyword (edital/concurso/processo seletivo or
+    simplificado/selecao) AND an instance marker: a numbered reference
+    (nº/n°/no./num. + digits), a numero/ano pair (001/2026), a full date
+    (dd/mm/yyyy), or a 4-digit year adjacent to the keyword. A quote that is
+    merely a filter/category LABEL (e.g. "Concurso ou Processo Seletivo")
+    has the keyword but no instance marker and fails this check -- it names
+    a category, it does not point at a published item. Matching is case-
+    and accent-insensitive and content-neutral (no municipio/platform
+    hardcoding), mirroring ITEM_MARKER_PATTERN in
+    eval/platform_probe_runner.py.
+    """
+    if not isinstance(quote, str) or not quote:
+        return False
+    folded = _fold_accents(quote).lower()
+    if not _ITEM_KEYWORD_PATTERN.search(folded):
+        return False
+    if _ITEM_INSTANCE_MARKER_PATTERN.search(folded):
+        return True
+    return bool(_ITEM_KEYWORD_YEAR_ADJACENT_PATTERN.search(folded))
 
 
 def _certifier_citations(output: Mapping[str, Any]) -> tuple[Citation, ...]:
@@ -165,6 +229,21 @@ def _certifier_invariants(output: Mapping[str, Any]) -> None:
             role="certifier",
             reason="indice_vacio_sin_items",
         )
+    item_positive_bucket_quotes = {
+        quote for quote in non_absence_bucket_quotes
+        if _is_item_positive_quote(quote)
+    }
+    if not item_positive_bucket_quotes:
+        # R-T1 iteracion 2 (FP real Canela/concurso_publico, holdout 12-jul,
+        # run r2_postpalancas): "no-ausencia" no basta. La cita de bucket
+        # puede ser una etiqueta de filtro/categoria (no dispara el
+        # blocklist de ausencia porque no dice "nao encontrado") sin probar
+        # que exista un solo item real. Endurecido a ITEM-POSITIVO: ver
+        # _is_item_positive_quote.
+        raise AgentOutputRejected(
+            role="certifier",
+            reason="indice_sin_evidencia_de_items",
+        )
     if decision == "indice_oficial_combinado":
         # Politica 12-jul (hueco FP real): una superficie combinada exige DOS
         # evidencias de bucket textualmente distintas -- una cita bucket sola
@@ -185,6 +264,57 @@ def _certifier_invariants(output: Mapping[str, Any]) -> None:
                 role="certifier",
                 reason="indice_vacio_sin_items:combinado_solo_un_tipo_con_items",
             )
+        if len(item_positive_bucket_quotes) < 2:
+            # R-T1 iteracion 2 para combinado: AMBOS tipos necesitan su
+            # propia evidencia ITEM-POSITIVA, no solo "no-ausencia". Dos
+            # quotes distintos donde uno es una etiqueta de filtro solo
+            # prueba UN tipo con item real.
+            raise AgentOutputRejected(
+                role="certifier",
+                reason="indice_sin_evidencia_de_items:combinado_solo_un_tipo_con_items",
+            )
+
+
+def _certifier_repairable_reason(reason: str) -> bool:
+    """Reasons this role gives the model one repair round for.
+
+    Extends the base citation-anchoring repair (``citation_*``, see
+    ``AgentRunner._citation_repair_instruction``) to also cover the R-T1
+    iteracion 2 item-evidence gate (``indice_sin_evidencia_de_items*``): a
+    lazy A that cited a filter LABEL while the page actually shows real
+    items should recover on retry instead of losing a good confirmation
+    to citation laziness. Reasons outside these two families still fail
+    closed immediately (no change for e.g. missing-dimension rejections).
+    """
+    return reason.startswith("citation_") or reason.startswith(
+        "indice_sin_evidencia_de_items"
+    )
+
+
+def _item_evidence_repair_instruction(reason: str) -> str:
+    return (
+        "ITEM_EVIDENCE_REPAIR (unica oportunidad): tu respuesta fue "
+        f"rechazada por el validador determinista (reason={reason}). Una "
+        "cita de dimension='bucket' que solo repite la ETIQUETA de un "
+        "filtro/menu/categoria (p.ej. 'Concurso ou Processo Seletivo', "
+        "'Edital de Concursos e Selecoes Publicas') NO prueba que exista un "
+        "item real: nombra una categoria, no apunta a un item publicado. "
+        "Reenvia el JSON COMPLETO con el mismo schema: si la pagina SI "
+        "muestra un concurso/processo seletivo/edital especifico (con "
+        "numero, par numero/ano, fecha o ano), cita ESE texto literal como "
+        "evidencia de bucket. Si la pagina NO muestra ningun item real "
+        "(solo filtros/categorias vacias), cambia tu decision a 'revisar' "
+        "-- no repitas la misma cita de etiqueta. No inventes contenido que "
+        "no este en el snapshot."
+    )
+
+
+def _certifier_repair_instruction(exc: BaseException) -> str:
+    """Dispatch to the right repair prompt by rejection reason family."""
+    reason = getattr(exc, "reason", "") or ""
+    if reason.startswith("indice_sin_evidencia_de_items"):
+        return _item_evidence_repair_instruction(reason)
+    return AgentRunner._citation_repair_instruction(exc)
 
 
 class CertifierAgent:
@@ -247,5 +377,7 @@ def build_certifier_agent(
         estimated_tokens=estimated_tokens,
         tool_limits=tool_limits,
         tools=tools,
+        repairable_reason=_certifier_repairable_reason,
+        repair_instruction=_certifier_repair_instruction,
     )
     return CertifierAgent(runner)

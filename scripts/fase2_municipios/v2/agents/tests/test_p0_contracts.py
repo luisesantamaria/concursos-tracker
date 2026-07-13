@@ -28,7 +28,7 @@ pytestmark = pytest.mark.offline
 ACCUSATION_CODES = tuple(sorted(prosecutor.REQUIRED_ACCUSATION_CODES))
 
 
-def _snapshot(text: str = "ASCII ação 😀 fim"):
+def _snapshot(text: str = "ASCII ação 😀 fim Concurso 01/2026 Processo Seletivo 02/2026"):
     return build_snapshot((EvidenceSource(
         source_id="main",
         url="https://example.invalid/indice",
@@ -43,7 +43,9 @@ def _affirmative_output(*, authority_citation: bool, offsets: bool = True):
     for dimension, quote in (
         ("identity", "ASCII"),
         ("page_role", "ação"),
-        ("bucket", "😀"),
+        # R-T1 iteracion 2: item-positive (keyword + numero/ano), no un
+        # placeholder arbitrario -- ver certifier._is_item_positive_quote.
+        ("bucket", "Concurso 01/2026"),
         ("stability", "fim"),
     ):
         start = text.index(quote)
@@ -196,11 +198,15 @@ def _combined_output(*, bucket_quotes: tuple[str, ...], decision: str = "indice_
 
 def test_combined_decision_rejects_single_bucket_citation() -> None:
     """Hueco FP real: 'indice_oficial_combinado' con UNA sola cita bucket solo
-    prueba un tipo, no la combinacion de ambos. Cardinalidad, no semantica."""
+    prueba un tipo, no la combinacion de ambos. Cardinalidad, no semantica.
+    La cita es item-positiva (R-T1 iteracion 2) para aislar el requisito de
+    cardinalidad del requisito de evidencia-de-item probado aparte."""
     with pytest.raises(
         AgentOutputRejected, match="combined_requires_two_distinct_bucket_citations"
     ):
-        certifier._certifier_invariants(_combined_output(bucket_quotes=("😀",)))
+        certifier._certifier_invariants(
+            _combined_output(bucket_quotes=("Concurso 01/2026",))
+        )
 
 
 def test_combined_decision_rejects_two_identical_bucket_citations() -> None:
@@ -209,14 +215,15 @@ def test_combined_decision_rejects_two_identical_bucket_citations() -> None:
         AgentOutputRejected, match="combined_requires_two_distinct_bucket_citations"
     ):
         certifier._certifier_invariants(
-            _combined_output(bucket_quotes=("😀", "😀"))
+            _combined_output(bucket_quotes=("Concurso 01/2026", "Concurso 01/2026"))
         )
 
 
 def test_combined_decision_accepts_two_distinct_bucket_citations() -> None:
-    """Dos citas bucket textualmente distintas satisfacen el requisito."""
+    """Dos citas bucket textualmente distintas y ambas item-positivas
+    satisfacen el requisito."""
     certifier._certifier_invariants(
-        _combined_output(bucket_quotes=("😀", "ASCII"))
+        _combined_output(bucket_quotes=("Concurso 01/2026", "Processo Seletivo 02/2026"))
     )  # no debe levantar
 
 
