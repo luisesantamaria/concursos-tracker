@@ -23,7 +23,9 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
+import signal
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -68,6 +70,8 @@ OUTPUT_COLUMNS = (
     "item_markers",
     "http_status",
 )
+PROVIDERS = ("gemini_free_1", "gemini_free_2", "gemini_paid")
+UNIT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -113,9 +117,32 @@ class GroundedClient(Protocol):
 class ExplicitProRejection(RuntimeError):
     """The API explicitly rejected gemini-2.5-pro for this request."""
 
-    def __init__(self, exact_error: str) -> None:
+    def __init__(self, exact_error: str, provider: str = "") -> None:
         self.exact_error = exact_error
+        self.provider = provider
         super().__init__(exact_error)
+
+
+class RescueInterrupted(RuntimeError):
+    """Cooperative stop used by SIGINT/SIGTERM handling."""
+
+
+@dataclass
+class InterruptionState:
+    requested: bool = False
+    signal_name: str = ""
+
+    def handle(self, signum: int, _frame: Any) -> None:
+        self.requested = True
+        try:
+            self.signal_name = signal.Signals(signum).name
+        except ValueError:
+            self.signal_name = str(signum)
+        raise RescueInterrupted("interrupted")
+
+    def raise_if_requested(self) -> None:
+        if self.requested:
+            raise RescueInterrupted("interrupted")
 
 
 def _safe_error(exc: BaseException, secret_values: Sequence[str]) -> str:
@@ -222,6 +249,8 @@ class GeminiGroundedClient:
                 contents=prompt,
                 config=self._config(),
             )
+        except RescueInterrupted:
+            raise
         except BaseException as exc:
             self._errors[provider] += 1
             if classify_error(exc).category is ErrorCategory.QUOTA_429:
@@ -245,9 +274,13 @@ class GeminiGroundedClient:
         for attempt, provider in enumerate(free_steps, start=1):
             try:
                 return self._invoke(provider, model, prompt), provider, events
+            except RescueInterrupted:
+                raise
             except BaseException as exc:
                 if _is_explicit_model_rejection(exc, model):
-                    raise ExplicitProRejection(_safe_error(exc, self._secret_values())) from exc
+                    raise ExplicitProRejection(
+                        _safe_error(exc, self._secret_values()), provider
+                    ) from exc
                 classified = classify_error(exc)
                 if not classified.fallback_eligible:
                     raise
@@ -272,9 +305,13 @@ class GeminiGroundedClient:
         self._fallback_events.append(dict(event))
         try:
             return self._invoke("gemini_paid", model, prompt), "gemini_paid", events
+        except RescueInterrupted:
+            raise
         except BaseException as exc:
             if _is_explicit_model_rejection(exc, model):
-                raise ExplicitProRejection(_safe_error(exc, self._secret_values())) from exc
+                raise ExplicitProRejection(
+                    _safe_error(exc, self._secret_values()), "gemini_paid"
+                ) from exc
             raise
 
     def search(self, query: str, *, model: str, municipio: str, bucket: str) -> GroundedAnswer:
@@ -293,6 +330,8 @@ class GeminiGroundedClient:
             if model != REQUIRED_MODEL:
                 raise
             fallbacks.append({
+                "from_provider": exc.provider or "unknown",
+                "to_provider": exc.provider or "unknown",
                 "from_model": REQUIRED_MODEL,
                 "to_model": FALLBACK_MODEL,
                 "cause": "explicit_pro_rejection",
@@ -302,8 +341,12 @@ class GeminiGroundedClient:
             try:
                 response, provider, key_fallbacks = self._key_policy_call(actual_model, prompt)
                 fallbacks.extend(key_fallbacks)
+            except RescueInterrupted:
+                raise
             except BaseException as fallback_exc:
                 raise RuntimeError(_safe_error(fallback_exc, self._secret_values())) from fallback_exc
+        except RescueInterrupted:
+            raise
         except BaseException as exc:
             raise RuntimeError(_safe_error(exc, self._secret_values())) from exc
         urls, snippets = extract_grounding_metadata(response)
@@ -458,6 +501,103 @@ def read_targets(path: Path) -> list[Target]:
     return targets
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _unit_path(output_dir: Path, target: Target) -> Path:
+    safe_municipio = re.sub(r"[^a-zA-Z0-9_-]+", "_", target.municipio).strip("_")
+    safe_bucket = re.sub(r"[^a-zA-Z0-9_-]+", "_", target.bucket).strip("_")
+    return Path(output_dir) / f"unidad_{safe_municipio}_{safe_bucket}.json"
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Durably replace a JSON artifact, never exposing a partial final file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _cleanup_tmp_files(output_dir: Path) -> None:
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return
+    for path in output_dir.glob("*.tmp"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _provider_snapshot(client: GroundedClient) -> dict[str, Any]:
+    telemetry = dict(getattr(client, "telemetry", {}) or {})
+    providers = telemetry.get("providers", {}) or {}
+    normalized: dict[str, dict[str, int]] = {}
+    for provider in PROVIDERS:
+        raw = providers.get(provider, {}) or {}
+        normalized[provider] = {
+            field: int(raw.get(field, 0) or 0)
+            for field in ("calls", "errors", "responses", "tokens", "quota_rate")
+        }
+    return {
+        "providers": normalized,
+        "fallback_events": list(telemetry.get("fallback_events", ()) or ()),
+    }
+
+
+def _unit_telemetry(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    fallbacks: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    providers: dict[str, dict[str, int]] = {}
+    for provider in PROVIDERS:
+        providers[provider] = {}
+        for field in ("calls", "errors", "responses", "tokens", "quota_rate"):
+            start = int(before.get("providers", {}).get(provider, {}).get(field, 0))
+            end = int(after.get("providers", {}).get(provider, {}).get(field, 0))
+            providers[provider][field] = max(0, end - start)
+    clean_fallbacks = [dict(event) for event in fallbacks]
+    before_events = list(before.get("fallback_events", ()) or ())
+    after_events = list(after.get("fallback_events", ()) or ())
+    for event in after_events[len(before_events):]:
+        normalized = dict(event)
+        if normalized not in clean_fallbacks:
+            clean_fallbacks.append(normalized)
+    return {
+        "providers": providers,
+        "fallbacks": clean_fallbacks,
+        "paid_calls": providers["gemini_paid"]["calls"],
+    }
+
+
+def _candidate_from_dict(value: Mapping[str, Any]) -> CandidateRow:
+    return CandidateRow(**{name: value[name] for name in OUTPUT_COLUMNS})
+
+
+def _read_unit_files(output_dir: Path) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for path in sorted(Path(output_dir).glob("unidad_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema_version") == UNIT_SCHEMA_VERSION
+            and payload.get("estado") in {"completed", "failed"}
+        ):
+            payloads.append(payload)
+    return payloads
+
+
 def _snippet(answer: GroundedAnswer) -> str:
     source = " | ".join(answer.grounding_snippets) or answer.text
     return re.sub(r"\s+", " ", source).strip()[:SNIPPET_LIMIT]
@@ -527,6 +667,8 @@ def micro_acquire_unit(
                 _, snapshot_text = extract_title_and_text(fetched.html)
                 status = fetched.status_code
                 trigger = "fetch+render_page_networkidle_sin_resultado"
+        except RescueInterrupted:
+            raise
         except BaseException as exc:
             trigger = "fetch_error"
             error = type(exc).__name__
@@ -550,6 +692,7 @@ def micro_acquire_unit(
         "snapshot_recortado": snapshot_text[:SNAPSHOT_LIMIT],
         "citas_candidatas": quotes,
         "veredicto_gate": gate,
+        "http_status": status,
         "timestamp": timestamp_run,
     }
     if error:
@@ -557,7 +700,7 @@ def micro_acquire_unit(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"micro_{target.municipio}_{target.bucket}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write_json(path, payload)
     return payload
 
 
@@ -632,20 +775,58 @@ def run_rescue(
     sleep_seconds: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
     fetch_timeout: int = 30,
+    output_dir: Path | None = None,
+    resume: bool = False,
+    skip_existing: bool = False,
+    micro_acquire: bool = False,
+    renderer: Callable[[str], Any] = render_page_networkidle,
+    interruption: InterruptionState | None = None,
+    timestamp_factory: Callable[[], str] = _utc_timestamp,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
     if model != REQUIRED_MODEL:
         raise ValueError(f"model_debe_ser_{REQUIRED_MODEL}")
     if not 1 <= max_searches <= MAX_POLICY_SEARCHES:
         raise ValueError("max_searches_debe_estar_entre_1_y_5")
-    candidates: list[CandidateRow] = []
-    units: dict[str, Any] = {}
-    total_errors = 0
+    policy = {
+        "grounding_tool": "google_search",
+        "retrieval": False,
+        "map_grounding": False,
+        "max_searches_per_unit": max_searches,
+        "confirmation_performed": False,
+        "writes_url_map": False,
+        "micro_acquire": micro_acquire,
+    }
+    output_path = Path(output_dir) if output_dir is not None else None
+    if output_path is not None:
+        output_path.mkdir(parents=True, exist_ok=True)
+        _cleanup_tmp_files(output_path)
+    should_resume = resume or skip_existing
+    payloads: list[dict[str, Any]] = []
+    skipped_existing = 0
+    stop_after_current = False
     for target in targets:
         key = f"{target.municipio}/{target.bucket}"
-        unit = {
+        path = _unit_path(output_path, target) if output_path is not None else None
+        if should_resume and path is not None and path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            if (
+                existing.get("schema_version") == UNIT_SCHEMA_VERSION
+                and existing.get("municipio") == target.municipio
+                and existing.get("bucket") == target.bucket
+                and existing.get("estado") == "completed"
+            ):
+                skipped_existing += 1
+                continue
+        before = _provider_snapshot(client)
+        unit_candidates: list[CandidateRow] = []
+        grounded: dict[str, Any] = {
             "sub_causa": target.sub_causa,
             "busquedas_usadas": 0,
-            "candidatas": 0,
+            "candidatas": [],
+            "queries": [],
             "modelo_real_usado": [],
             "proveedores_que_respondieron": [],
             "fallbacks": [],
@@ -657,128 +838,312 @@ def run_rescue(
         seen: set[str] = set()
         fetched: set[str] = set()
         queries = build_queries(target)[:max_searches]
-        for index, query in enumerate(queries):
-            unit["busquedas_usadas"] += 1
-            try:
-                answer = client.search(query, model=model, municipio=target.municipio, bucket=target.bucket)
-            except BaseException as exc:
-                total_errors += 1
-                unit["errores"].append({"query": query, "type": type(exc).__name__, "message": str(exc)[:500]})
+        micro_result: dict[str, Any] | None = None
+        estado = "completed"
+        causa: str | None = None
+        try:
+            for index, query in enumerate(queries):
+                if interruption is not None:
+                    interruption.raise_if_requested()
+                grounded["busquedas_usadas"] += 1
+                query_result: dict[str, Any] = {"query": query}
+                try:
+                    answer = client.search(
+                        query,
+                        model=model,
+                        municipio=target.municipio,
+                        bucket=target.bucket,
+                    )
+                except RescueInterrupted:
+                    raise
+                except BaseException as exc:
+                    error = {"query": query, "type": type(exc).__name__}
+                    grounded["errores"].append(error)
+                    query_result["error"] = dict(error)
+                    grounded["queries"].append(query_result)
+                    if index + 1 < len(queries) and sleep_seconds:
+                        sleep(sleep_seconds)
+                    continue
+                query_result.update({
+                    "answer_text": answer.text,
+                    "grounding_urls": list(answer.grounding_urls),
+                    "grounding_snippets": list(answer.grounding_snippets),
+                    "model": answer.model,
+                    "provider": answer.provider,
+                    "fallbacks": [dict(item) for item in answer.fallbacks],
+                })
+                grounded["queries"].append(query_result)
+                if answer.model not in grounded["modelo_real_usado"]:
+                    grounded["modelo_real_usado"].append(answer.model)
+                if answer.provider and answer.provider not in grounded["proveedores_que_respondieron"]:
+                    grounded["proveedores_que_respondieron"].append(answer.provider)
+                grounded["fallbacks"].extend(answer.fallbacks)
+                snippet = _snippet(answer)
+                for url in extract_answer_urls(answer):
+                    normalized = url.casefold()
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    grounding_redirect = _is_google_grounding_redirect(url)
+                    allowed, reason = official_host_check(target.municipio, url)
+                    if not allowed and not grounding_redirect:
+                        grounded["descartadas"].append({"url": url, "razon": reason})
+                        continue
+                    if normalized in fetched:
+                        continue
+                    fetched.add(normalized)
+                    status = ""
+                    markers = 0
+                    positive_quotes: list[str] = []
+                    candidate_url = url
+                    try:
+                        result = fetcher.get(url, fetch_timeout)
+                        status = str(result.status_code)
+                        candidate_url = _clean_url(result.final_url or url) or url
+                        final_allowed, final_reason = official_host_check(target.municipio, candidate_url)
+                        if not final_allowed:
+                            grounded["descartadas"].append({
+                                "url": candidate_url,
+                                "razon": "redirect_final_no_oficial" if grounding_redirect else final_reason,
+                            })
+                            continue
+                        reason = (
+                            f"google_grounding_redirect->{final_reason}"
+                            if grounding_redirect
+                            else final_reason
+                        )
+                        _, visible_text = extract_title_and_text(result.html)
+                        markers = _count_item_markers(_norm(visible_text))
+                        positive_quotes = _candidate_item_positive_quotes(visible_text, target.bucket)
+                    except RescueInterrupted:
+                        raise
+                    except BaseException as exc:
+                        grounded["errores"].append({
+                            "query": query,
+                            "type": type(exc).__name__,
+                            "stage": "fetch",
+                        })
+                        status = f"error:{type(exc).__name__}"
+                        if grounding_redirect:
+                            grounded["descartadas"].append({
+                                "url": url,
+                                "razon": "grounding_redirect_fetch_error",
+                            })
+                            continue
+                    final_normalized = candidate_url.casefold()
+                    if final_normalized != normalized and final_normalized in seen:
+                        continue
+                    seen.add(final_normalized)
+                    if target.sub_causa == "render_incierto" and not positive_quotes:
+                        grounded["micro_pendientes"].append({
+                            "url": candidate_url,
+                            "query": query,
+                            "snippet": snippet,
+                            "host_oficial_check": reason,
+                        })
+                        continue
+                    unit_candidates.append(CandidateRow(
+                        municipio=target.municipio,
+                        bucket=target.bucket,
+                        url_candidata=candidate_url,
+                        query_usada=query,
+                        snippet_grounding=snippet,
+                        host_oficial_check=reason,
+                        item_markers=markers,
+                        http_status=status,
+                    ))
                 if index + 1 < len(queries) and sleep_seconds:
                     sleep(sleep_seconds)
-                continue
-            if answer.model not in unit["modelo_real_usado"]:
-                unit["modelo_real_usado"].append(answer.model)
-            if answer.provider and answer.provider not in unit["proveedores_que_respondieron"]:
-                unit["proveedores_que_respondieron"].append(answer.provider)
-            unit["fallbacks"].extend(answer.fallbacks)
-            snippet = _snippet(answer)
-            for url in extract_answer_urls(answer):
-                normalized = url.casefold()
-                if normalized in seen:
-                    continue
-                seen.add(normalized)
-                grounding_redirect = _is_google_grounding_redirect(url)
-                allowed, reason = official_host_check(target.municipio, url)
-                if not allowed and not grounding_redirect:
-                    unit["descartadas"].append({"url": url, "razon": reason})
-                    continue
-                if normalized in fetched:
-                    continue
-                fetched.add(normalized)
-                status = ""
-                markers = 0
-                positive_quotes: list[str] = []
-                candidate_url = url
-                try:
-                    result = fetcher.get(url, fetch_timeout)
-                    status = str(result.status_code)
-                    candidate_url = _clean_url(result.final_url or url) or url
-                    final_allowed, final_reason = official_host_check(target.municipio, candidate_url)
-                    if not final_allowed:
-                        unit["descartadas"].append({
-                            "url": candidate_url,
-                            "razon": "redirect_final_no_oficial" if grounding_redirect else final_reason,
-                        })
-                        continue
-                    reason = (
-                        f"google_grounding_redirect->{final_reason}"
-                        if grounding_redirect
-                        else final_reason
-                    )
-                    _, visible_text = extract_title_and_text(result.html)
-                    markers = _count_item_markers(_norm(visible_text))
-                    positive_quotes = _candidate_item_positive_quotes(visible_text, target.bucket)
-                except BaseException as exc:
-                    total_errors += 1
-                    status = f"error:{type(exc).__name__}"
-                    if grounding_redirect:
-                        unit["descartadas"].append({
-                            "url": url,
-                            "razon": "grounding_redirect_fetch_error",
-                        })
-                        continue
-                final_normalized = candidate_url.casefold()
-                if final_normalized != normalized and final_normalized in seen:
-                    continue
-                seen.add(final_normalized)
-                if target.sub_causa == "render_incierto" and not positive_quotes:
-                    unit["micro_pendientes"].append({
-                        "url": candidate_url,
-                        "query": query,
-                        "snippet": snippet,
-                        "host_oficial_check": reason,
-                    })
-                    continue
-                candidates.append(CandidateRow(
-                    municipio=target.municipio,
-                    bucket=target.bucket,
-                    url_candidata=candidate_url,
-                    query_usada=query,
-                    snippet_grounding=snippet,
-                    host_oficial_check=reason,
-                    item_markers=markers,
-                    http_status=status,
-                ))
-            if index + 1 < len(queries) and sleep_seconds:
-                sleep(sleep_seconds)
-        unit["candidatas"] = sum(1 for row in candidates if row.municipio == target.municipio and row.bucket == target.bucket)
-        units[key] = unit
-    telemetry = dict(getattr(client, "telemetry", {}) or {})
-    provider_calls = sum(int(item.get("calls", 0)) for item in telemetry.get("providers", {}).values())
-    summary = {
-        "policy": {
-            "grounding_tool": "google_search",
-            "retrieval": False,
-            "map_grounding": False,
-            "max_searches_per_unit": max_searches,
-            "confirmation_performed": False,
-            "writes_url_map": False,
-        },
+            if grounded["queries"] and all("error" in item for item in grounded["queries"]):
+                estado = "failed"
+                causa = "all_grounded_searches_failed"
+            if micro_acquire and target.sub_causa == "render_incierto" and not unit_candidates:
+                pending = grounded["micro_pendientes"]
+                selected = pending[0] if pending else {
+                    "url": "",
+                    "query": "",
+                    "snippet": "",
+                    "host_oficial_check": "sin_url_candidata_grounded",
+                }
+                if output_path is None:
+                    raise ValueError("micro_acquire_requiere_output_dir")
+                micro_result = micro_acquire_unit(
+                    target,
+                    selected["url"],
+                    output_dir=output_path,
+                    fetcher=fetcher,
+                    timestamp_run=timestamp_factory(),
+                    fetch_timeout=fetch_timeout,
+                    renderer=renderer,
+                )
+                if micro_result["veredicto_gate"]["pasa"]:
+                    unit_candidates.append(CandidateRow(
+                        municipio=target.municipio,
+                        bucket=target.bucket,
+                        url_candidata=micro_result["url_final"],
+                        query_usada=selected["query"],
+                        snippet_grounding=selected["snippet"],
+                        host_oficial_check=micro_result["veredicto_gate"]["razon_autoridad"],
+                        item_markers=len(micro_result["citas_candidatas"]),
+                        http_status="micro_acquire",
+                    ))
+        except RescueInterrupted:
+            estado = "failed"
+            causa = "interrupted"
+            stop_after_current = True
+        except BaseException as exc:
+            estado = "failed"
+            causa = type(exc).__name__
+        grounded["candidatas"] = [row.as_dict() for row in unit_candidates]
+        after = _provider_snapshot(client)
+        payload = {
+            "schema_version": UNIT_SCHEMA_VERSION,
+            "municipio": target.municipio,
+            "bucket": target.bucket,
+            "sub_causa": target.sub_causa,
+            "pista": target.pista,
+            "grounded": grounded,
+            "telemetria": _unit_telemetry(before, after, grounded["fallbacks"]),
+            "microadquisicion": micro_result,
+            "estado": estado,
+            "causa": causa,
+            "timestamp": timestamp_factory(),
+        }
+        if path is not None:
+            try:
+                _atomic_write_json(path, payload)
+            except RescueInterrupted:
+                payload["estado"] = "failed"
+                payload["causa"] = "interrupted"
+                payload["timestamp"] = timestamp_factory()
+                stop_after_current = True
+                _atomic_write_json(path, payload)
+        payloads.append(payload)
+        if stop_after_current:
+            break
+    if output_path is not None:
+        summary = rebuild_summary(output_path, policy=policy, skipped_existing=skipped_existing)
+        candidates = _rows_from_unit_payloads(_read_unit_files(output_path))
+    else:
+        summary = _aggregate_unit_payloads(payloads, policy=policy, skipped_existing=0)
+        candidates = _rows_from_unit_payloads(payloads)
+    return candidates, summary
+
+
+def _rows_from_unit_payloads(payloads: Sequence[Mapping[str, Any]]) -> list[CandidateRow]:
+    rows: list[CandidateRow] = []
+    for payload in payloads:
+        for raw in payload.get("grounded", {}).get("candidatas", ()) or ():
+            rows.append(_candidate_from_dict(raw))
+    return rows
+
+
+def _aggregate_unit_payloads(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    policy: Mapping[str, Any],
+    skipped_existing: int,
+) -> dict[str, Any]:
+    providers = {
+        provider: {field: 0 for field in ("calls", "errors", "responses", "tokens", "quota_rate")}
+        for provider in PROVIDERS
+    }
+    fallback_counters = {provider: Counter() for provider in (*PROVIDERS, "unknown")}
+    units: dict[str, Any] = {}
+    candidates = 0
+    searches = 0
+    for payload in payloads:
+        grounded = dict(payload.get("grounded", {}) or {})
+        key = f'{payload.get("municipio", "")}/{payload.get("bucket", "")}'
+        unit_summary = dict(grounded)
+        unit_summary.update({
+            "estado": payload.get("estado"),
+            "causa": payload.get("causa"),
+            "timestamp": payload.get("timestamp"),
+            "telemetria": payload.get("telemetria", {}),
+            "microadquisicion": payload.get("microadquisicion"),
+        })
+        if payload.get("microadquisicion"):
+            unit_summary["micro_veredicto"] = payload["microadquisicion"].get("veredicto_gate", {})
+        units[key] = unit_summary
+        candidates += len(grounded.get("candidatas", ()) or ())
+        searches += int(grounded.get("busquedas_usadas", 0) or 0)
+        telemetry = payload.get("telemetria", {}) or {}
+        for provider in PROVIDERS:
+            raw = telemetry.get("providers", {}).get(provider, {}) or {}
+            for field in providers[provider]:
+                providers[provider][field] += int(raw.get(field, 0) or 0)
+        for event in telemetry.get("fallbacks", ()) or ():
+            provider = str(event.get("from_provider") or "unknown")
+            if provider not in fallback_counters:
+                provider = "unknown"
+            fallback_counters[provider][str(event.get("cause") or "unknown")] += 1
+    calls_by_provider = {name: values["calls"] for name, values in providers.items()}
+    errors_by_provider = {name: values["errors"] for name, values in providers.items()}
+    tokens_by_provider = {name: values["tokens"] for name, values in providers.items()}
+    fallbacks_by_provider = {
+        name: dict(counter) for name, counter in fallback_counters.items()
+    }
+    return {
+        "policy": dict(policy),
         "unidades": units,
         "global": {
-            "unidades": len(targets),
-            "busquedas_grounded": sum(item["busquedas_usadas"] for item in units.values()),
-            "llamadas": provider_calls,
-            "errores": total_errors,
-            "candidatas": len(candidates),
-            "telemetria": telemetry,
+            "unidades": len(payloads),
+            "completed": sum(payload.get("estado") == "completed" for payload in payloads),
+            "failed": sum(payload.get("estado") == "failed" for payload in payloads),
+            "skipped_existing": skipped_existing,
+            "busquedas_grounded": searches,
+            "candidatas": candidates,
+            "llamadas": sum(calls_by_provider.values()),
+            "errores": sum(errors_by_provider.values()),
+            "calls_by_provider": calls_by_provider,
+            "tokens_by_provider": tokens_by_provider,
+            "errors_by_provider": errors_by_provider,
+            "fallbacks_by_provider": fallbacks_by_provider,
+            "paid_calls": calls_by_provider["gemini_paid"],
+            "telemetria": {
+                "providers": providers,
+                "fallbacks_by_provider": fallbacks_by_provider,
+                "paid_calls": calls_by_provider["gemini_paid"],
+            },
         },
     }
-    return candidates, summary
+
+
+def rebuild_summary(
+    output_dir: Path,
+    *,
+    policy: Mapping[str, Any] | None = None,
+    skipped_existing: int = 0,
+) -> dict[str, Any]:
+    """Rebuild the final summary exclusively from durable unit JSON files."""
+    effective_policy = policy or {
+        "grounding_tool": "google_search",
+        "retrieval": False,
+        "map_grounding": False,
+        "confirmation_performed": False,
+        "writes_url_map": False,
+    }
+    return _aggregate_unit_payloads(
+        _read_unit_files(output_dir),
+        policy=effective_policy,
+        skipped_existing=skipped_existing,
+    )
 
 
 def write_outputs(output_dir: Path, rows: Sequence[CandidateRow], summary: Mapping[str, Any]) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "candidates.csv").open("w", encoding="utf-8", newline="") as handle:
+    csv_path = output_dir / "candidates.csv"
+    csv_tmp = csv_path.with_name(csv_path.name + ".tmp")
+    with csv_tmp.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         writer.writerows(row.as_dict() for row in rows)
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(csv_tmp, csv_path)
+    _atomic_write_json(output_dir / "summary.json", summary)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -790,6 +1155,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-searches", type=int, default=MAX_POLICY_SEARCHES)
     parser.add_argument("--sleep", type=float, default=1.0)
     parser.add_argument("--fetch-timeout", type=int, default=30)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Salta unidades completed ya persistidas; reintenta failed o ausentes.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Alias operativo de --resume; solo salta estado completed.",
+    )
     parser.add_argument(
         "--micro-acquire",
         action="store_true",
@@ -806,29 +1181,42 @@ def main(argv: list[str] | None = None) -> int:
     client = GeminiGroundedClient(credentials)
     targets = read_targets(args.targets)
     fetcher = RequestsFetcher()
-    rows, summary = run_rescue(
-        targets,
-        client=client,
-        fetcher=fetcher,
-        model=args.model,
-        max_searches=args.max_searches,
-        sleep_seconds=args.sleep,
-        fetch_timeout=args.fetch_timeout,
+    interruption = InterruptionState()
+    previous_handlers: dict[signal.Signals, Any] = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, interruption.handle)
+    try:
+        try:
+            rows, summary = run_rescue(
+                targets,
+                client=client,
+                fetcher=fetcher,
+                model=args.model,
+                max_searches=args.max_searches,
+                sleep_seconds=args.sleep,
+                fetch_timeout=args.fetch_timeout,
+                output_dir=args.output_dir,
+                resume=args.resume,
+                skip_existing=args.skip_existing,
+                micro_acquire=args.micro_acquire,
+                interruption=interruption,
+            )
+        except RescueInterrupted:
+            payloads = _read_unit_files(args.output_dir)
+            rows = _rows_from_unit_payloads(payloads)
+            summary = rebuild_summary(args.output_dir)
+        write_outputs(args.output_dir, rows, summary)
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+        _cleanup_tmp_files(args.output_dir)
+    LOGGER.info(
+        "rescate_completo unidades=%s candidatas=%s",
+        summary["global"]["unidades"],
+        len(rows),
     )
-    if args.micro_acquire:
-        timestamp_run = datetime.now(timezone.utc).isoformat()
-        rows = run_micro_acquisitions(
-            targets,
-            rows,
-            summary,
-            output_dir=args.output_dir,
-            fetcher=fetcher,
-            timestamp_run=timestamp_run,
-            fetch_timeout=args.fetch_timeout,
-        )
-    write_outputs(args.output_dir, rows, summary)
-    LOGGER.info("rescate_completo unidades=%s candidatas=%s", summary["global"]["unidades"], len(rows))
-    return 0
+    return 130 if interruption.requested else 0
 
 
 if __name__ == "__main__":

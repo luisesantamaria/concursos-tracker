@@ -7,16 +7,19 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scripts.fase2_municipios.v2.eval.grounded_rescue import (
     FALLBACK_MODEL,
     REQUIRED_MODEL,
     GeminiGroundedClient,
     GroundedAnswer,
+    InterruptionState,
     Target,
     build_queries,
     micro_acquire_unit,
     read_targets,
+    rebuild_summary,
     run_micro_acquisitions,
     run_rescue,
     write_outputs,
@@ -86,6 +89,167 @@ class SequencedClient:
 
 
 class GroundedRescueTests(unittest.TestCase):
+    def test_completed_unit_is_atomically_persisted_with_required_fields(self) -> None:
+        client = FakeGroundedClient([GroundedAnswer(
+            text="https://camaqua.rs.gov.br/concursos",
+            grounding_urls=("https://camaqua.rs.gov.br/concursos",),
+            grounding_snippets=("Concurso Publico 01/2025",),
+            provider="gemini_free_1",
+        )])
+        target = Target("camaqua", "concurso_publico", "pista")
+        import scripts.fase2_municipios.v2.eval.grounded_rescue as module
+
+        real_replace = module.os.replace
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            module.os, "replace", side_effect=real_replace
+        ) as replace:
+            output = Path(directory)
+            run_rescue(
+                [target],
+                client=client,
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+            )
+            unit_path = output / "unidad_camaqua_concurso_publico.json"
+            payload = json.loads(unit_path.read_text(encoding="utf-8"))
+            orphan_tmp = list(output.glob("*.tmp"))
+
+        self.assertTrue(any(
+            Path(call.args[0]).name.endswith(".json.tmp")
+            and Path(call.args[1]).name == "unidad_camaqua_concurso_publico.json"
+            for call in replace.call_args_list
+        ))
+        self.assertEqual({
+            "schema_version", "municipio", "bucket", "sub_causa", "pista",
+            "grounded", "telemetria", "microadquisicion", "estado", "causa",
+            "timestamp",
+        }, set(payload))
+        self.assertEqual("completed", payload["estado"])
+        self.assertIsNone(payload["causa"])
+        self.assertTrue(payload["grounded"]["queries"])
+        self.assertTrue(payload["grounded"]["candidatas"])
+        self.assertIn("grounding_snippets", payload["grounded"]["queries"][0])
+        self.assertEqual([], orphan_tmp)
+
+    def test_resume_skips_completed_and_retries_failed_units(self) -> None:
+        targets = [
+            Target("camaqua", "concurso_publico", "pista"),
+            Target("camaqua", "processo_seletivo", "pista"),
+        ]
+        answer = GroundedAnswer(
+            text="https://camaqua.rs.gov.br/concursos",
+            provider="gemini_free_1",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            run_rescue(
+                targets,
+                client=FakeGroundedClient([answer]),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+            )
+            failed_path = output / "unidad_camaqua_processo_seletivo.json"
+            failed = json.loads(failed_path.read_text(encoding="utf-8"))
+            failed["estado"] = "failed"
+            failed["causa"] = "simulated_failure"
+            failed_path.write_text(json.dumps(failed), encoding="utf-8")
+
+            resumed_client = FakeGroundedClient([answer])
+            _, summary = run_rescue(
+                targets,
+                client=resumed_client,
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+                resume=True,
+            )
+
+            retried = json.loads(failed_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(resumed_client.calls))
+        self.assertEqual(1, summary["global"]["skipped_existing"])
+        self.assertEqual("completed", retried["estado"])
+
+    def test_summary_is_rebuilt_only_from_unit_files_on_disk(self) -> None:
+        answer = GroundedAnswer(
+            text="https://camaqua.rs.gov.br/concursos",
+            provider="gemini_free_1",
+        )
+        client = FakeGroundedClient([answer])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            run_rescue(
+                [Target("camaqua", "concurso_publico", "pista")],
+                client=client,
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+            )
+            client.telemetry["providers"]["gemini_free_1"]["calls"] = 999
+            summary = rebuild_summary(output)
+        self.assertEqual(1, summary["global"]["calls_by_provider"]["gemini_free_1"])
+        self.assertEqual(1, summary["global"]["unidades"])
+        self.assertEqual(0, summary["global"]["paid_calls"])
+
+    def test_simulated_interruption_persists_failed_unit_without_orphan_tmp(self) -> None:
+        interruption = InterruptionState(requested=True, signal_name="SIGTERM")
+        client = FakeGroundedClient([GroundedAnswer(text="")])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _, summary = run_rescue(
+                [Target("camaqua", "concurso_publico", "pista")],
+                client=client,
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+                interruption=interruption,
+            )
+            payload = json.loads(
+                (output / "unidad_camaqua_concurso_publico.json").read_text(encoding="utf-8")
+            )
+            orphan_tmp = list(output.glob("*.tmp"))
+        self.assertEqual("failed", payload["estado"])
+        self.assertEqual("interrupted", payload["causa"])
+        self.assertEqual(1, summary["global"]["failed"])
+        self.assertEqual([], orphan_tmp)
+
+    def test_unit_telemetry_contains_every_provider_and_fallback_cause(self) -> None:
+        answer = GroundedAnswer(
+            text="",
+            provider="gemini_free_1",
+            fallbacks=({
+                "from_provider": "gemini_free_1",
+                "to_provider": "gemini_free_2",
+                "cause": "quota_429",
+            },),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            run_rescue(
+                [Target("camaqua", "concurso_publico", "pista")],
+                client=FakeGroundedClient([answer]),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+            )
+            payload = json.loads(
+                (output / "unidad_camaqua_concurso_publico.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(
+            {"gemini_free_1", "gemini_free_2", "gemini_paid"},
+            set(payload["telemetria"]["providers"]),
+        )
+        self.assertEqual(1, payload["telemetria"]["providers"]["gemini_free_1"]["calls"])
+        self.assertEqual(0, payload["telemetria"]["paid_calls"])
+        self.assertEqual("quota_429", payload["telemetria"]["fallbacks"][0]["cause"])
+
     def test_correction31_csv_parses_31_targets_with_sub_causa(self) -> None:
         repo = Path(__file__).resolve().parents[5]
         path = repo / "staging/fase2_v2/eval/misiones_20260713/rescate_targets.csv"
@@ -169,7 +333,7 @@ class GroundedRescueTests(unittest.TestCase):
             self.assertEqual({
                 "url_inicial", "url_final", "trigger",
                 "snapshot_recortado", "citas_candidatas",
-                "veredicto_gate", "timestamp",
+                "veredicto_gate", "http_status", "timestamp",
             }, set(durable))
             self.assertTrue(durable["citas_candidatas"])
             self.assertTrue(durable["veredicto_gate"]["pasa"])
