@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from scripts.fase2_municipios.v2.eval.grounded_rescue import (
     FALLBACK_MODEL,
+    PAID_AUTHORIZATION,
     REQUIRED_MODEL,
     DailyQuotaExhausted,
     GeminiGroundedClient,
@@ -22,10 +23,12 @@ from scripts.fase2_municipios.v2.eval.grounded_rescue import (
     Target,
     _clean_url,
     _new_redirect_session,
+    _parser,
     build_queries,
     dispatch_f3_adapter,
     extract_answer_url_sources,
     load_grounded_credentials,
+    main,
     micro_acquire_unit,
     read_targets,
     rebuild_summary,
@@ -1232,6 +1235,14 @@ class GroundedRescueTests(unittest.TestCase):
         self.assertEqual(original, rows[0].url_candidata)
 
     def test_free_only_run_never_constructs_or_calls_paid_client(self) -> None:
+        args = _parser().parse_args([
+            "--targets", "targets.csv",
+            "--output-dir", "output",
+            "--credentials-file", "credentials.env",
+            "--free-only",
+        ])
+        self.assertTrue(args.free_only)
+        self.assertFalse(args.paid_authorized)
         log: list[tuple] = []
         clients = {
             "FREE": SequencedClient(
@@ -1267,6 +1278,78 @@ class GroundedRescueTests(unittest.TestCase):
         self.assertEqual(0, client.telemetry["paid_calls"])
         self.assertEqual(0, summary["global"]["paid_calls"])
         self.assertEqual(["free", "free2"], [item[0] for item in log])
+
+    def test_cli_without_authorization_flag_preserves_policy_failure(self) -> None:
+        with self.assertRaisesRegex(
+            PolicyFailure,
+            r"^FALLO_DE_POLITICA:rescate_cli_requiere_--free-only$",
+        ):
+            main([
+                "--targets", "targets.csv",
+                "--output-dir", "output",
+                "--credentials-file", "credentials.env",
+            ])
+
+    def test_cli_authorization_flags_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            _parser().parse_args([
+                "--targets", "targets.csv",
+                "--output-dir", "output",
+                "--credentials-file", "credentials.env",
+                "--free-only",
+                "--paid-authorized",
+            ])
+        self.assertEqual(2, raised.exception.code)
+
+    def test_paid_authorized_reaches_paid_after_both_free_tiers_429(self) -> None:
+        args = _parser().parse_args([
+            "--targets", "targets.csv",
+            "--output-dir", "output",
+            "--credentials-file", "credentials.env",
+            "--paid-authorized",
+        ])
+        self.assertFalse(args.free_only)
+        self.assertTrue(args.paid_authorized)
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient("free", [HttpError(429, "minute quota")], log),
+            "FREE2": SequencedClient("free2", [HttpError(429, "minute quota")], log),
+            "PAID": SequencedClient("paid", [sdk_response()], log),
+        }
+        client = GeminiGroundedClient(
+            {
+                "GEMINI_API_KEY_FREE": "FREE",
+                "GEMINI_API_KEY_FREE_2": "FREE2",
+                "GEMINI_API_KEY": "PAID",
+            },
+            client_factory=lambda *, api_key, vertexai: clients[api_key],
+            free_only=args.free_only,
+            max_free2_attempts=1,
+            sleep=lambda _: None,
+        )
+        _, summary = run_rescue(
+            [Target("camaqua", "concurso_publico", "pista")],
+            client=client,
+            fetcher=FakeFetcher(),
+            max_searches=1,
+            sleep_seconds=0,
+            free_only=args.free_only,
+            paid_authorization=(PAID_AUTHORIZATION if args.paid_authorized else None),
+        )
+        self.assertEqual(["free", "free2", "paid"], [item[0] for item in log])
+        self.assertEqual(PAID_AUTHORIZATION, summary["policy"]["paid_authorization"])
+        self.assertEqual(1, summary["global"]["paid_calls"])
+        self.assertEqual(1, summary["global"]["telemetria"]["providers"]["gemini_paid"]["calls"])
+
+    def test_global_call_budget_cli_accepts_value_above_default(self) -> None:
+        args = _parser().parse_args([
+            "--targets", "targets.csv",
+            "--output-dir", "output",
+            "--credentials-file", "credentials.env",
+            "--free-only",
+            "--global-call-budget", "250",
+        ])
+        self.assertEqual(250, args.global_call_budget)
 
     def test_free_only_credential_loader_does_not_require_or_return_paid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

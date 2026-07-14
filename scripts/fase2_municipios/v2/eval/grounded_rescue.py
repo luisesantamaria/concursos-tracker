@@ -102,6 +102,7 @@ OUTPUT_COLUMNS = (
     "provenance",
 )
 PROVIDERS = ("gemini_free_1", "gemini_free_2", "gemini_paid")
+PAID_AUTHORIZATION = "explicita_luis_20260714"
 TELEMETRY_COUNTERS = (
     "model_requests", "successful_model_responses", "google_search_queries",
     "query_count_unknown", "grounded_responses", "quota_429", "paid_calls",
@@ -1935,6 +1936,7 @@ def run_rescue(
     interruption: InterruptionState | None = None,
     timestamp_factory: Callable[[], str] = _utc_timestamp,
     free_only: bool = False,
+    paid_authorization: str | None = None,
     adapter_context_provider: Callable[[Target, str], Mapping[str, Any]] | None = None,
     adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
@@ -1953,6 +1955,8 @@ def run_rescue(
         "free_only": free_only,
         "provider_sequence": "FREE1->FREE2->STOP" if free_only else "FREE1->FREE2->PAID",
     }
+    if paid_authorization is not None:
+        policy["paid_authorization"] = paid_authorization
     if free_only and _provider_snapshot(client)["paid_calls"] != 0:
         raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_before_run")
     output_path = Path(output_dir) if output_dir is not None else None
@@ -2459,9 +2463,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-searches", type=int, default=MAX_POLICY_SEARCHES)
     parser.add_argument("--sleep", type=float, default=1.0)
     parser.add_argument("--fetch-timeout", type=int, default=30)
-    parser.add_argument(
+    authorization = parser.add_mutually_exclusive_group()
+    authorization.add_argument(
         "--free-only", action="store_true",
         help="Secuencia estructural FREE1 -> FREE2 -> STOP; obligatoria para rescate/evaluacion.",
+    )
+    authorization.add_argument(
+        "--paid-authorized", action="store_true",
+        help=(
+            "Autorizacion explicita de Luis (2026-07-14): habilita "
+            "FREE1 -> FREE2 -> PAID."
+        ),
     )
     parser.add_argument(
         "--global-call-budget", type=int,
@@ -2497,14 +2509,15 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.sleep < 0 or args.fetch_timeout < 1:
         raise ValueError("sleep/fetch-timeout invalidos")
-    if not args.free_only:
+    if not args.free_only and not args.paid_authorized:
         raise PolicyFailure("FALLO_DE_POLITICA:rescate_cli_requiere_--free-only")
     if args.global_call_budget < 1 or args.daily_model_limit < 1 or args.daily_search_limit < 1:
         raise ValueError("limites_de_cuota_invalidos")
-    credentials = load_grounded_credentials(args.credentials_file, free_only=True)
+    free_only = args.free_only
+    credentials = load_grounded_credentials(args.credentials_file, free_only=free_only)
     client = GeminiGroundedClient(
         credentials,
-        free_only=True,
+        free_only=free_only,
         global_call_budget=args.global_call_budget,
         daily_model_limit=args.daily_model_limit,
         daily_search_limit=args.daily_search_limit,
@@ -2531,12 +2544,27 @@ def main(argv: list[str] | None = None) -> int:
                 skip_existing=args.skip_existing,
                 micro_acquire=args.micro_acquire,
                 interruption=interruption,
-                free_only=True,
+                free_only=free_only,
+                paid_authorization=(PAID_AUTHORIZATION if args.paid_authorized else None),
             )
         except RescueInterrupted:
             payloads = _read_unit_files(args.output_dir)
             rows = _rows_from_unit_payloads(payloads)
-            summary = rebuild_summary(args.output_dir)
+            summary = rebuild_summary(args.output_dir, policy={
+                "grounding_tool": "google_search",
+                "retrieval": False,
+                "map_grounding": False,
+                "confirmation_performed": False,
+                "writes_url_map": False,
+                "free_only": free_only,
+                "provider_sequence": (
+                    "FREE1->FREE2->STOP" if free_only else "FREE1->FREE2->PAID"
+                ),
+                **(
+                    {"paid_authorization": PAID_AUTHORIZATION}
+                    if args.paid_authorized else {}
+                ),
+            })
         write_outputs(args.output_dir, rows, summary)
     finally:
         for signum, previous in previous_handlers.items():
