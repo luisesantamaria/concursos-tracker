@@ -29,6 +29,7 @@ MAX_ADDITIONAL_PAGES = 3
 MAX_DEPTH = 2
 MAX_INTERACTIONS = 5
 MAX_SNAPSHOT_BYTES = 50 * 1024
+MANIFEST_FIELDNAMES = ["municipio", "bucket", "site_base"]
 
 NAVIGATION_TERMS = (
     "concursos",
@@ -683,16 +684,15 @@ def load_inputs(
     gate_path: Path,
     equivalencias_path: Path,
 ) -> tuple[list[Unit], dict[str, str]]:
-    gate_text = files.read_text(gate_path)
-    equivalencias_text = files.read_text(equivalencias_path)
-    if not gate_text.strip() or not equivalencias_text.strip():
-        raise ValueError("gate and equivalencias must be non-empty UTF-8 documents")
-
+    # Keep this as the first structural check: a contaminated manifest must be
+    # rejected before other inputs are interpreted or Playwright is imported.
     with files.open(manifest_path, "r") as handle:
         reader = csv.DictReader(handle)
-        required = {"municipio", "bucket", "site_base"}
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-            raise ValueError("manifest must contain municipio,bucket,site_base columns")
+        if reader.fieldnames != MANIFEST_FIELDNAMES:
+            raise BlindAccessViolation(
+                "invalid manifest columns: "
+                f"expected {MANIFEST_FIELDNAMES!r}, found {reader.fieldnames!r}"
+            )
         units = [
             Unit(
                 municipio=(row.get("municipio") or "").strip(),
@@ -701,6 +701,11 @@ def load_inputs(
             )
             for row in reader
         ]
+
+    gate_text = files.read_text(gate_path)
+    equivalencias_text = files.read_text(equivalencias_path)
+    if not gate_text.strip() or not equivalencias_text.strip():
+        raise ValueError("gate and equivalencias must be non-empty UTF-8 documents")
 
     if not units:
         raise ValueError("manifest contains no units")

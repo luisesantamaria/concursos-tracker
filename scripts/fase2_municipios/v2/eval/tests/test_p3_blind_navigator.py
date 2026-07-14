@@ -7,12 +7,146 @@ request and do not require a browser process.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
+import sys
+import tempfile
+import types
 from pathlib import Path
 
 import pytest
 
 from scripts.fase2_municipios.v2.eval import p3_blind_navigator as runner
+
+
+class FailOnCall:
+    """Explosive stub proving invalid manifests never reach a side effect."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.calls = 0
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        self.calls += 1
+        raise AssertionError(f"{self.label} must not be called")
+
+
+def _assert_manifest_header_rejected_without_navigation(header: list[str]) -> None:
+    """Run the real entry flow with explosive Playwright/navigation stubs."""
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        manifest = root / "manifest.csv"
+        gate = root / "gate.md"
+        equivalencias = root / "equivalencias.md"
+        manifest.write_text(
+            ",".join(header) + "\n" + ",".join("value" for _ in header) + "\n",
+            encoding="utf-8",
+        )
+        gate.write_text("gate", encoding="utf-8")
+        equivalencias.write_text("equivalencias", encoding="utf-8")
+
+        playwright_call = FailOnCall("Playwright")
+        navigation_call = FailOnCall("navigation")
+        fake_playwright = types.ModuleType("playwright")
+        fake_async_api = types.ModuleType("playwright.async_api")
+        fake_async_api.async_playwright = playwright_call  # type: ignore[attr-defined]
+        fake_playwright.async_api = fake_async_api  # type: ignore[attr-defined]
+        previous_playwright = sys.modules.get("playwright")
+        previous_async_api = sys.modules.get("playwright.async_api")
+        previous_navigate_unit = runner.navigate_unit
+        sys.modules["playwright"] = fake_playwright
+        sys.modules["playwright.async_api"] = fake_async_api
+        runner.navigate_unit = navigation_call  # type: ignore[assignment]
+        args = argparse.Namespace(
+            manifest=str(manifest),
+            gate=str(gate),
+            equivalencias=str(equivalencias),
+            output_dir=str(root / "output"),
+        )
+        try:
+            try:
+                asyncio.run(runner.run(args))
+            except runner.BlindAccessViolation as exc:
+                message = str(exc)
+                assert repr(runner.MANIFEST_FIELDNAMES) in message
+                assert repr(header) in message
+            else:
+                raise AssertionError(f"manifest header unexpectedly accepted: {header!r}")
+        finally:
+            runner.navigate_unit = previous_navigate_unit
+            if previous_playwright is None:
+                sys.modules.pop("playwright", None)
+            else:
+                sys.modules["playwright"] = previous_playwright
+            if previous_async_api is None:
+                sys.modules.pop("playwright.async_api", None)
+            else:
+                sys.modules["playwright.async_api"] = previous_async_api
+
+        assert playwright_call.calls == 0
+        assert navigation_call.calls == 0
+
+
+def test_manifest_rejects_url_confirmada_column_without_navigation() -> None:
+    _assert_manifest_header_rejected_without_navigation(
+        ["municipio", "bucket", "site_base", "url_confirmada"]
+    )
+
+
+def test_manifest_rejects_other_extra_column_without_navigation() -> None:
+    _assert_manifest_header_rejected_without_navigation(
+        ["municipio", "bucket", "site_base", "fuente"]
+    )
+
+
+def test_manifest_rejects_reordered_columns_without_navigation() -> None:
+    _assert_manifest_header_rejected_without_navigation(
+        ["bucket", "municipio", "site_base"]
+    )
+
+
+def test_manifest_accepts_exact_columns_in_exact_order() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        manifest = root / "manifest.csv"
+        gate = root / "gate.md"
+        equivalencias = root / "equivalencias.md"
+        output = root / "output"
+        manifest.write_text(
+            "municipio,bucket,site_base\n"
+            "Municipio Teste,concurso_publico,https://prefeitura.test/\n",
+            encoding="utf-8",
+        )
+        gate.write_text("gate", encoding="utf-8")
+        equivalencias.write_text("equivalencias", encoding="utf-8")
+
+        with runner.AuditLogger(output) as audit:
+            files = runner.BlindFileAccess(
+                manifest=manifest,
+                gate=gate,
+                equivalencias=equivalencias,
+                output_dir=output,
+                audit=audit,
+            )
+            units, _provenance = runner.load_inputs(
+                files, manifest, gate, equivalencias
+            )
+
+        assert units == [
+            runner.Unit(
+                "Municipio Teste", "concurso_publico", "https://prefeitura.test/"
+            )
+        ]
+
+
+def test_invalid_manifest_cases_never_call_playwright_or_navigation() -> None:
+    for header in (
+        ["municipio", "bucket", "site_base", "url_confirmada"],
+        ["municipio", "bucket", "site_base", "fuente"],
+        ["bucket", "municipio", "site_base"],
+    ):
+        _assert_manifest_header_rejected_without_navigation(header)
 
 
 class FakeSession:
