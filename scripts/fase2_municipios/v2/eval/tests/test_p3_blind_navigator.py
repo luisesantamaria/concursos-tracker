@@ -164,6 +164,30 @@ class FakeSession:
         return None
 
 
+class Error(Exception):
+    """Playwright-shaped exception used without importing Playwright."""
+
+
+class FailingSession(FakeSession):
+    def __init__(
+        self,
+        states: dict[str, runner.PageState],
+        failing_url: str,
+        message: str,
+    ) -> None:
+        super().__init__(states)
+        self.failing_url = failing_url
+        self.message = message
+        self.failure_count = 0
+
+    async def visit(self, url: str) -> runner.PageState:
+        self.visited.append(url)
+        if url == self.failing_url:
+            self.failure_count += 1
+            raise Error(self.message)
+        return self.states[url]
+
+
 def _state(
     url: str,
     text: str,
@@ -220,6 +244,115 @@ def test_final_output_is_one_url_never_a_candidate_list(tmp_path: Path) -> None:
     assert not isinstance(outcome.result, list)
     assert outcome.reason is None
     assert outcome.citations
+
+
+def test_playwright_error_after_captured_surface_preserves_proposal(
+    tmp_path: Path,
+) -> None:
+    """Regression for P3 r1: a later visit must not erase a valid surface."""
+
+    failing_url = "https://prefeitura.test/editais"
+    states = {
+        "https://prefeitura.test/": _state(
+            "https://prefeitura.test/",
+            "Portal municipal",
+            (
+                runner.Link("Concursos", "/concursos"),
+                runner.Link("Editais", "/editais"),
+            ),
+        ),
+        "https://prefeitura.test/concursos": _item_page(
+            "https://prefeitura.test/concursos"
+        ),
+    }
+    session = FailingSession(
+        states,
+        failing_url,
+        "Page.goto: Download is starting while opening edital.pdf",
+    )
+    with runner.AuditLogger(tmp_path / "output") as audit:
+        outcome = asyncio.run(
+            runner.navigate_unit(
+                session,
+                runner.Unit(
+                    "Municipio Teste",
+                    "concurso_publico",
+                    "https://prefeitura.test/",
+                ),
+                audit,
+            )
+        )
+
+    assert session.failure_count == 1
+    assert outcome.result == "https://prefeitura.test/concursos"
+    assert outcome.reason is None
+    assert outcome.citations
+
+
+def test_navigation_error_reason_includes_real_exception_message(
+    tmp_path: Path,
+) -> None:
+    message = "Page.goto: browser context closed during networkidle"
+    session = FailingSession({}, "https://prefeitura.test/", message)
+    with runner.AuditLogger(tmp_path / "output") as audit:
+        outcome = asyncio.run(
+            runner.navigate_unit(
+                session,
+                runner.Unit(
+                    "Municipio Teste",
+                    "concurso_publico",
+                    "https://prefeitura.test/",
+                ),
+                audit,
+            )
+        )
+
+    assert outcome.result == "REVISAR"
+    assert outcome.reason is not None
+    payload = runner.outcome_payload(
+        runner.Unit(
+            "Municipio Teste",
+            "concurso_publico",
+            "https://prefeitura.test/",
+        ),
+        outcome,
+        "2026-07-14T00:00:00+00:00",
+        "2026-07-14T00:00:01+00:00",
+        {"gate_sha256": "gate", "equivalencias_sha256": "equivalencias"},
+    )
+    assert "Error" in payload["motivo"]
+    assert message in payload["motivo"]
+    assert payload["motivo"] != "error_navegacion:Error"
+
+
+def test_successful_item_surface_does_not_descend_into_item_detail(
+    tmp_path: Path,
+) -> None:
+    surface_url = "https://prefeitura.test/concursos"
+    detail_url = "https://prefeitura.test/concurso-01"
+    states = {
+        "https://prefeitura.test/": _state(
+            "https://prefeitura.test/",
+            "Portal municipal",
+            (runner.Link("Concursos", "/concursos"),),
+        ),
+        surface_url: _state(
+            surface_url,
+            "Publicacoes e resultados\n"
+            "Concurso Publico nº 01/2026 - Edital de abertura\n"
+            "Concurso Publico nº 02/2025 - Edital e anexos\n"
+            "Filtrar por ano",
+            (runner.Link("Concurso Publico nº 01/2026", "/concurso-01"),),
+        ),
+        detail_url: _state(detail_url, "Detalhe do edital"),
+    }
+
+    outcome, session = _run_navigation(tmp_path, states)
+
+    assert outcome.result == surface_url
+    assert outcome.reason is None
+    assert outcome.citations
+    assert detail_url not in session.visited
 
 
 def test_genuine_ambiguity_returns_revisar(tmp_path: Path) -> None:

@@ -78,6 +78,10 @@ RESTRICTED_PATTERN = re.compile(
     r"verifique que você é humano|cloudflare|security check|robot)\b",
     re.IGNORECASE,
 )
+SENSITIVE_ERROR_VALUE_PATTERN = re.compile(
+    r"(?i)(?P<prefix>(?:api[_-]?key|access[_-]?token|authorization|secret|password)"
+    r"\s*(?:=|:)\s*)(?P<value>[^\s&;,]+)"
+)
 ABSENCE_PATTERN = re.compile(
     r"\b(?:nenhum resultado|nenhum registro|nao encontrado|não encontrado|"
     r"sem resultados|0 resultados)\b",
@@ -103,6 +107,18 @@ class BlindAccessViolation(PermissionError):
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def exception_detail(exc: Exception) -> str:
+    """Return an actionable exception description without leaking credentials."""
+
+    message = str(exc).strip()
+    if not message:
+        message = "sin_mensaje_proporcionado_por_la_excepcion"
+    redacted = SENSITIVE_ERROR_VALUE_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}<redacted>", message
+    )
+    return f"{type(exc).__name__}: {redacted}"
 
 
 def fold_text(value: str) -> str:
@@ -513,6 +529,7 @@ async def navigate_unit(
     interaction_count = 0
     additional_pages = 0
     restricted = False
+    failure_stage = "inicio"
 
     async def explore(
         requested_url: str,
@@ -521,7 +538,7 @@ async def navigate_unit(
         from_url: str | None,
         via_text: str | None,
     ) -> None:
-        nonlocal interaction_count, additional_pages, restricted
+        nonlocal interaction_count, additional_pages, restricted, failure_stage
         if restricted or depth > MAX_DEPTH:
             return
         if depth > 0 and additional_pages >= MAX_ADDITIONAL_PAGES:
@@ -534,6 +551,7 @@ async def navigate_unit(
             requested_url=requested_url,
             depth=depth,
         )
+        failure_stage = "captura_estado"
         state = await session.visit(requested_url)
         actual_url = canonicalize_url(state.url)
         if actual_url != canonicalize_url(requested_url):
@@ -560,6 +578,7 @@ async def navigate_unit(
                 "depth": depth,
             }
         )
+        failure_stage = "snapshot_estado"
         snapshots.append(_snapshot_record(state, requested_url))
 
         if not related_to_official(state.url, unit.site_base):
@@ -574,13 +593,20 @@ async def navigate_unit(
             return
         visited.add(actual_url)
 
+        failure_stage = "evaluacion_superficie"
         candidate = page_candidate(state, unit.bucket, current_path)
         if candidate is not None:
             if related_to_official(candidate.url, unit.site_base):
                 candidates.append(candidate)
+                # This phase discovers the stable listing surface.  Following
+                # item/detail/download links from an already evaluable surface
+                # adds no useful candidate and can make Playwright abort a
+                # whole unit (for example when navigation starts a PDF download).
+                return
 
         if depth >= MAX_DEPTH:
             return
+        failure_stage = "exploracion_enlaces"
         prioritized: list[tuple[tuple[int, str, str], Link, str]] = []
         for link in state.links:
             priority = navigation_link_priority(link)
@@ -651,16 +677,46 @@ async def navigate_unit(
             additional_pages=additional_pages,
         )
     except Exception as exc:
+        detail = exception_detail(exc)
         audit.record(
             "unit_navigation_error",
             municipio=unit.municipio,
             bucket=unit.bucket,
+            stage=failure_stage,
             error_type=type(exc).__name__,
-            message=str(exc),
+            message=detail,
+            detail=detail,
         )
+        selected, selection_reason = choose_candidate(candidates)
+        if selected is not None:
+            audit.record(
+                "unit_navigation_recovered",
+                municipio=unit.municipio,
+                bucket=unit.bucket,
+                stage=failure_stage,
+                detail=detail,
+                selected_url=selected.url,
+            )
+            return NavigationOutcome(
+                result=selected.url,
+                reason=None,
+                final_path=selected.path,
+                explored=explored,
+                snapshots=snapshots,
+                citations=selected.quotes,
+                interaction_count=interaction_count,
+                additional_pages=additional_pages,
+            )
+        if candidates:
+            reason = (
+                f"error_estado_con_superficie_candidata:{failure_stage}:{detail}; "
+                f"seleccion:{selection_reason}"
+            )
+        else:
+            reason = f"error_navegacion:{failure_stage}:{detail}"
         return NavigationOutcome(
             result="REVISAR",
-            reason=f"error_navegacion:{type(exc).__name__}",
+            reason=reason,
             final_path=[],
             explored=explored,
             snapshots=snapshots,
