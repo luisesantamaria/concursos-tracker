@@ -875,6 +875,15 @@ def municipality_natural_name(slug_or_name: str) -> tuple[str, str]:
     return " ".join(words), domain
 
 
+def _url_map_key(municipio: str, bucket: str) -> tuple[str, str]:
+    """Reuse the runner's slug identity for both sides of a URL-map match."""
+
+    return tuple(
+        re.sub(r"[^a-z0-9]", "", _norm(value))
+        for value in (municipio, bucket)
+    )
+
+
 def _municipality_site_base(slug_or_name: str) -> str:
     """Resolve the CSV site_base through the runner's natural-name identity."""
 
@@ -1115,6 +1124,28 @@ def read_targets(path: Path) -> list[Target]:
             raise ValueError(f"target_invalido:linea={number}")
         targets.append(Target(municipio, bucket, pista, sub_causa))
     return targets
+
+
+def read_url_map(path: Path) -> dict[tuple[str, str], str]:
+    """Load staging URL dispatch hints keyed by normalized municipio/bucket."""
+
+    with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not {"municipio", "bucket", "url"}.issubset(reader.fieldnames or ()):
+            raise ValueError("url_map_columnas_invalidas")
+        result: dict[tuple[str, str], str] = {}
+        for number, row in enumerate(reader, start=2):
+            municipio = (row.get("municipio") or "").strip()
+            bucket = (row.get("bucket") or "").strip()
+            raw_url = (row.get("url") or "").strip()
+            key = _url_map_key(municipio, bucket)
+            url = _clean_url(raw_url)
+            if not all(key) or not url:
+                raise ValueError(f"url_map_invalido:linea={number}")
+            if key in result:
+                raise ValueError(f"url_map_clave_duplicada:linea={number}")
+            result[key] = url
+    return result
 
 
 def load_grounded_credentials(path: Path, *, free_only: bool) -> dict[str, str]:
@@ -1886,20 +1917,8 @@ def _select_micro_target(
     *,
     require_platform: bool = False,
 ) -> dict[str, Any]:
-    """Prefer a replay URL; otherwise require an evaluated, unambiguous candidate."""
-    original_urls = extract_answer_urls(GroundedAnswer(text=target.pista))
-    for original in original_urls:
-        if require_platform and detect_platform(original, "") not in {
-            "multi24", "atende", "datatables"
-        }:
-            continue
-        allowed, reason = official_host_check(target.municipio, original)
-        if allowed:
-            return {
-                "url": original, "query": "", "snippet": target.pista,
-                "host_oficial_check": reason, "fuente": "target_original",
-                "redirector_original": "", "selection_reason": "url_original_target_replay",
-            }
+    """Require an evaluated, unambiguous candidate; never parse target.pista."""
+
     evaluated = [
         dict(item) for item in pending
         if item.get("url")
@@ -1928,24 +1947,30 @@ def _select_micro_target(
     }
 
 
-def _select_detectable_target_url(target: Target) -> dict[str, Any]:
-    """Select an original URL only when URL-first platform proof exists."""
+def _select_detectable_target_url(
+    target: Target,
+    url_map: Mapping[tuple[str, str], str],
+) -> dict[str, Any]:
+    """Select a URL-map hint only when URL-first platform proof exists.
 
-    for original in extract_answer_urls(GroundedAnswer(text=target.pista)):
-        platform = detect_platform(original, "")
-        if platform not in {"multi24", "atende", "datatables"}:
-            continue
-        allowed, reason = official_host_check(target.municipio, original)
-        if allowed:
-            return {
-                "url": original,
-                "query": "",
-                "snippet": target.pista,
-                "host_oficial_check": reason,
-                "fuente": "target_original",
-                "redirector_original": "",
-                "selection_reason": f"plataforma_detectable:{platform}",
-            }
+    The map is deliberately not authority evidence. Normal acquisition and
+    adapter authority/delegation checks still run after this dispatch choice.
+    """
+
+    mapped_url = _clean_url(html.unescape(
+        url_map.get(_url_map_key(target.municipio, target.bucket), "")
+    ))
+    platform = detect_platform(mapped_url, "") if mapped_url else None
+    if platform in {"multi24", "atende", "datatables"}:
+        return {
+            "url": mapped_url,
+            "query": "",
+            "snippet": "",
+            "host_oficial_check": "urlmap_solo_dispatch_sin_prueba_autoridad",
+            "fuente": "url_map",
+            "redirector_original": "",
+            "selection_reason": f"urlmap_plataforma_detectable:{platform}",
+        }
     return {
         "url": "", "query": "", "snippet": "",
         "host_oficial_check": "sin_plataforma_detectable",
@@ -2048,6 +2073,7 @@ def run_rescue(
     skip_existing: bool = False,
     micro_acquire: bool = False,
     adapters_only: bool = False,
+    url_map: Mapping[tuple[str, str], str] | None = None,
     renderer: Callable[[str], Any] = render_page_networkidle,
     redirect_session_factory: Callable[[], Any] = _new_redirect_session,
     redirect_host_resolver: Callable[[str], Sequence[str]] = _default_redirect_host_resolver,
@@ -2063,6 +2089,8 @@ def run_rescue(
         raise ValueError(f"model_debe_ser_exactamente_{REQUIRED_MODEL}")
     if not 1 <= max_searches <= MAX_POLICY_SEARCHES:
         raise ValueError("max_searches_debe_estar_entre_1_y_5")
+    if adapters_only and url_map is None:
+        raise ValueError("adapters_only_requiere_--url-map")
     policy = {
         "grounding_tool": None if adapters_only else "google_search",
         "retrieval": False,
@@ -2373,7 +2401,7 @@ def run_rescue(
             if adapters_only:
                 if output_path is None:
                     raise ValueError("adapters_only_requiere_output_dir")
-                selected = _select_detectable_target_url(target)
+                selected = _select_detectable_target_url(target, url_map or {})
                 if not selected["url"]:
                     estado = "skipped"
                     causa = "sin_plataforma_detectable"
@@ -2695,6 +2723,11 @@ def write_outputs(output_dir: Path, rows: Sequence[CandidateRow], summary: Mappi
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Propone candidatas URL con Google Search grounding; nunca confirma.")
     parser.add_argument("--targets", type=Path, required=True)
+    parser.add_argument(
+        "--url-map",
+        type=Path,
+        help="CSV municipio,bucket,url usado como hint de dispatch en --adapters-only.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--credentials-file", type=Path)
     parser.add_argument("--model", default=REQUIRED_MODEL)
@@ -2754,6 +2787,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.adapters_only and (args.free_only or args.paid_authorized):
         parser.error("--adapters-only no se combina con autorizaciones de modelo")
+    if args.adapters_only and args.url_map is None:
+        parser.error("--url-map es obligatorio con --adapters-only")
     if args.paid_authorized and args.max_paid_calls is None:
         parser.error("--max-paid-calls es obligatorio con --paid-authorized")
     if args.max_paid_calls is not None and args.max_paid_calls < 1:
@@ -2780,6 +2815,7 @@ def main(argv: list[str] | None = None) -> int:
             daily_search_limit=args.daily_search_limit,
         )
     targets = read_targets(args.targets)
+    url_map = read_url_map(args.url_map) if args.url_map is not None else {}
     fetcher = RequestsFetcher()
     interruption = InterruptionState()
     previous_handlers: dict[signal.Signals, Any] = {}
@@ -2801,6 +2837,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip_existing=args.skip_existing,
                 micro_acquire=args.micro_acquire,
                 adapters_only=args.adapters_only,
+                url_map=url_map,
                 interruption=interruption,
                 free_only=free_only,
                 paid_authorization=(PAID_AUTHORIZATION if args.paid_authorized else None),

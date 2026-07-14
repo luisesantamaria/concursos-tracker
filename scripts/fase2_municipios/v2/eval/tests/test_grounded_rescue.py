@@ -31,6 +31,7 @@ from scripts.fase2_municipios.v2.eval.grounded_rescue import (
     main,
     micro_acquire_unit,
     read_targets,
+    read_url_map,
     rebuild_summary,
     run_micro_acquisitions,
     run_rescue,
@@ -1207,13 +1208,8 @@ class GroundedRescueTests(unittest.TestCase):
             for query in pss_queries
         ))
 
-    def test_micro_acquisition_reuses_original_target_url_without_grounded_url(self) -> None:
+    def test_micro_acquisition_does_not_infer_url_from_target_hint(self) -> None:
         original = "https://camaqua.rs.gov.br/concursos"
-        rendered = SimpleNamespace(
-            final_url=original,
-            text="Prefeitura de Camaqua\nConcurso Publico Edital 01/2026",
-            status=200,
-        )
         target = Target("camaqua", "concurso_publico", f"Replay conhecido: {original}", "render_incierto")
         with tempfile.TemporaryDirectory() as directory:
             rows, _ = run_rescue(
@@ -1224,16 +1220,16 @@ class GroundedRescueTests(unittest.TestCase):
                 sleep_seconds=0,
                 output_dir=Path(directory),
                 micro_acquire=True,
-                renderer=lambda _: rendered,
+                renderer=lambda _: self.fail("pista must not select an acquisition URL"),
             )
             durable = json.loads(
                 (Path(directory) / "micro_camaqua_concurso_publico.json").read_text(encoding="utf-8")
             )
-        self.assertEqual(original, durable["url_inicial"])
-        self.assertEqual(original, durable["url_final"])
-        self.assertEqual([original], durable["cadena_redirects"])
-        self.assertEqual("url_original_target_replay", durable["razon_seleccion_url"])
-        self.assertEqual(original, rows[0].url_candidata)
+        self.assertEqual("", durable["url_inicial"])
+        self.assertEqual("", durable["url_final"])
+        self.assertEqual([], durable["cadena_redirects"])
+        self.assertEqual("sin_candidata_evaluada_no_ambigua", durable["razon_seleccion_url"])
+        self.assertEqual([], rows)
 
     def test_url_mala_with_detectable_multi24_dispatches_adapter(self) -> None:
         url = "https://sistemas.camaqua.rs.gov.br/multi24/transparencia/concursos"
@@ -1245,8 +1241,8 @@ class GroundedRescueTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             run_rescue(
-                [Target("camaqua", "concurso_publico", f"Objetivo: {url}", "url_mala")],
-                client=FakeGroundedClient([GroundedAnswer(text="")]),
+                [Target("camaqua", "concurso_publico", "pista sin URL", "url_mala")],
+                client=FakeGroundedClient([GroundedAnswer(text=url)]),
                 fetcher=FakeFetcher(),
                 max_searches=1,
                 sleep_seconds=0,
@@ -1262,8 +1258,8 @@ class GroundedRescueTests(unittest.TestCase):
         dispatch_calls: list[str] = []
         with tempfile.TemporaryDirectory() as directory:
             run_rescue(
-                [Target("camaqua", "concurso_publico", f"Objetivo: {url}", "url_mala")],
-                client=FakeGroundedClient([GroundedAnswer(text="")]),
+                [Target("camaqua", "concurso_publico", "pista sin URL", "url_mala")],
+                client=FakeGroundedClient([GroundedAnswer(text=url)]),
                 fetcher=FakeFetcher(),
                 max_searches=1,
                 sleep_seconds=0,
@@ -1274,26 +1270,42 @@ class GroundedRescueTests(unittest.TestCase):
             )
         self.assertEqual([], dispatch_calls)
 
-    def test_adapters_only_never_calls_model_and_skips_undetectable_units(self) -> None:
+    def test_adapters_only_url_map_dispatches_without_hint_urls_or_gemini(self) -> None:
         class BombClient:
             telemetry = {"providers": {"gemini_free_1": {"calls": 0}}}
 
             def search(self, *args, **kwargs):
                 raise AssertionError("Gemini must be unreachable in adapters-only")
 
-        detectable = "https://camaqua.atende.net/cidadao/pagina/concursos"
-        undetectable = "https://camaqua.rs.gov.br/concursos"
+        progresso = (
+            "https://sistemas.progresso.rs.gov.br/multi24/transparencia/index"
+            "?entidade=1&secao=dinamico&id=6146"
+        )
+        dois_lajeados = (
+            "https://doislajeados.atende.net/cidadao/pagina/concursos"
+            "?filtro=abertos&ano=2026"
+        )
         dispatch_calls: list[str] = []
 
         def dispatcher(**kwargs):
             dispatch_calls.append(kwargs["url"])
-            return {"platform": "atende", "adapter": "fake", "candidates": []}
+            return {"platform": "fake", "adapter": "fake", "candidates": []}
 
         with tempfile.TemporaryDirectory() as directory:
+            url_map_path = Path(directory) / "urlmap.csv"
+            url_map_path.write_text(
+                "municipio,bucket,url\n"
+                "PROGRESSO,CONCURSO PUBLICO,"
+                f"{progresso.replace('&', '&amp;')}\n"
+                "DÓIS   LAJEADOS,Processo Seletivo,"
+                f"{dois_lajeados.replace('&', '&amp;')}\n",
+                encoding="utf-8",
+            )
+            url_map = read_url_map(url_map_path)
             _, summary = run_rescue(
                 [
-                    Target("camaqua", "concurso_publico", detectable, "url_mala"),
-                    Target("camaqua", "processo_seletivo", undetectable, "url_mala"),
+                    Target("progresso", "concurso_publico", "portal a revisar", "url_mala"),
+                    Target("doislajeados", "processo_seletivo", "verificar fonte", "url_mala"),
                 ],
                 client=BombClient(),
                 fetcher=FakeFetcher(),
@@ -1301,10 +1313,48 @@ class GroundedRescueTests(unittest.TestCase):
                 sleep_seconds=0,
                 output_dir=Path(directory),
                 adapters_only=True,
+                url_map=url_map,
                 adapter_dispatcher=dispatcher,
                 renderer=lambda _: self.fail("adapters-only must not render"),
             )
-        self.assertEqual([detectable], dispatch_calls)
+        self.assertEqual([progresso, dois_lajeados], dispatch_calls)
+        self.assertEqual(2, summary["global"]["unidades"])
+        self.assertEqual(0, summary["global"]["model_requests"])
+
+    def test_adapters_only_cli_accepts_url_map_flag(self) -> None:
+        args = _parser().parse_args([
+            "--targets", "targets.csv",
+            "--url-map", "holdout_urlmap.csv",
+            "--output-dir", "output",
+            "--adapters-only",
+        ])
+        self.assertEqual(Path("holdout_urlmap.csv"), args.url_map)
+
+    def test_adapters_only_skips_url_map_unit_without_detectable_platform(self) -> None:
+        class BombClient:
+            telemetry = {"providers": {"gemini_free_1": {"calls": 0}}}
+
+            def search(self, *args, **kwargs):
+                raise AssertionError("Gemini must be unreachable in adapters-only")
+
+        dispatch_calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            _, summary = run_rescue(
+                [Target("camaqua", "processo_seletivo", "pista sem URL", "url_mala")],
+                client=BombClient(),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=Path(directory),
+                adapters_only=True,
+                url_map={
+                    ("camaqua", "processoseletivo"):
+                        "https://camaqua.rs.gov.br/concursos"
+                },
+                adapter_dispatcher=lambda **kwargs: dispatch_calls.append(kwargs["url"]),
+                renderer=lambda _: self.fail("adapters-only must not render"),
+            )
+        self.assertEqual([], dispatch_calls)
         skipped = summary["unidades"]["camaqua/processo_seletivo"]
         self.assertEqual("skipped", skipped["estado"])
         self.assertEqual("sin_plataforma_detectable", skipped["causa"])
