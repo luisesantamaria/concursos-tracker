@@ -196,6 +196,10 @@ class PreventiveQuotaStop(RuntimeError):
     """The 90% model/search quota brake or global call budget fired."""
 
 
+class PaidCallCapReached(RuntimeError):
+    """The authorized run-wide paid-call cap blocked the next paid request."""
+
+
 class PolicyFailure(RuntimeError):
     """A free-only invariant was violated."""
 
@@ -302,6 +306,7 @@ class GeminiGroundedClient:
         *,
         client_factory: Callable[..., Any] | None = None,
         free_only: bool = False,
+        max_paid_calls: int | None = None,
         global_call_budget: int = 100,
         daily_model_limit: int = DEFAULT_DAILY_MODEL_LIMIT,
         daily_search_limit: int = DEFAULT_DAILY_SEARCH_LIMIT,
@@ -314,6 +319,8 @@ class GeminiGroundedClient:
             raise ValueError("gemini_free1_credential_missing")
         if not free_only and not credentials.get("GEMINI_API_KEY"):
             raise ValueError("gemini_paid_credential_missing_for_production")
+        if max_paid_calls is not None and max_paid_calls < 1:
+            raise ValueError("max_paid_calls_debe_ser_positivo")
         if client_factory is None:
             try:
                 from google import genai  # type: ignore[import-not-found]
@@ -327,6 +334,7 @@ class GeminiGroundedClient:
         self._client_factory = client_factory
         self._clients: dict[str, Any] = {}
         self.free_only = free_only
+        self.max_paid_calls = max_paid_calls
         self._sleep = sleep
         self._max_free2_attempts = max(1, max_free2_attempts)
         self._governor = QuotaGovernor(
@@ -396,6 +404,12 @@ class GeminiGroundedClient:
             raise ValueError(f"model_debe_ser_exactamente_{REQUIRED_MODEL}")
         if self.free_only and provider == "gemini_paid":
             raise PolicyFailure("FALLO_DE_POLITICA:paid_provider_reachable")
+        if (
+            provider == "gemini_paid"
+            and self.max_paid_calls is not None
+            and self._calls[provider] >= self.max_paid_calls
+        ):
+            raise PaidCallCapReached("paid_cap_alcanzado")
         self._governor.before_request(
             model_requests=self._model_requests,
             google_search_queries=self._google_search_queries,
@@ -600,7 +614,13 @@ class GeminiGroundedClient:
         """Authorized production extension; never used by ``--free-only``."""
         try:
             return self._free_only_call(model, prompt)
-        except (RescueInterrupted, PreventiveQuotaStop, DailyQuotaExhausted, PolicyFailure):
+        except (
+            RescueInterrupted,
+            PreventiveQuotaStop,
+            DailyQuotaExhausted,
+            PaidCallCapReached,
+            PolicyFailure,
+        ):
             raise
         except BaseException as exc:
             classified = classify_error(exc)
@@ -637,7 +657,13 @@ class GeminiGroundedClient:
             else:
                 response, provider, key_fallbacks = self._production_call(model, prompt)
             fallbacks.extend(key_fallbacks)
-        except (RescueInterrupted, PreventiveQuotaStop, DailyQuotaExhausted, PolicyFailure):
+        except (
+            RescueInterrupted,
+            PreventiveQuotaStop,
+            DailyQuotaExhausted,
+            PaidCallCapReached,
+            PolicyFailure,
+        ):
             raise
         except BaseException as exc:
             raise RuntimeError(_safe_error(exc, self._secret_values())) from exc
@@ -1937,6 +1963,7 @@ def run_rescue(
     timestamp_factory: Callable[[], str] = _utc_timestamp,
     free_only: bool = False,
     paid_authorization: str | None = None,
+    max_paid_calls: int | None = None,
     adapter_context_provider: Callable[[Target, str], Mapping[str, Any]] | None = None,
     adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
 ) -> tuple[list[CandidateRow], dict[str, Any]]:
@@ -1957,6 +1984,7 @@ def run_rescue(
     }
     if paid_authorization is not None:
         policy["paid_authorization"] = paid_authorization
+        policy["max_paid_calls"] = max_paid_calls
     if free_only and _provider_snapshot(client)["paid_calls"] != 0:
         raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_before_run")
     output_path = Path(output_dir) if output_dir is not None else None
@@ -2047,6 +2075,15 @@ def run_rescue(
                     grounded["queries"].append(query_result)
                     estado = "DETENIDA_FRENO_CUOTA"
                     causa = str(exc)
+                    stop_after_current = True
+                    break
+                except PaidCallCapReached:
+                    error = {"query": query, "type": "paid_cap_alcanzado"}
+                    grounded["errores"].append(error)
+                    query_result["error"] = dict(error)
+                    grounded["queries"].append(query_result)
+                    estado = "failed"
+                    causa = "paid_cap_alcanzado"
                     stop_after_current = True
                     break
                 except BaseException as exc:
@@ -2268,6 +2305,10 @@ def run_rescue(
             causa = type(exc).__name__
         grounded["candidatas"] = [row.as_dict() for row in unit_candidates]
         after = _provider_snapshot(client)
+        paid_cap_reached_here = (
+            max_paid_calls is not None
+            and before["paid_calls"] < max_paid_calls <= after["paid_calls"]
+        )
         payload = {
             "schema_version": UNIT_SCHEMA_VERSION,
             "municipio": target.municipio,
@@ -2279,6 +2320,7 @@ def run_rescue(
             "microadquisicion": micro_result,
             "estado": estado,
             "causa": causa,
+            "paid_cap_alcanzado_en_unidad": paid_cap_reached_here,
             "timestamp": timestamp_factory(),
         }
         if path is not None:
@@ -2368,7 +2410,7 @@ def _aggregate_unit_payloads(
     fallbacks_by_provider = {
         name: dict(counter) for name, counter in fallback_counters.items()
     }
-    return {
+    result = {
         "policy": dict(policy),
         "capacidad_vetada": capacity_vetoes,
         "unidades": units,
@@ -2411,6 +2453,20 @@ def _aggregate_unit_payloads(
             },
         },
     }
+    if policy.get("max_paid_calls") is not None:
+        reached_unit = next(
+            (
+                f'{payload.get("municipio", "")}/{payload.get("bucket", "")}'
+                for payload in payloads
+                if payload.get("paid_cap_alcanzado_en_unidad") is True
+            ),
+            None,
+        )
+        result["paid_cap"] = {
+            "limite": policy["max_paid_calls"],
+            "alcanzado_en_unidad": reached_unit,
+        }
+    return result
 
 
 def rebuild_summary(
@@ -2479,6 +2535,7 @@ def _parser() -> argparse.ArgumentParser:
         "--global-call-budget", type=int,
         default=int(os.environ.get("GROUNDED_GLOBAL_CALL_BUDGET", "100")),
     )
+    parser.add_argument("--max-paid-calls", type=int)
     parser.add_argument(
         "--daily-model-limit", type=int,
         default=int(os.environ.get("GROUNDED_DAILY_MODEL_LIMIT", str(DEFAULT_DAILY_MODEL_LIMIT))),
@@ -2506,7 +2563,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.paid_authorized and args.max_paid_calls is None:
+        parser.error("--max-paid-calls es obligatorio con --paid-authorized")
+    if args.max_paid_calls is not None and args.max_paid_calls < 1:
+        parser.error("--max-paid-calls debe ser un entero positivo")
     if args.sleep < 0 or args.fetch_timeout < 1:
         raise ValueError("sleep/fetch-timeout invalidos")
     if not args.free_only and not args.paid_authorized:
@@ -2518,6 +2580,7 @@ def main(argv: list[str] | None = None) -> int:
     client = GeminiGroundedClient(
         credentials,
         free_only=free_only,
+        max_paid_calls=(args.max_paid_calls if args.paid_authorized else None),
         global_call_budget=args.global_call_budget,
         daily_model_limit=args.daily_model_limit,
         daily_search_limit=args.daily_search_limit,
@@ -2546,6 +2609,7 @@ def main(argv: list[str] | None = None) -> int:
                 interruption=interruption,
                 free_only=free_only,
                 paid_authorization=(PAID_AUTHORIZATION if args.paid_authorized else None),
+                max_paid_calls=(args.max_paid_calls if args.paid_authorized else None),
             )
         except RescueInterrupted:
             payloads = _read_unit_files(args.output_dir)
@@ -2562,6 +2626,10 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 **(
                     {"paid_authorization": PAID_AUTHORIZATION}
+                    if args.paid_authorized else {}
+                ),
+                **(
+                    {"max_paid_calls": args.max_paid_calls}
                     if args.paid_authorized else {}
                 ),
             })
@@ -2582,6 +2650,8 @@ def main(argv: list[str] | None = None) -> int:
         return 4
     if states & {"DETENIDA_CUOTA_DIARIA_FREE2", "DETENIDA_FRENO_CUOTA"}:
         return 3
+    if any(unit.get("causa") == "paid_cap_alcanzado" for unit in summary.get("unidades", {}).values()):
+        return 5
     return 0
 
 

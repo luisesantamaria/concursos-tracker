@@ -805,6 +805,7 @@ class GroundedRescueTests(unittest.TestCase):
         self.assertEqual({
             "schema_version", "municipio", "bucket", "sub_causa", "pista",
             "grounded", "telemetria", "microadquisicion", "estado", "causa",
+            "paid_cap_alcanzado_en_unidad",
             "timestamp",
         }, set(payload))
         self.assertEqual("completed", payload["estado"])
@@ -1307,6 +1308,7 @@ class GroundedRescueTests(unittest.TestCase):
             "--output-dir", "output",
             "--credentials-file", "credentials.env",
             "--paid-authorized",
+            "--max-paid-calls", "3",
         ])
         self.assertFalse(args.free_only)
         self.assertTrue(args.paid_authorized)
@@ -1324,6 +1326,7 @@ class GroundedRescueTests(unittest.TestCase):
             },
             client_factory=lambda *, api_key, vertexai: clients[api_key],
             free_only=args.free_only,
+            max_paid_calls=args.max_paid_calls,
             max_free2_attempts=1,
             sleep=lambda _: None,
         )
@@ -1335,11 +1338,109 @@ class GroundedRescueTests(unittest.TestCase):
             sleep_seconds=0,
             free_only=args.free_only,
             paid_authorization=(PAID_AUTHORIZATION if args.paid_authorized else None),
+            max_paid_calls=args.max_paid_calls,
         )
         self.assertEqual(["free", "free2", "paid"], [item[0] for item in log])
         self.assertEqual(PAID_AUTHORIZATION, summary["policy"]["paid_authorization"])
         self.assertEqual(1, summary["global"]["paid_calls"])
         self.assertEqual(1, summary["global"]["telemetria"]["providers"]["gemini_paid"]["calls"])
+
+    def test_paid_authorized_requires_max_paid_calls_before_work(self) -> None:
+        with patch("sys.stderr") as stderr, self.assertRaises(SystemExit) as raised:
+            main([
+                "--targets", "missing-targets.csv",
+                "--output-dir", "output",
+                "--credentials-file", "missing-credentials.env",
+                "--paid-authorized",
+            ])
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn(
+            "--max-paid-calls es obligatorio con --paid-authorized",
+            "".join(call.args[0] for call in stderr.write.call_args_list),
+        )
+
+    def test_paid_cap_blocks_fourth_paid_call_checkpoints_and_summarizes(self) -> None:
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient(
+                "free", [HttpError(429, "minute quota") for _ in range(4)], log
+            ),
+            "FREE2": SequencedClient(
+                "free2", [HttpError(429, "minute quota") for _ in range(4)], log
+            ),
+            "PAID": SequencedClient("paid", [sdk_response() for _ in range(3)], log),
+        }
+        client = GeminiGroundedClient(
+            {
+                "GEMINI_API_KEY_FREE": "FREE",
+                "GEMINI_API_KEY_FREE_2": "FREE2",
+                "GEMINI_API_KEY": "PAID",
+            },
+            client_factory=lambda *, api_key, vertexai: clients[api_key],
+            max_paid_calls=3,
+            max_free2_attempts=1,
+            sleep=lambda _: None,
+        )
+        targets = [
+            Target(name, "concurso_publico", "pista")
+            for name in ("camaqua", "canoas", "esteio", "gravatai")
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _, summary = run_rescue(
+                targets,
+                client=client,
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+                paid_authorization=PAID_AUTHORIZATION,
+                max_paid_calls=3,
+            )
+            durable = json.loads(
+                (output / "unidad_gravatai_concurso_publico.json").read_text(encoding="utf-8")
+            )
+        self.assertEqual(3, sum(item[0] == "paid" for item in log))
+        self.assertEqual(3, client.telemetry["paid_calls"])
+        self.assertEqual("failed", durable["estado"])
+        self.assertEqual("paid_cap_alcanzado", durable["causa"])
+        self.assertEqual(
+            {"limite": 3, "alcanzado_en_unidad": "esteio/concurso_publico"},
+            summary["paid_cap"],
+        )
+
+    def test_free_only_run_ignores_max_paid_calls(self) -> None:
+        args = _parser().parse_args([
+            "--targets", "targets.csv",
+            "--output-dir", "output",
+            "--credentials-file", "credentials.env",
+            "--free-only",
+            "--max-paid-calls", "1",
+        ])
+        log: list[tuple] = []
+        free = SequencedClient("free", [sdk_response()], log)
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE"},
+            client_factory=lambda **_: free,
+            free_only=args.free_only,
+            max_paid_calls=args.max_paid_calls,
+            sleep=lambda _: None,
+        )
+        _, summary = run_rescue(
+            [Target("camaqua", "concurso_publico", "pista")],
+            client=client,
+            fetcher=FakeFetcher(),
+            max_searches=1,
+            sleep_seconds=0,
+            free_only=args.free_only,
+            max_paid_calls=args.max_paid_calls,
+        )
+        self.assertEqual(0, summary["global"]["paid_calls"])
+        self.assertNotIn("paid_cap", summary)
+        self.assertFalse(any(
+            unit.get("causa") == "paid_cap_alcanzado"
+            for unit in summary["unidades"].values()
+        ))
 
     def test_global_call_budget_cli_accepts_value_above_default(self) -> None:
         args = _parser().parse_args([
