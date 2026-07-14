@@ -1235,6 +1235,81 @@ class GroundedRescueTests(unittest.TestCase):
         self.assertEqual("url_original_target_replay", durable["razon_seleccion_url"])
         self.assertEqual(original, rows[0].url_candidata)
 
+    def test_url_mala_with_detectable_multi24_dispatches_adapter(self) -> None:
+        url = "https://sistemas.camaqua.rs.gov.br/multi24/transparencia/concursos"
+        dispatch_calls: list[str] = []
+
+        def dispatcher(**kwargs):
+            dispatch_calls.append(kwargs["url"])
+            return {"platform": "multi24", "adapter": "fake", "candidates": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_rescue(
+                [Target("camaqua", "concurso_publico", f"Objetivo: {url}", "url_mala")],
+                client=FakeGroundedClient([GroundedAnswer(text="")]),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=Path(directory),
+                micro_acquire=True,
+                adapter_dispatcher=dispatcher,
+                renderer=lambda _: None,
+            )
+        self.assertEqual([url], dispatch_calls)
+
+    def test_url_mala_without_detectable_platform_does_not_dispatch_adapter(self) -> None:
+        url = "https://camaqua.rs.gov.br/concursos"
+        dispatch_calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            run_rescue(
+                [Target("camaqua", "concurso_publico", f"Objetivo: {url}", "url_mala")],
+                client=FakeGroundedClient([GroundedAnswer(text="")]),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=Path(directory),
+                micro_acquire=True,
+                adapter_dispatcher=lambda **kwargs: dispatch_calls.append(kwargs["url"]),
+                renderer=lambda _: None,
+            )
+        self.assertEqual([], dispatch_calls)
+
+    def test_adapters_only_never_calls_model_and_skips_undetectable_units(self) -> None:
+        class BombClient:
+            telemetry = {"providers": {"gemini_free_1": {"calls": 0}}}
+
+            def search(self, *args, **kwargs):
+                raise AssertionError("Gemini must be unreachable in adapters-only")
+
+        detectable = "https://camaqua.atende.net/cidadao/pagina/concursos"
+        undetectable = "https://camaqua.rs.gov.br/concursos"
+        dispatch_calls: list[str] = []
+
+        def dispatcher(**kwargs):
+            dispatch_calls.append(kwargs["url"])
+            return {"platform": "atende", "adapter": "fake", "candidates": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            _, summary = run_rescue(
+                [
+                    Target("camaqua", "concurso_publico", detectable, "url_mala"),
+                    Target("camaqua", "processo_seletivo", undetectable, "url_mala"),
+                ],
+                client=BombClient(),
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=Path(directory),
+                adapters_only=True,
+                adapter_dispatcher=dispatcher,
+                renderer=lambda _: self.fail("adapters-only must not render"),
+            )
+        self.assertEqual([detectable], dispatch_calls)
+        skipped = summary["unidades"]["camaqua/processo_seletivo"]
+        self.assertEqual("skipped", skipped["estado"])
+        self.assertEqual("sin_plataforma_detectable", skipped["causa"])
+        self.assertEqual(0, summary["global"]["model_requests"])
+
     def test_free_only_run_never_constructs_or_calls_paid_client(self) -> None:
         args = _parser().parse_args([
             "--targets", "targets.csv",
@@ -1409,6 +1484,63 @@ class GroundedRescueTests(unittest.TestCase):
             summary["paid_cap"],
         )
 
+    def test_resume_subtracts_five_previous_paid_calls_from_cap_thirty(self) -> None:
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient("free", [HttpError(429, "minute quota")], log),
+            "FREE2": SequencedClient("free2", [HttpError(429, "minute quota")], log),
+            "PAID": SequencedClient("paid", [sdk_response() for _ in range(25)], log),
+        }
+        client = GeminiGroundedClient(
+            {
+                "GEMINI_API_KEY_FREE": "FREE",
+                "GEMINI_API_KEY_FREE_2": "FREE2",
+                "GEMINI_API_KEY": "PAID",
+            },
+            client_factory=lambda *, api_key, vertexai: clients[api_key],
+            max_paid_calls=30,
+            max_free2_attempts=1,
+            sleep=lambda _: None,
+        )
+        targets = [
+            Target(f"municipio{i}", "concurso_publico", "pista")
+            for i in range(26)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            previous = {
+                "schema_version": 1,
+                "municipio": "previa",
+                "bucket": "concurso_publico",
+                "grounded": {"busquedas_usadas": 0, "candidatas": []},
+                "telemetria": {
+                    "providers": {"gemini_paid": {"calls": 5}},
+                    "fallbacks": [],
+                },
+                "estado": "completed",
+                "causa": None,
+                "timestamp": "2026-07-14T00:00:00+00:00",
+            }
+            (output / "unidad_previa_concurso_publico.json").write_text(
+                json.dumps(previous), encoding="utf-8"
+            )
+            _, summary = run_rescue(
+                targets,
+                client=client,
+                fetcher=FakeFetcher(),
+                max_searches=1,
+                sleep_seconds=0,
+                output_dir=output,
+                resume=True,
+                paid_authorization=PAID_AUTHORIZATION,
+                max_paid_calls=30,
+            )
+        self.assertEqual(25, sum(item[0] == "paid" for item in log))
+        self.assertEqual(5, summary["global"]["paid_calls_previas"])
+        self.assertEqual(25, summary["global"]["paid_calls_nuevas"])
+        self.assertEqual(25, summary["global"]["tope_efectivo"])
+        self.assertEqual(25, summary["paid_cap"]["limite"])
+
     def test_free_only_run_ignores_max_paid_calls(self) -> None:
         args = _parser().parse_args([
             "--targets", "targets.csv",
@@ -1504,7 +1636,7 @@ class GroundedRescueTests(unittest.TestCase):
         self.assertEqual([5.0], clock.sleeps)
         self.assertEqual(2, client.telemetry["model_requests"])
 
-    def test_free2_429_honors_retry_after_then_succeeds(self) -> None:
+    def test_free2_429_honors_retry_after_and_is_vetoed_for_run(self) -> None:
         clock = FakeClock()
         log: list[tuple] = []
         clients = {
@@ -1512,7 +1644,7 @@ class GroundedRescueTests(unittest.TestCase):
                 "free", [HttpError(429, "minute quota", headers={"Retry-After": "5"})], log
             ),
             "FREE2": SequencedClient(
-                "free2", [HttpError(429, "minute quota", headers={"Retry-After": "7"}), sdk_response()], log
+                "free2", [HttpError(429, "minute quota", headers={"Retry-After": "7"})], log
             ),
         }
         client = GeminiGroundedClient(
@@ -1522,12 +1654,43 @@ class GroundedRescueTests(unittest.TestCase):
             clock=clock.monotonic,
             sleep=clock.sleep,
         )
-        answer = client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
-        self.assertEqual("gemini_free_2", answer.provider)
+        with self.assertRaises(RuntimeError):
+            client.search("q", model=REQUIRED_MODEL, municipio="camaqua", bucket="concurso_publico")
         self.assertIn(5.0, clock.sleeps)
         self.assertIn(7.0, clock.sleeps)
         self.assertEqual(2, client.telemetry["quota_429"])
         self.assertEqual(0, client.telemetry["paid_calls"])
+        self.assertEqual(1, sum(item[0] == "free2" for item in log))
+
+    def test_free1_quota_429_is_not_retried_by_second_unit(self) -> None:
+        log: list[tuple] = []
+        clients = {
+            "FREE": SequencedClient("free", [HttpError(429, "minute quota")], log),
+            "FREE2": SequencedClient("free2", [sdk_response(), sdk_response()], log),
+        }
+        client = GeminiGroundedClient(
+            {"GEMINI_API_KEY_FREE": "FREE", "GEMINI_API_KEY_FREE_2": "FREE2"},
+            client_factory=lambda *, api_key, vertexai: clients[api_key],
+            free_only=True,
+            sleep=lambda _: None,
+        )
+        _, summary = run_rescue(
+            [
+                Target("camaqua", "concurso_publico", "pista"),
+                Target("canoas", "concurso_publico", "pista"),
+            ],
+            client=client,
+            fetcher=FakeFetcher(),
+            max_searches=1,
+            sleep_seconds=0,
+            free_only=True,
+        )
+        self.assertEqual(1, sum(item[0] == "free" for item in log))
+        self.assertEqual(2, sum(item[0] == "free2" for item in log))
+        self.assertIn(
+            ("gemini_free_1", REQUIRED_MODEL, "quota_429_run_veto"),
+            [tuple(item) for item in summary["capacidad_vetada"]],
+        )
 
     def test_missing_search_count_metadata_records_unknown_without_estimate(self) -> None:
         log: list[tuple] = []

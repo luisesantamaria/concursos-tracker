@@ -175,6 +175,15 @@ class GroundedClient(Protocol):
         """Perform one grounded search intent and return candidate evidence."""
 
 
+class _AdaptersOnlyModelGuard:
+    """Structural bomb: adapters-only must never reach a model client."""
+
+    telemetry = {"providers": {provider: {} for provider in PROVIDERS}}
+
+    def search(self, query: str, *, model: str, municipio: str, bucket: str) -> GroundedAnswer:
+        raise AssertionError("adapters_only_model_client_invoked")
+
+
 class ExplicitModelRejection(RuntimeError):
     """An API provider explicitly rejected the exact required model."""
 
@@ -464,6 +473,19 @@ class GeminiGroundedClient:
         self._capacity_veto[key] = "model_unavailable_for_provider"
         self._capacity_errors[key] = _safe_error(exc, self._secret_values())
 
+    def _veto_free_quota_for_run(
+        self, provider: str, model: str, exc: BaseException
+    ) -> None:
+        """Veto one exhausted FREE key until this client/run ends."""
+
+        if provider not in {"gemini_free_1", "gemini_free_2"}:
+            return
+        key = (provider, model)
+        if key in self._capacity_veto:
+            return
+        self._capacity_veto[key] = "quota_429_run_veto"
+        self._capacity_errors[key] = _safe_error(exc, self._secret_values())
+
     def _next_available_provider(
         self,
         steps: Sequence[str],
@@ -592,13 +614,12 @@ class GeminiGroundedClient:
                     classified = classify_error(exc)
                     if not classified.fallback_eligible:
                         raise
+                    if classified.category is ErrorCategory.QUOTA_429:
+                        self._veto_free_quota_for_run(provider, model, exc)
                     if provider == "gemini_free_2" and classified.category is ErrorCategory.QUOTA_429:
                         if self._daily_quota_exhausted(exc):
                             raise DailyQuotaExhausted("free2_daily_quota_exhausted") from exc
                         delay = self._governor.backoff_seconds(attempt, classified.retry_after)
-                        if attempt < attempts:
-                            self._sleep(delay)
-                            continue
                         self._sleep(delay)
                     elif classified.category is ErrorCategory.QUOTA_429:
                         # Retry-After/backoff applies even when the next attempt
@@ -612,6 +633,15 @@ class GeminiGroundedClient:
 
     def _production_call(self, model: str, prompt: str) -> tuple[Any, str, list[dict[str, str]]]:
         """Authorized production extension; never used by ``--free-only``."""
+        if all((provider, model) in self._capacity_veto for provider in self._free_steps()):
+            event = {
+                "from_provider": self._free_steps()[-1],
+                "to_provider": "gemini_paid",
+                "cause": "quota_429_run_veto",
+            }
+            self._fallback_events.append(dict(event))
+            response = self._invoke("gemini_paid", model, prompt)
+            return response, "gemini_paid", [event]
         try:
             return self._free_only_call(model, prompt)
         except (
@@ -1236,12 +1266,25 @@ def _read_unit_files(output_dir: Path) -> list[dict[str, Any]]:
             isinstance(payload, dict)
             and payload.get("schema_version") == UNIT_SCHEMA_VERSION
             and payload.get("estado") in {
-                "completed", "failed", "DETENIDA_CUOTA_DIARIA_FREE2",
+                "completed", "failed", "skipped", "DETENIDA_CUOTA_DIARIA_FREE2",
                 "DETENIDA_FRENO_CUOTA", "FALLO_DE_POLITICA",
             }
         ):
             payloads.append(payload)
     return payloads
+
+
+def _paid_calls_in_payloads(payloads: Sequence[Mapping[str, Any]]) -> int:
+    return sum(
+        int(
+            (payload.get("telemetria", {}) or {})
+            .get("providers", {})
+            .get("gemini_paid", {})
+            .get("calls", 0)
+            or 0
+        )
+        for payload in payloads
+    )
 
 
 def _snippet(answer: GroundedAnswer) -> str:
@@ -1653,6 +1696,7 @@ def micro_acquire_unit(
     adapter_dispatcher: Callable[..., Mapping[str, Any]] = dispatch_f3_adapter,
     adapter_context: Mapping[str, Any] | None = None,
     multi24_authority_cache: dict[str, _Multi24OfficialPage] | None = None,
+    dispatch_only: bool = False,
 ) -> dict[str, Any]:
     """Perform exactly one controlled fetch+render acquisition and persist it."""
     initial_url = url
@@ -1740,6 +1784,10 @@ def micro_acquire_unit(
                 _, snapshot_text = extract_title_and_text(fetched.html)
                 status = fetched.status_code
                 trigger = f'f3_adapter:{adapter_result.get("adapter", "unknown")}'
+            elif dispatch_only:
+                _, snapshot_text = extract_title_and_text(fetched.html)
+                status = fetched.status_code
+                trigger = f'f3_adapter:{adapter_result.get("adapter", "unknown")}:sin_candidatas'
             else:
                 rendered = renderer(final_url)
                 if rendered is not None:
@@ -1789,6 +1837,7 @@ def micro_acquire_unit(
         adapter_result.get("candidates")
         or adapter_result.get("hook")
         or adapter_result.get("platform") == "multi24"
+        or (dispatch_only and adapter_result.get("platform") is not None)
     ):
         payload["adaptador"] = adapter_result
     output_dir = Path(output_dir)
@@ -1831,10 +1880,19 @@ def _adapter_candidate_rows(
     return rows
 
 
-def _select_micro_target(target: Target, pending: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _select_micro_target(
+    target: Target,
+    pending: Sequence[Mapping[str, Any]],
+    *,
+    require_platform: bool = False,
+) -> dict[str, Any]:
     """Prefer a replay URL; otherwise require an evaluated, unambiguous candidate."""
     original_urls = extract_answer_urls(GroundedAnswer(text=target.pista))
     for original in original_urls:
+        if require_platform and detect_platform(original, "") not in {
+            "multi24", "atende", "datatables"
+        }:
+            continue
         allowed, reason = official_host_check(target.municipio, original)
         if allowed:
             return {
@@ -1842,7 +1900,14 @@ def _select_micro_target(target: Target, pending: Sequence[Mapping[str, Any]]) -
                 "host_oficial_check": reason, "fuente": "target_original",
                 "redirector_original": "", "selection_reason": "url_original_target_replay",
             }
-    evaluated = [dict(item) for item in pending if item.get("url") and item.get("host_oficial_check")]
+    evaluated = [
+        dict(item) for item in pending
+        if item.get("url")
+        and item.get("host_oficial_check")
+        and (not require_platform or item.get("detected_platform") in {
+            "multi24", "atende", "datatables"
+        })
+    ]
     bucket_specific = [
         item for item in evaluated
         if _bucket_matches(f'{item.get("url", "")} {item.get("snippet", "")}', target.bucket)
@@ -1860,6 +1925,32 @@ def _select_micro_target(target: Target, pending: Sequence[Mapping[str, Any]]) -
         "host_oficial_check": "sin_url_no_ambigua",
         "fuente": "", "redirector_original": "",
         "selection_reason": "sin_candidata_evaluada_no_ambigua",
+    }
+
+
+def _select_detectable_target_url(target: Target) -> dict[str, Any]:
+    """Select an original URL only when URL-first platform proof exists."""
+
+    for original in extract_answer_urls(GroundedAnswer(text=target.pista)):
+        platform = detect_platform(original, "")
+        if platform not in {"multi24", "atende", "datatables"}:
+            continue
+        allowed, reason = official_host_check(target.municipio, original)
+        if allowed:
+            return {
+                "url": original,
+                "query": "",
+                "snippet": target.pista,
+                "host_oficial_check": reason,
+                "fuente": "target_original",
+                "redirector_original": "",
+                "selection_reason": f"plataforma_detectable:{platform}",
+            }
+    return {
+        "url": "", "query": "", "snippet": "",
+        "host_oficial_check": "sin_plataforma_detectable",
+        "fuente": "", "redirector_original": "",
+        "selection_reason": "sin_plataforma_detectable",
     }
 
 
@@ -1956,6 +2047,7 @@ def run_rescue(
     resume: bool = False,
     skip_existing: bool = False,
     micro_acquire: bool = False,
+    adapters_only: bool = False,
     renderer: Callable[[str], Any] = render_page_networkidle,
     redirect_session_factory: Callable[[], Any] = _new_redirect_session,
     redirect_host_resolver: Callable[[str], Sequence[str]] = _default_redirect_host_resolver,
@@ -1972,26 +2064,49 @@ def run_rescue(
     if not 1 <= max_searches <= MAX_POLICY_SEARCHES:
         raise ValueError("max_searches_debe_estar_entre_1_y_5")
     policy = {
-        "grounding_tool": "google_search",
+        "grounding_tool": None if adapters_only else "google_search",
         "retrieval": False,
         "map_grounding": False,
-        "max_searches_per_unit": max_searches,
+        "max_searches_per_unit": 0 if adapters_only else max_searches,
         "confirmation_performed": False,
         "writes_url_map": False,
         "micro_acquire": micro_acquire,
+        "adapters_only": adapters_only,
         "free_only": free_only,
-        "provider_sequence": "FREE1->FREE2->STOP" if free_only else "FREE1->FREE2->PAID",
+        "provider_sequence": (
+            "NONE_ADAPTERS_ONLY" if adapters_only else
+            ("FREE1->FREE2->STOP" if free_only else "FREE1->FREE2->PAID")
+        ),
     }
     if paid_authorization is not None:
         policy["paid_authorization"] = paid_authorization
-        policy["max_paid_calls"] = max_paid_calls
     if free_only and _provider_snapshot(client)["paid_calls"] != 0:
         raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_before_run")
+    adapters_only_model_calls_before = sum(
+        item["calls"] for item in _provider_snapshot(client)["providers"].values()
+    )
     output_path = Path(output_dir) if output_dir is not None else None
     if output_path is not None:
         output_path.mkdir(parents=True, exist_ok=True)
         _cleanup_tmp_files(output_path)
     should_resume = resume or skip_existing
+    paid_calls_previas = (
+        _paid_calls_in_payloads(_read_unit_files(output_path))
+        if should_resume and output_path is not None else 0
+    )
+    tope_efectivo = (
+        max(0, max_paid_calls - paid_calls_previas)
+        if max_paid_calls is not None else None
+    )
+    paid_calls_at_start = _provider_snapshot(client)["paid_calls"]
+    if paid_authorization is not None:
+        policy.update({
+            "max_paid_calls": max_paid_calls,
+            "paid_calls_previas": paid_calls_previas,
+            "tope_efectivo": tope_efectivo,
+        })
+        if hasattr(client, "max_paid_calls"):
+            client.max_paid_calls = tope_efectivo
     payloads: list[dict[str, Any]] = []
     skipped_existing = 0
     stop_after_current = False
@@ -2029,7 +2144,7 @@ def run_rescue(
             "confirmacion": False,
         }
         seen_final: set[str] = set()
-        queries = build_queries(target)[:max_searches]
+        queries = [] if adapters_only else build_queries(target)[:max_searches]
         micro_result: dict[str, Any] | None = None
         estado = "completed"
         causa: str | None = None
@@ -2188,6 +2303,7 @@ def run_rescue(
                                 "redirector_original": redirector_original,
                             })
                             continue
+                        detected_platform = detect_platform(candidate_url, result.html)
                     except RescueInterrupted:
                         raise
                     except BaseException as exc:
@@ -2208,6 +2324,20 @@ def run_rescue(
                     if final_normalized != normalized and final_normalized in seen_final:
                         continue
                     seen_final.add(final_normalized)
+                    if (
+                        target.sub_causa == "url_mala"
+                        and detected_platform in {"multi24", "atende", "datatables"}
+                    ):
+                        grounded["micro_pendientes"].append({
+                            "url": candidate_url,
+                            "query": query,
+                            "snippet": source_snippet,
+                            "host_oficial_check": reason,
+                            "fuente": source,
+                            "redirector_original": redirector_original,
+                            "detected_platform": detected_platform,
+                        })
+                        continue
                     if target.sub_causa == "render_incierto" and not positive_quotes:
                         grounded["micro_pendientes"].append({
                             "url": candidate_url,
@@ -2240,6 +2370,40 @@ def run_rescue(
                     ))
                 if index + 1 < len(queries) and sleep_seconds:
                     sleep(sleep_seconds)
+            if adapters_only:
+                if output_path is None:
+                    raise ValueError("adapters_only_requiere_output_dir")
+                selected = _select_detectable_target_url(target)
+                if not selected["url"]:
+                    estado = "skipped"
+                    causa = "sin_plataforma_detectable"
+                else:
+                    micro_result = micro_acquire_unit(
+                        target,
+                        selected["url"],
+                        output_dir=output_path,
+                        fetcher=fetcher,
+                        timestamp_run=timestamp_factory(),
+                        fetch_timeout=fetch_timeout,
+                        renderer=renderer,
+                        selection_reason=selected["selection_reason"],
+                        adapter_dispatcher=adapter_dispatcher,
+                        adapter_context=(
+                            adapter_context_provider(target, selected["url"])
+                            if adapter_context_provider is not None else None
+                        ),
+                        multi24_authority_cache=multi24_authority_cache,
+                        dispatch_only=True,
+                    )
+                    unit_candidates.extend(_adapter_candidate_rows(
+                        target,
+                        micro_result,
+                        query="",
+                        snippet=selected["snippet"],
+                        host_reason=selected["host_oficial_check"],
+                        fuente=selected["fuente"],
+                        redirector_original="",
+                    ))
             if (
                 estado == "completed"
                 and grounded["queries"]
@@ -2249,10 +2413,16 @@ def run_rescue(
                 causa = "all_grounded_searches_failed"
             if (
                 estado == "completed" and micro_acquire
-                and target.sub_causa == "render_incierto" and not unit_candidates
+                and target.sub_causa in {"render_incierto", "url_mala"}
+                and not unit_candidates
+                and not adapters_only
             ):
                 pending = grounded["micro_pendientes"]
-                selected = _select_micro_target(target, pending)
+                selected = _select_micro_target(
+                    target,
+                    pending,
+                    require_platform=(target.sub_causa == "url_mala"),
+                )
                 if output_path is None:
                     raise ValueError("micro_acquire_requiere_output_dir")
                 micro_result = micro_acquire_unit(
@@ -2306,8 +2476,8 @@ def run_rescue(
         grounded["candidatas"] = [row.as_dict() for row in unit_candidates]
         after = _provider_snapshot(client)
         paid_cap_reached_here = (
-            max_paid_calls is not None
-            and before["paid_calls"] < max_paid_calls <= after["paid_calls"]
+            tope_efectivo is not None
+            and before["paid_calls"] < tope_efectivo <= after["paid_calls"]
         )
         payload = {
             "schema_version": UNIT_SCHEMA_VERSION,
@@ -2335,6 +2505,9 @@ def run_rescue(
         payloads.append(payload)
         if stop_after_current:
             break
+    policy["paid_calls_nuevas"] = max(
+        0, _provider_snapshot(client)["paid_calls"] - paid_calls_at_start
+    )
     if output_path is not None:
         summary = rebuild_summary(output_path, policy=policy, skipped_existing=skipped_existing)
         candidates = _rows_from_unit_payloads(_read_unit_files(output_path))
@@ -2344,6 +2517,12 @@ def run_rescue(
     if free_only and summary["global"]["paid_calls"] != 0:
         summary["global"]["estado_corrida"] = "FALLO_DE_POLITICA"
         raise PolicyFailure("FALLO_DE_POLITICA:paid_calls_after_run")
+    if adapters_only:
+        adapters_only_model_calls_after = sum(
+            item["calls"] for item in _provider_snapshot(client)["providers"].values()
+        )
+        if adapters_only_model_calls_after != adapters_only_model_calls_before:
+            raise PolicyFailure("FALLO_DE_POLITICA:adapters_only_model_client_invoked")
     return candidates, summary
 
 
@@ -2430,6 +2609,9 @@ def _aggregate_unit_payloads(
             "fallbacks_by_provider": fallbacks_by_provider,
             "capacidad_vetada": capacity_vetoes,
             "paid_calls": calls_by_provider["gemini_paid"],
+            "paid_calls_previas": int(policy.get("paid_calls_previas", 0) or 0),
+            "paid_calls_nuevas": int(policy.get("paid_calls_nuevas", 0) or 0),
+            "tope_efectivo": policy.get("tope_efectivo"),
             "model_requests": telemetry_counters["model_requests"],
             "successful_model_responses": telemetry_counters["successful_model_responses"],
             "google_search_queries": telemetry_counters["google_search_queries"],
@@ -2463,7 +2645,7 @@ def _aggregate_unit_payloads(
             None,
         )
         result["paid_cap"] = {
-            "limite": policy["max_paid_calls"],
+            "limite": policy.get("tope_efectivo", policy["max_paid_calls"]),
             "alcanzado_en_unidad": reached_unit,
         }
     return result
@@ -2514,7 +2696,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Propone candidatas URL con Google Search grounding; nunca confirma.")
     parser.add_argument("--targets", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--credentials-file", type=Path, required=True)
+    parser.add_argument("--credentials-file", type=Path)
     parser.add_argument("--model", default=REQUIRED_MODEL)
     parser.add_argument("--max-searches", type=int, default=MAX_POLICY_SEARCHES)
     parser.add_argument("--sleep", type=float, default=1.0)
@@ -2559,32 +2741,44 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Tras grounding, ejecuta una adquisicion fetch+render por unidad render_incierto pendiente.",
     )
+    parser.add_argument(
+        "--adapters-only",
+        action="store_true",
+        help="Ejecuta solo fetch+dispatch para URLs con plataforma detectable; cero modelo.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.adapters_only and (args.free_only or args.paid_authorized):
+        parser.error("--adapters-only no se combina con autorizaciones de modelo")
     if args.paid_authorized and args.max_paid_calls is None:
         parser.error("--max-paid-calls es obligatorio con --paid-authorized")
     if args.max_paid_calls is not None and args.max_paid_calls < 1:
         parser.error("--max-paid-calls debe ser un entero positivo")
     if args.sleep < 0 or args.fetch_timeout < 1:
         raise ValueError("sleep/fetch-timeout invalidos")
-    if not args.free_only and not args.paid_authorized:
+    if not args.adapters_only and not args.free_only and not args.paid_authorized:
         raise PolicyFailure("FALLO_DE_POLITICA:rescate_cli_requiere_--free-only")
+    if not args.adapters_only and args.credentials_file is None:
+        parser.error("--credentials-file es obligatorio fuera de --adapters-only")
     if args.global_call_budget < 1 or args.daily_model_limit < 1 or args.daily_search_limit < 1:
         raise ValueError("limites_de_cuota_invalidos")
     free_only = args.free_only
-    credentials = load_grounded_credentials(args.credentials_file, free_only=free_only)
-    client = GeminiGroundedClient(
-        credentials,
-        free_only=free_only,
-        max_paid_calls=(args.max_paid_calls if args.paid_authorized else None),
-        global_call_budget=args.global_call_budget,
-        daily_model_limit=args.daily_model_limit,
-        daily_search_limit=args.daily_search_limit,
-    )
+    if args.adapters_only:
+        client: GroundedClient = _AdaptersOnlyModelGuard()
+    else:
+        credentials = load_grounded_credentials(args.credentials_file, free_only=free_only)
+        client = GeminiGroundedClient(
+            credentials,
+            free_only=free_only,
+            max_paid_calls=(args.max_paid_calls if args.paid_authorized else None),
+            global_call_budget=args.global_call_budget,
+            daily_model_limit=args.daily_model_limit,
+            daily_search_limit=args.daily_search_limit,
+        )
     targets = read_targets(args.targets)
     fetcher = RequestsFetcher()
     interruption = InterruptionState()
@@ -2606,6 +2800,7 @@ def main(argv: list[str] | None = None) -> int:
                 resume=args.resume,
                 skip_existing=args.skip_existing,
                 micro_acquire=args.micro_acquire,
+                adapters_only=args.adapters_only,
                 interruption=interruption,
                 free_only=free_only,
                 paid_authorization=(PAID_AUTHORIZATION if args.paid_authorized else None),
