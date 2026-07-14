@@ -36,6 +36,29 @@ def fixture_bytes(name: str) -> bytes:
     return (FIXTURES / name).read_bytes()
 
 
+def without_sanitized_identity(body: bytes, municipio: str) -> bytes:
+    text = body.decode("utf-8")
+    text = re.sub(
+        r"<title>.*?</title>",
+        "<title>Portal da Transparência</title>",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    text = text.replace(f"<p>Município de {municipio}</p>", "", 1)
+    return text.encode("utf-8")
+
+
+def with_live_identity_banner(body: bytes, municipio: str) -> bytes:
+    text = without_sanitized_identity(body, municipio).decode("utf-8")
+    banner = (
+        '<div class="row background-nome"><div class="col-md-12">'
+        f'<p class="cidade-centro">Município de {municipio}</p>'
+        "</div></div>"
+    )
+    return text.replace("<body>", f"<body>{banner}", 1).encode("utf-8")
+
+
 def authority_for(url: str, *, municipio: str | None = None) -> Multi24Authority:
     parsed = urlsplit(url)
     if "floresdacunha" in parsed.netloc:
@@ -60,6 +83,31 @@ def authority_for(url: str, *, municipio: str | None = None) -> Multi24Authority
     )
     return Multi24Authority(
         official_source_origins=("https://authority.fixture.test",),
+        navigation_snapshots=(proof,),
+    )
+
+
+def authority_with_target(
+    target_url: str,
+    *,
+    municipio: str = "Flores da Cunha",
+    label: str = "Acesso com Senha",
+) -> Multi24Authority:
+    source_url = "https://official.fixture.test/"
+    escaped_target = target_url.replace("&", "&amp;")
+    body = (
+        f"<html><head><title>Prefeitura Municipal de {municipio} - Home</title></head>"
+        f'<body><a href="{escaped_target}">{label}</a></body></html>'
+    ).encode("utf-8")
+    proof = Multi24Snapshot(
+        requested_url=source_url,
+        final_url=source_url,
+        status_code=200,
+        body=body,
+        content_type="text/html; charset=utf-8",
+    )
+    return Multi24Authority(
+        official_source_origins=("https://official.fixture.test",),
         navigation_snapshots=(proof,),
     )
 
@@ -407,6 +455,92 @@ def test_entry_origin_must_be_explicitly_authorized_with_navigation_evidence() -
         )
 
 
+def test_official_title_and_exact_same_origin_portal_root_prove_delegation() -> None:
+    entry = snapshot(FLORES_ENTRY, "flores_tree.html")
+    target = target_for(
+        entry,
+        "Flores da Cunha",
+        "Concurso Público 01/2026",
+        "Concursos Públicos",
+    )
+    portal_root = (
+        "https://pmfloresdacunha.multi24h.com.br/"
+        "multi24/sistemas/portal/#tab-login"
+    )
+
+    result = _analyze_multi24(
+        entry=entry,
+        linked_pages={target: snapshot(target, "flores_cp_2026.html")},
+        authority=authority_with_target(portal_root),
+        municipio="Flores da Cunha",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "candidata"
+    assert (
+        "official_navigation_relation:same_origin_multi24_portal_root"
+        in result.authority_evidence
+    )
+    assert f"official_navigation_target:{portal_root}" in result.authority_evidence
+
+
+@pytest.mark.parametrize(
+    ("target_url", "label"),
+    [
+        (
+            "https://floresdacunha.multi24h.com.br/multi24/sistemas/portal/",
+            "Acesso com Senha",
+        ),
+        (
+            "https://pmfloresdacunha.multi24h.com.br/multi24/sistemas/portal-malicioso/",
+            "Portal da Transparência",
+        ),
+        (
+            "https://pmfloresdacunha.multi24h.com.br/multi24/sistemas/portal/extra",
+            "Concurso",
+        ),
+        (
+            "https://pmfloresdacunha.multi24h.com.br/multi24/sistemas/portal/?atalho=x",
+            "Acesso com Senha",
+        ),
+        (
+            "https://pmfloresdacunha.multi24h.com.br/arbitrary",
+            "Concursos/Processos Seletivos",
+        ),
+        (
+            "http://pmfloresdacunha.multi24h.com.br/multi24/sistemas/portal/",
+            "Acesso com Senha",
+        ),
+        (
+            "https://user@pmfloresdacunha.multi24h.com.br/multi24/sistemas/portal/",
+            "Acesso com Senha",
+        ),
+        (
+            "https://pmfloresdacunha.multi24h.com.br:444/multi24/sistemas/portal/",
+            "Acesso com Senha",
+        ),
+    ],
+)
+def test_portal_root_delegation_rejects_broad_or_ambiguous_targets(
+    target_url: str,
+    label: str,
+) -> None:
+    entry = snapshot(FLORES_ENTRY, "flores_tree.html")
+    result = _analyze_multi24(
+        entry=entry,
+        linked_pages={},
+        authority=authority_with_target(target_url, label=label),
+        municipio="Flores da Cunha",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "revisar"
+    assert result.reason == "official_navigation_link_not_proven"
+    assert result.authority_evidence == ()
+
+
 def test_municipality_identity_does_not_accept_a_longer_name_with_same_prefix() -> None:
     original = fixture_bytes("progresso_tree.html")
     body = original.replace("Progresso".encode(), "São José do Norte".encode())
@@ -439,6 +573,310 @@ def test_contradictory_title_cannot_be_overridden_by_expected_header_mention() -
     )
     assert result.disposition == "revisar"
     assert result.reason == "entry_identity_mismatch"
+
+
+def test_live_multi24_banner_identity_is_accepted_for_entry_and_child() -> None:
+    entry = replace(
+        snapshot(PROGRESSO_ENTRY, "progresso_tree.html"),
+        body=with_live_identity_banner(fixture_bytes("progresso_tree.html"), "Progresso"),
+    )
+    target = target_for(entry, "Progresso", "2026", "Concursos Públicos")
+    child = snapshot(target, "progresso_live_2026.html")
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={target: child},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "candidata"
+    assert result.reason == "candidate_nodes_with_item_evidence"
+    assert result.identity_evidence == ("municipio:progresso",)
+    assert len(result.items) == 8
+    assert all("secao=download" in item.url for item in result.items)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_role",
+        "wrong_heading_class",
+        "hidden_path",
+        "wrong_year",
+        "wrong_bucket",
+        "contradictory_duplicate",
+    ],
+)
+def test_live_multi24_path_surface_remains_exact_and_fail_closed(mutation: str) -> None:
+    entry = snapshot(PROGRESSO_ENTRY, "progresso_tree.html")
+    target = target_for(entry, "Progresso", "2026", "Concursos Públicos")
+    body = fixture_bytes("progresso_live_2026.html")
+    if mutation == "wrong_role":
+        body = body.replace(b'role="main"', b'role="region"', 1)
+    elif mutation == "wrong_heading_class":
+        body = body.replace(b'<h1 class="title">', b'<h1 class="page-title">', 1)
+    elif mutation == "hidden_path":
+        body = body.replace(b'role="main">', b'role="main" hidden>', 1)
+    elif mutation == "wrong_year":
+        body = body.replace(
+            b"<h1 class=\"title\">Concursos P\xc3\xbablicos / 2026</h1>",
+            b"<h1 class=\"title\">Concursos P\xc3\xbablicos / 2025</h1>",
+            1,
+        )
+    elif mutation == "wrong_bucket":
+        body = body.replace(
+            b"<h1 class=\"title\">Concursos P\xc3\xbablicos / 2026</h1>",
+            b"<h1 class=\"title\">Processos Seletivos / 2026</h1>",
+            1,
+        )
+    else:
+        body = body.replace(
+            b"<h1 class=\"title\">Concursos P\xc3\xbablicos / 2026</h1>",
+            (
+                b"<h1 class=\"title\">Concursos P\xc3\xbablicos / 2026</h1>"
+                b"<h1 class=\"title\">Concursos P\xc3\xbablicos / 2025</h1>"
+            ),
+            1,
+        )
+    child = replace(
+        snapshot(target, "progresso_live_2026.html"),
+        body=body,
+    )
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={target: child},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "revisar"
+    assert "linked_page_breadcrumb_mismatch" in result.review_reasons
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_node_span",
+        "wrong_section",
+        "wrong_sub",
+        "wrong_entity",
+        "missing_publication_class",
+        "wrong_publication_year",
+        "impossible_publication_date",
+        "excluded_titles",
+    ],
+)
+def test_live_download_rows_reject_incomplete_or_ambiguous_evidence(mutation: str) -> None:
+    entry = snapshot(PROGRESSO_ENTRY, "progresso_tree.html")
+    target = target_for(entry, "Progresso", "2026", "Concursos Públicos")
+    body = fixture_bytes("progresso_live_2026.html")
+    if mutation == "wrong_node_span":
+        body = body.replace(b'id="span11730"', b'id="span99999"')
+    elif mutation == "wrong_section":
+        body = body.replace(b"secao=download", b"secao=dinamico")
+    elif mutation == "wrong_sub":
+        body = body.replace(b"sub=menu", b"sub=other")
+    elif mutation == "wrong_entity":
+        body = body.replace(b"entidade=1&amp;secao=download", b"entidade=2&amp;secao=download")
+    elif mutation == "missing_publication_class":
+        body = body.replace(b'class="publicacao"', b'class="published"')
+    elif mutation == "wrong_publication_year":
+        body = re.sub(br"(Publicado em \d{2}/\d{2}/)2026", br"\g<1>2025", body)
+    elif mutation == "impossible_publication_date":
+        body = re.sub(
+            br"Publicado em \d{2}/\d{2}/2026",
+            b"Publicado em 31/02/2026",
+            body,
+        )
+    else:
+        body = body.replace(b"CP PROGRESSO", b"Concurso Cultural PROGRESSO")
+        body = body.replace(b"Progresso CP", b"Concurso Cultural Progresso")
+    child = replace(
+        snapshot(target, "progresso_live_2026.html"),
+        body=body,
+    )
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={target: child},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "revisar"
+    assert "linked_page_insufficient_item_evidence" in result.review_reasons
+
+
+def test_live_download_rows_dedupe_by_document_id_and_still_require_two() -> None:
+    entry = snapshot(PROGRESSO_ENTRY, "progresso_tree.html")
+    target = target_for(entry, "Progresso", "2026", "Concursos Públicos")
+    original = fixture_bytes("progresso_live_2026.html")
+    duplicate = original.replace(b"id=11945", b"id=11946", 1)
+    duplicate_result = analyze_multi24(
+        entry=entry,
+        linked_pages={
+            target: replace(
+                snapshot(target, "progresso_live_2026.html"),
+                body=duplicate,
+            )
+        },
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+    assert duplicate_result.disposition == "candidata"
+    assert len(duplicate_result.items) == 7
+
+    one_valid = re.sub(
+        br'id="span11730"',
+        b'id="span99999"',
+        original,
+        count=7,
+    )
+    one_result = analyze_multi24(
+        entry=entry,
+        linked_pages={
+            target: replace(
+                snapshot(target, "progresso_live_2026.html"),
+                body=one_valid,
+            )
+        },
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+    assert one_result.disposition == "revisar"
+    assert "linked_page_insufficient_item_evidence" in one_result.review_reasons
+
+
+@pytest.mark.parametrize(
+    "identity_markup",
+    [
+        "<main><p>Município de Progresso</p></main>",
+        "<main><article><h1>Edital da Prefeitura Municipal de Progresso</h1></article></main>",
+        "<aside><h2>Município de Progresso</h2></aside>",
+        "<nav><h2>Município de Progresso</h2></nav>",
+        '<p class="cidade-centro">Município de Progresso</p>',
+        '<div class="background-nome"><p>Município de Progresso</p></div>',
+        (
+            '<nav><div class="row background-nome"><div class="col-md-12">'
+            '<p class="cidade-centro">Município de Progresso</p>'
+            "</div></div></nav>"
+        ),
+        (
+            '<div class="row background-nome" hidden><div class="col-md-12">'
+            '<p class="cidade-centro">Município de Progresso</p>'
+            "</div></div>"
+        ),
+        (
+            '<div class="row background-nome" aria-hidden="true"><div class="col-md-12">'
+            '<p class="cidade-centro">Município de Progresso</p>'
+            "</div></div>"
+        ),
+        (
+            '<div class="row background-nome"><div class="col-md-12">'
+            '<select><option class="cidade-centro">Município de Progresso</option></select>'
+            "</div></div>"
+        ),
+        "<footer><p>Prefeitura Municipal de Progresso</p></footer>",
+    ],
+)
+def test_non_authoritative_identity_mentions_remain_fail_closed(identity_markup: str) -> None:
+    text = without_sanitized_identity(
+        fixture_bytes("progresso_tree.html"),
+        "Progresso",
+    ).decode("utf-8")
+    body = text.replace("<body>", f"<body>{identity_markup}", 1).encode("utf-8")
+    entry = replace(snapshot(PROGRESSO_ENTRY, "progresso_tree.html"), body=body)
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "revisar"
+    assert result.reason == "entry_identity_mismatch"
+    assert result.identity_evidence == ()
+
+
+def test_title_declaration_alone_is_not_multi24_identity() -> None:
+    text = without_sanitized_identity(
+        fixture_bytes("progresso_tree.html"),
+        "Progresso",
+    ).decode("utf-8")
+    body = text.replace(
+        "<title>Portal da Transparência</title>",
+        "<title>Município de Progresso</title>",
+        1,
+    ).encode("utf-8")
+    entry = replace(snapshot(PROGRESSO_ENTRY, "progresso_tree.html"), body=body)
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "revisar"
+    assert result.reason == "entry_identity_mismatch"
+    assert result.identity_evidence == ()
+
+
+def test_incidental_other_city_in_content_does_not_contradict_live_banner() -> None:
+    body = with_live_identity_banner(
+        fixture_bytes("progresso_tree.html"),
+        "Progresso",
+    ).replace(
+        b"<main>",
+        b"<main><article><h2>Prefeitura Municipal de Outra Cidade</h2></article>",
+        1,
+    )
+    entry = replace(snapshot(PROGRESSO_ENTRY, "progresso_tree.html"), body=body)
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.reason == "linked_current_year_page_missing"
+    assert result.identity_evidence == ("municipio:progresso",)
+
+
+def test_live_banner_cannot_override_a_contradictory_title() -> None:
+    body = with_live_identity_banner(
+        fixture_bytes("progresso_tree.html"),
+        "Progresso",
+    ).replace(
+        b"<title>Portal da Transpar\xc3\xaancia</title>",
+        b"<title>Munic\xc3\xadpio de Outra Cidade</title>",
+        1,
+    )
+    entry = replace(snapshot(PROGRESSO_ENTRY, "progresso_tree.html"), body=body)
+
+    result = analyze_multi24(
+        entry=entry,
+        linked_pages={},
+        municipio="Progresso",
+        bucket="concurso_publico",
+        current_year=2026,
+    )
+
+    assert result.disposition == "revisar"
+    assert result.reason == "entry_identity_mismatch"
+    assert result.identity_evidence == ()
 
 
 def test_hyphenated_municipality_identity_is_preserved() -> None:

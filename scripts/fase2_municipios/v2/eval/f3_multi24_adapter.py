@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date
 import hashlib
 import re
 import unicodedata
@@ -29,9 +30,11 @@ VALID_DISPOSITIONS = frozenset({"candidata", "revisar"})
 MIN_ITEM_EVIDENCE = 2
 
 _MULTI24_PATH_RE = re.compile(r"^/multi24/sistemas/transparencia(?:/index)?/?$", re.IGNORECASE)
+_MULTI24_PORTAL_ROOT_RE = re.compile(r"^/multi24/sistemas/portal/?$", re.IGNORECASE)
+_FRIENDLY_TRANSPARENCIA_RE = re.compile(r"^/portal-da-transparencia(?:/|$)", re.IGNORECASE)
 _EXCLUDED_BRANCH_PATTERNS = (
     re.compile(r"\bchamadas?\s+publicas?\b"),
-    re.compile(r"\bconcursos?\s+culturais?\b"),
+    re.compile(r"\bconcursos?\s+cultur(?:al|ais)\b"),
     re.compile(r"\blicitac(?:ao|oes)\b"),
     re.compile(r"\bsoberanas?\b"),
     re.compile(r"\brainhas?\b"),
@@ -54,6 +57,34 @@ _SOFT_404_TERMS = (
     "conteudo solicitado nao esta disponivel",
     "erro 404",
     "pagina inexistente",
+)
+_MUNICIPAL_IDENTITY_BANNER_SELECTOR = (
+    "div.row.background-nome > div.col-md-12 > p.cidade-centro"
+)
+_MULTI24_LIVE_PATH_SELECTOR = (
+    "div.post_container[role='main'] > div.post > h1.title"
+)
+_IDENTITY_FORBIDDEN_TAGS = frozenset(
+    {
+        "a",
+        "article",
+        "aside",
+        "footer",
+        "main",
+        "nav",
+        "noscript",
+        "option",
+        "script",
+        "select",
+        "style",
+        "template",
+    }
+)
+_IDENTITY_FORBIDDEN_ROLES = frozenset(
+    {"menu", "menuitem", "navigation", "option"}
+)
+_IDENTITY_FORBIDDEN_CLASSES = frozenset(
+    {"download", "link_menu", "post", "post_container"}
 )
 
 
@@ -395,40 +426,108 @@ def _has_link_menu(soup: BeautifulSoup) -> bool:
     return False
 
 
+def _node_is_visible(tag: Tag) -> bool:
+    current: Tag | None = tag
+    while isinstance(current, Tag):
+        if current.has_attr("hidden") or current.has_attr("inert"):
+            return False
+        aria_hidden = current.get("aria-hidden", "")
+        if isinstance(aria_hidden, str) and aria_hidden.strip().casefold() == "true":
+            return False
+        style = current.get("style", "")
+        if isinstance(style, str):
+            compact_style = re.sub(r"\s+", "", style).casefold()
+            if "display:none" in compact_style or "visibility:hidden" in compact_style:
+                return False
+
+        parent = current.parent
+        current = parent if isinstance(parent, Tag) else None
+    return True
+
+
+def _eligible_identity_node(tag: Tag) -> bool:
+    """Return whether ``tag`` is visible institutional chrome, not content."""
+
+    if not _node_is_visible(tag):
+        return False
+    current: Tag | None = tag
+    while isinstance(current, Tag):
+        if current.name.casefold() in _IDENTITY_FORBIDDEN_TAGS:
+            return False
+
+        role = current.get("role", "")
+        if isinstance(role, str) and role.strip().casefold() in _IDENTITY_FORBIDDEN_ROLES:
+            return False
+
+        classes = current.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        if any(str(value).casefold() in _IDENTITY_FORBIDDEN_CLASSES for value in classes):
+            return False
+
+        parent = current.parent
+        current = parent if isinstance(parent, Tag) else None
+    return True
+
+
 def _identity_evidence(page: _ParsedPage, municipio: str) -> tuple[str, ...]:
     expected = _norm(municipio)
-    segments: list[str] = []
-    for tag in page.soup.find_all(["title", "h1", "h2", "h3"]):
+    title_segments: list[str] = []
+    chrome_segments: list[str] = []
+    for tag in page.soup.find_all("title"):
         if isinstance(tag, Tag):
             text = _norm(tag.get_text(" ", strip=True))
             if text:
-                segments.append(text)
+                title_segments.append(text)
     for header in page.soup.find_all("header"):
-        if not isinstance(header, Tag):
+        if not isinstance(header, Tag) or not _eligible_identity_node(header):
             continue
         for tag in header.find_all(["h1", "h2", "h3", "p", "span", "address"]):
-            if isinstance(tag, Tag):
+            if isinstance(tag, Tag) and _eligible_identity_node(tag):
                 text = _norm(tag.get_text(" ", strip=True))
                 if text:
-                    segments.append(text)
+                    chrome_segments.append(text)
 
-    declarations: set[str] = set()
+    # The live Multi24 template used by Progresso and Flores da Cunha keeps
+    # the municipal declaration in a banner outside ``header`` while the
+    # document title is only "Portal da Transparencia".  Accept that precise
+    # institutional surface, not arbitrary body paragraphs or name mentions.
+    for tag in page.soup.select(_MUNICIPAL_IDENTITY_BANNER_SELECTOR):
+        if isinstance(tag, Tag) and _eligible_identity_node(tag):
+            text = _norm(tag.get_text(" ", strip=True))
+            if text:
+                chrome_segments.append(text)
+
+    title_declarations: set[str] = set()
+    chrome_declarations: set[str] = set()
     declaration_pattern = re.compile(r"\b(?:municipio|prefeitura(?:\s+municipal)?)\s+de\s+(.+)$")
-    for segment in segments:
-        match = declaration_pattern.search(segment)
-        if not match:
-            continue
-        declared = re.split(
-            r"\s+(?:[-|;,])\s+|:\s*",
-            match.group(1),
-            maxsplit=1,
-        )[0].strip(" .")
-        if declared:
-            declarations.add(declared)
+    for segments, declarations in (
+        (title_segments, title_declarations),
+        (chrome_segments, chrome_declarations),
+    ):
+        for segment in segments:
+            match = declaration_pattern.search(segment)
+            if not match:
+                continue
+            declared = re.split(
+                r"\s+(?:[-|;,])\s+|:\s*",
+                match.group(1),
+                maxsplit=1,
+            )[0].strip(" .")
+            if declared:
+                declarations.add(declared)
 
-    # A matching footer/body mention cannot override a contradictory title or
-    # header declaration. Ambiguous authoritative identities fail closed.
-    if expected not in declarations or any(value != expected for value in declarations):
+    # On Multi24 a document title alone is not municipal authority. Official
+    # municipal source pages may use their title as the declaration that
+    # delegates to the portal; the portal entry itself must prove visible
+    # institutional chrome.
+    declarations = title_declarations | chrome_declarations
+    positive_declarations = (
+        chrome_declarations if _is_multi24_url(page.url) else declarations
+    )
+    if expected not in positive_declarations or any(
+        value != expected for value in declarations
+    ):
         return ()
     return (f"municipio:{expected}",)
 
@@ -633,6 +732,22 @@ def _classify_path(labels: tuple[str, ...]) -> str:
 
 
 def _breadcrumb_texts(soup: BeautifulSoup) -> tuple[str, ...]:
+    # Real Multi24 pages expose their full navigation path as the page title,
+    # not as an element named "breadcrumb".  Accept only the exact template
+    # chain observed across installations; generic headings remain content.
+    live_values: list[str] = []
+    live_seen: set[str] = set()
+    for tag in soup.select(_MULTI24_LIVE_PATH_SELECTOR):
+        if not isinstance(tag, Tag) or not _node_is_visible(tag):
+            continue
+        text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
+        normalized = _norm(text)
+        if text and normalized not in live_seen:
+            live_seen.add(normalized)
+            live_values.append(text)
+    if live_values:
+        return tuple(live_values)
+
     values: list[str] = []
     seen: set[str] = set()
     for tag in soup.find_all(True):
@@ -653,25 +768,34 @@ def _breadcrumb_texts(soup: BeautifulSoup) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _breadcrumb_value_matches(
+    breadcrumb: str,
+    edge: Multi24Edge,
+    bucket: str,
+    year: int,
+) -> bool:
+    normalized = _norm(breadcrumb)
+    if not _year_in_text(normalized, year):
+        return False
+    leaf = _norm(edge.label)
+    if leaf != str(year) and not re.search(
+        rf"(?<![\w-]){re.escape(leaf)}(?![\w-])", normalized
+    ):
+        return False
+    if bucket == "concurso_publico":
+        return bool(re.search(r"\bconcursos?\s+publicos?\b", normalized))
+    return bool(
+        re.search(r"\bprocessos?\s+seletivos?\b", normalized)
+        or re.search(r"\b(?:pss|psp)\b", normalized)
+    )
+
+
 def _breadcrumb_matches(page: _ParsedPage, edge: Multi24Edge, bucket: str, year: int) -> bool:
     breadcrumbs = _breadcrumb_texts(page.soup)
-    for breadcrumb in breadcrumbs:
-        normalized = _norm(breadcrumb)
-        if not _year_in_text(normalized, year):
-            continue
-        leaf = _norm(edge.label)
-        if leaf != str(year) and not re.search(
-            rf"(?<![\w-]){re.escape(leaf)}(?![\w-])", normalized
-        ):
-            continue
-        if bucket == "concurso_publico" and re.search(r"\bconcursos?\s+publicos?\b", normalized):
-            return True
-        if bucket == "processo_seletivo" and (
-            re.search(r"\bprocessos?\s+seletivos?\b", normalized)
-            or re.search(r"\b(?:pss|psp)\b", normalized)
-        ):
-            return True
-    return False
+    return bool(breadcrumbs) and all(
+        _breadcrumb_value_matches(value, edge, bucket, year)
+        for value in breadcrumbs
+    )
 
 
 def _content_roots(soup: BeautifulSoup) -> tuple[Tag, ...]:
@@ -724,6 +848,112 @@ def _item_evidence_key(title: str, year: int) -> str:
     return f"{'|'.join(kinds)}:{identifier}"
 
 
+def _live_multi24_download_evidence(
+    anchor: Tag,
+    page: _ParsedPage,
+    title: str,
+    year: int,
+    bucket: str,
+) -> tuple[str, str] | None:
+    """Validate the exact dated download row emitted by live Multi24."""
+
+    download_span = anchor.parent
+    if not isinstance(download_span, Tag) or download_span.name != "span":
+        return None
+    download_classes = download_span.get("class", [])
+    if isinstance(download_classes, str):
+        download_classes = download_classes.split()
+    if "download" not in {str(value).casefold() for value in download_classes}:
+        return None
+
+    row = download_span.parent
+    post = row.parent if isinstance(row, Tag) else None
+    container = post.parent if isinstance(post, Tag) else None
+    if not (
+        isinstance(row, Tag)
+        and row.name == "div"
+        and isinstance(post, Tag)
+        and post.name == "div"
+        and "post" in {str(value).casefold() for value in post.get("class", [])}
+        and isinstance(container, Tag)
+        and container.name == "div"
+        and "post_container"
+        in {str(value).casefold() for value in container.get("class", [])}
+        and str(container.get("role", "")).strip().casefold() == "main"
+        and _node_is_visible(row)
+    ):
+        return None
+    if any(
+        ancestor.name in {"nav", "aside"} or _has_navigation_container_marker(ancestor)
+        for ancestor in (container, *[value for value in container.parents if isinstance(value, Tag)])
+    ):
+        return None
+
+    direct_tags = [value for value in row.children if isinstance(value, Tag)]
+    try:
+        publication = direct_tags[direct_tags.index(download_span) + 1]
+    except (ValueError, IndexError):
+        return None
+    publication_classes = publication.get("class", [])
+    if isinstance(publication_classes, str):
+        publication_classes = publication_classes.split()
+    if publication.name != "span" or "publicacao" not in {
+        str(value).casefold() for value in publication_classes
+    }:
+        return None
+    publication_text = _norm(publication.get_text(" ", strip=True))
+    published = re.fullmatch(
+        r"\(?\s*publicado em\s+(\d{1,2})/(\d{1,2})/(\d{4})\s*\)?",
+        publication_text,
+    )
+    if not published:
+        return None
+    day, month, published_year = (int(value) for value in published.groups())
+    try:
+        publication_date = date(published_year, month, day)
+    except ValueError:
+        return None
+    if publication_date.year != year or not _item_positive(
+        f"{title} {publication_text}", year, bucket
+    ):
+        return None
+
+    page_parts = urlsplit(page.url)
+    page_query = _query_values(page.url)
+    href = str(anchor.get("href", "")).strip()
+    target = urljoin(page.url, href)
+    target_parts = urlsplit(target)
+    target_query = _query_values(target)
+    expected_keys = {"entidade", "secao", "sub", "id"}
+    if (
+        not href
+        or target_parts.fragment
+        or not _same_portal(page.url, target)
+        or target_parts.path.casefold() != page_parts.path.casefold()
+        or set(target_query) != expected_keys
+    ):
+        return None
+    if any(len(target_query[key]) != 1 for key in expected_keys):
+        return None
+    if any(len(page_query.get(key, [])) != 1 for key in ("entidade", "secao", "id")):
+        return None
+    page_node = page_query["id"][0].strip()
+    document_id = target_query["id"][0].strip()
+    if not (
+        page_query["secao"][0].casefold() == "dinamico"
+        and target_query["secao"][0].casefold() == "download"
+        and target_query["sub"][0].casefold() == "menu"
+        and target_query["entidade"] == page_query["entidade"]
+        and page_node.isdigit()
+        and int(page_node) > 0
+        and document_id.isdigit()
+        and int(document_id) > 0
+        and str(download_span.get("id", "")) == f"span{page_node}"
+    ):
+        return None
+    return target, f"multi24_download:{page_query['entidade'][0]}:{document_id}"
+
+
 def _extract_items(page: _ParsedPage, year: int, bucket: str) -> tuple[Multi24Item, ...]:
     items: list[Multi24Item] = []
     seen: set[str] = set()
@@ -736,17 +966,26 @@ def _extract_items(page: _ParsedPage, year: int, bucket: str) -> tuple[Multi24It
                 # row/list container as well could turn one document into two.
                 continue
             title = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
-            normalized = _norm(title)
-            if not title or not _item_positive(title, year, bucket):
+            if not title:
+                continue
+            live_evidence = None
+            if tag.name == "a":
+                live_evidence = _live_multi24_download_evidence(
+                    tag, page, title, year, bucket
+                )
+            if not _item_positive(title, year, bucket) and live_evidence is None:
                 continue
             url = ""
-            if tag.name == "a" and tag.has_attr("href"):
-                candidate_url = urljoin(page.url, str(tag["href"]))
-                if urlsplit(candidate_url).scheme.casefold() in {"http", "https"}:
-                    url = candidate_url
-            # Semantic identity is safer than URL identity: the same document
-            # is often linked twice with different cache/query parameters.
-            evidence_key = _item_evidence_key(title, year)
+            if live_evidence is not None:
+                url, evidence_key = live_evidence
+            else:
+                # Semantic identity is safer than URL identity for generic
+                # pages: one document is often repeated with tracking params.
+                evidence_key = _item_evidence_key(title, year)
+                if tag.name == "a" and tag.has_attr("href"):
+                    candidate_url = urljoin(page.url, str(tag["href"]))
+                    if urlsplit(candidate_url).scheme.casefold() in {"http", "https"}:
+                        url = candidate_url
             if not evidence_key or evidence_key in seen:
                 continue
             seen.add(evidence_key)
@@ -823,21 +1062,28 @@ def _authority_check(
             target = urljoin(proof_page.url, href)
             if _origin(target) != entry_origin:
                 continue
-            link_text = _norm(anchor.get_text(" ", strip=True))
-            target_path = urlsplit(target).path.casefold()
+            target_parts = urlsplit(target)
+            target_path = target_parts.path.casefold()
             exact_target = _canonical_url(target) in {
                 _canonical_url(page.snapshot.requested_url),
                 _canonical_url(page.url),
             }
-            semantic_target = (
-                _MULTI24_PATH_RE.search(target_path) is not None
-                or "/portal-da-transparencia" in target_path
-                or any(
-                    marker in link_text
-                    for marker in ("portal da transparencia", "concurso", "processo seletivo")
-                )
-            )
-            if not exact_target and not semantic_target:
+            relation = ""
+            if exact_target:
+                relation = "exact_entry"
+            elif _is_multi24_url(target):
+                relation = "same_origin_multi24_dynamic"
+            elif not target_parts.query and _MULTI24_PATH_RE.fullmatch(target_path):
+                relation = "same_origin_multi24_transparency_root"
+            elif not target_parts.query and _FRIENDLY_TRANSPARENCIA_RE.match(target_path):
+                relation = "same_origin_friendly_transparency_root"
+            elif (
+                not target_parts.query
+                and _MULTI24_PORTAL_ROOT_RE.fullmatch(target_path)
+                and _is_multi24_url(page.url)
+            ):
+                relation = "same_origin_multi24_portal_root"
+            if not relation:
                 continue
             anchor_label = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip()
             evidence = (
@@ -845,6 +1091,7 @@ def _authority_check(
                 f"official_source_sha256:{proof_page.decoded.raw_sha256}",
                 f"official_navigation_target:{target}",
                 f"official_navigation_label:{anchor_label}",
+                f"official_navigation_relation:{relation}",
                 f"navigation_target_origin:{entry_origin}",
             )
             return "", evidence
