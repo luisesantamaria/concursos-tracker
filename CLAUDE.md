@@ -179,3 +179,20 @@ python scripts/eval/medir_golden_set.py --golden data/golden_set_v1.csv --pipeli
 ## Safety
 
 Never commit `.env`, local API keys, generated outputs, logs, model files, Cloud Run/RunPod secrets, or `.claude/settings.local.json`.
+
+### Gemini policy (grounded rescue)
+
+- The only authorized rescue model is exactly `gemini-3.1-flash-lite` (never
+  `gemini-2.5-flash`, `gemini-3.1-flash-lite-preview`, or another fallback).
+- Production may use `FREE1 -> FREE2 -> PAID` only when the configuration and
+  Luis explicitly authorize paid calls. Golden, holdout, evaluation, and
+  rescue runs always use `FREE1 -> FREE2 -> STOP` with `--free-only`.
+- `--free-only` is structural: the paid client is not constructed and paid is
+  absent from the call sequence. `paid_calls` must be zero before and after the
+  run; any change is `FALLO_DE_POLITICA` and aborts the run.
+- Quotas are per GCP project, so two keys from one project do not multiply
+  capacity. The operational governor is at most 12 RPM (at least about five
+  seconds between model requests), always honors `Retry-After`, otherwise uses
+  exponential backoff with jitter, and stops preventively before 90% of either
+  active daily model-request or Google Search Grounding quota. A configurable
+  global call budget is mandatory.

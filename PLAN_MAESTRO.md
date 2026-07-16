@@ -56,6 +56,19 @@ comandos/archivos exactos), `PRUEBA` (criterio de éxito medible) y `SI FALLA`
   humanamente sin FP; 6 abstenciones legítimas (Almirante×2, Arambaré/CP,
   Caxias/PSS, Itaara/PSS, Canoas/PSS-bug). Paso siguiente: **F2.P6** (holdout
   ciego de 50, REQUIERE autorización de Luis).
+- F2.P6 ejecutado (12-jul, cierre pendiente): holdout ciego de 50 municipios
+  NO-golden (88 unidades, URLs V1 sin curar, gemini_policy free→pagado
+  funcionó). **21/88 confirmadas (24%); auditoría de las 21: 17 ratificadas,
+  4 dudas, 0 FP duros** (oráculo pendiente: Canela = índice oficial vacío).
+  Cobertura NO cumple gate → SI-FALLA activada. Diagnóstico de las 64
+  no-confirmadas (`docs/f2_p6_acta_holdout_20260712.md`): #1 cobertura de
+  autoridad en municipios nuevos 39% (registro solo cubre golden; gate
+  fail-closed degrada consensos A+B válidos) · #2 render interactivo 27% ·
+  #3 citas quote_ambiguous+charset 19% · #4 transporte 6%; drift V1 marginal
+  (~3%). Proyección con palancas 1-4: 73-85% → re-corrida del holdout cierra
+  el paso.
+- F3.P1 runner construido (12-jul): `v2/eval/platform_probe_runner.py` +
+  42 tests offline (suite 480 verdes). NO corrido sobre los 497 aún.
 - Comparación controlada (`semantic_matrix_r3_20260712/`): sobre evidencia
   idéntica, V2 acierta 22/23 vs 2/23 de las heurísticas V1.
 - Fixture y oracle: `url_map_golden_fixture_20260712.csv` (36 URLs verificadas),
@@ -195,7 +208,18 @@ confirmó con URL exacta (¿match válido o sobre-confirmación?).
 **PRUEBA**: acta escrita (doc en staging) con cada differ adjudicado.
 **SI aparece un FP**: R-T1.
 
-### F2.P6 — Holdout 50 (prueba de generalización; NO antes de P5)
+### F2.P6 🔄 (12-jul-2026, ejecutado — cierre pendiente) — Holdout 50
+**RESULTADO**: 21/88 confirmadas (24%). Auditoría de las 21: **17 ratificadas,
+4 dudas, 0 FP duros** (pendiente oráculo de Luis sobre Canela = índice oficial
+vacío). Gate de cobertura NO cumplido → rama SI-FALLA activada. Diagnóstico
+completo de las 64 no-confirmadas (acta:
+`docs/f2_p6_acta_holdout_20260712.md`): la palanca #1 (39%) es COBERTURA DE
+AUTORIDAD en municipios nuevos (registro solo cubre golden; el gate fail-closed
+degrada consensos A+B válidos a revisar) → F3.P2 + reglas de plataforma
+delegada; #2 render interactivo (27%, F3.P5); #3 sub-bugs de citas
+quote_ambiguous+charset (19%); #4 transporte SSL/Content-Type (6%). El drift
+de URLs V1 resultó marginal (~3%). Proyección honesta con palancas 1-4:
+73-85%. Re-corrida del holdout tras implementar palancas = criterio de cierre.
 **ENTRADA**: acta de P5; autorización explícita de Luis.
 **ACCIONES**: 50 municipios de los 497 NO presentes en el golden,
 estratificados por plataforma. Descubrimiento SIN curación manual (registro +
@@ -214,7 +238,62 @@ aparece `quota_429` (`approx_rpd` ya se mide).
 trivial); free queda para desarrollo.
 
 ### F2.P8 — Corrida 497 RS completa
-**ENTRADA**: F2.P6 verde.
+**ENTRADA (GATE DE LUIS, 13-jul-2026 — BLOQUEANTE)**: el holdout debe cumplir
+SIMULTÁNEAMENTE: (1) ≥75/88 unidades confirmadas Y RATIFICADAS por auditoría
+(≥85%); (2) cero FP tras auditar TODAS las confirmaciones; (3) ninguna DUDA en
+el numerador; (4) ninguna confirmación bruta cuenta sin verificar evidencia
+item-positiva + autoridad + identidad. Cálculo válido:
+confirmaciones_netas = RATIFICAR; cobertura_neta = RATIFICAR/88 — NUNCA el
+bruto del runner. Tras cada re-corrida: auditar confirmaciones nuevas,
+revalidar los 7 FP conocidos de r2, restar FP y dudas, documentar el neto.
+Si <75/88 o aparece 1 FP: no avanzar, diagnosticar, corrección general,
+fixtures de regresión, nueva iteración en directorio nuevo. **F2.P8 queda
+bloqueada hasta que Luis vea y apruebe el acta que demuestre ≥75/88 RATIFICAR
+y 0 FP.**
+
+**PRE-GATE DE LA CORRIDA r3 (corrección de Luis, 13-jul)**: la corrida live r3
+solo se lanza si la PROYECCIÓN OFFLINE (replay + gates deterministas, con la
+lista de DUDA/REVISAR/NO_ENCONTRADO REGENERADA tras cada replay — nunca
+reutilizar la lista vieja de 10) alcanza ≥75/88 (85%) con 0 FP. Si queda por
+debajo: FASE DE RESCATE GROUNDED antes de r3 — Gemini API, modelo obligatorio
+gemini-2.5-pro (gemini-2.5-flash SOLO si la API rechaza Pro explícitamente),
+herramienta google_search (no Default, no Map Grounding), máximo 5 búsquedas
+grounded por unidad; el grounding PROPONE URLs y evidencia pero NUNCA
+confirma por sí solo — solo cuentan páginas oficiales con evidencia literal
+que pase el gate determinista. Tras el rescate: replay completo + 7/7
+regresiones FP + auditoría de toda confirmación nueva → GO a r3 solo con
+proyección ≥75/88 y 0 FP.
+
+**MINI-WAVE F3 CONDICIONAL (Luis, 13-jul)**: si el rescate grounded válido +
+su auditoría dejan la proyección <75/88, NO forzar r3 — activar mini-wave
+adelantada de F3 con reglas generales: (1) F3.P1: completar SOLO patrones
+generales de plataforma respaldados por repetición en el corpus (candidatos
+medidos por M6: /site/concursos ~48 municipios, pg.php?area=PUBLICACOES ~20,
+/portal/editais ~25), medir sobre los 497, WRNG=0 contra confirmados
+auditados, cero parches por municipio. (2) F3.P3: validar el agente navegador
+A CIEGAS sobre 20 municipios custom ya confirmados — gate: ≥70% propone la
+URL correcta y 0 evidencia inventada; solo después aplicarlo a los residuales
+url_mala que el grounding no resolvió; provenance completo de ruta
+menú/clics; propone-nunca-confirma. (3) F3.P5 adelantada (condición de
+entrada cumplida: 10 render_incierto > 5 exigidas): exploración Playwright
+acotada y reproducible; whitelist estricta: paginación ≤3 páginas,
+año=todos/ano=0, búsqueda vacía, pestañas vigente/encerrado; máx 5
+interacciones por unidad; snapshot y provenance POR ESTADO; citas verificadas
+contra el estado que las contiene; jamás login/datos personales/CAPTCHA/
+evasión antibot. (4) Computer Use sigue reservado para lo que quede como
+revisión humana después de F3.P5. (5) Tras la mini-wave: replay completo +
+auditoría de toda confirmación nueva + regresión de los 7 FP → GO a r3 solo
+con ≥75/88 RATIFICAR proyectadas y 0 FP. NO implementar F3.P2 ni F3.P4 aún.
+
+**POLÍTICA COMPUTER USE (Luis, 13-jul)**: reservado para DESPUÉS de agotar
+búsqueda, HTML, endpoints XHR y render automatizado; solo cola residual que
+requiera filtros/botones, JS interactivo, paginación visual, cookies o
+apertura normal de documentos. PROHIBIDO evadir CAPTCHA, antibot,
+autenticación o controles de acceso: ante CAPTCHA → pausa para humano y
+clasificar REVISION_HUMANA_ACCESO_RESTRINGIDO. Tras r3 puede ser última
+adjudicación de residuales con evidencia durable obligatoria: URL
+inicial/final, acciones, texto literal, documento recuperado, veredicto del
+gate.
 **ACCIONES**: correr 497 (menos golden) por lotes de ~50; auditoría muestral
 humana de 50-100 confirmaciones POR LOTE con intervalo de confianza.
 **PRUEBA**: FP=0 en cada muestra; al acumular n≥300 confirmaciones auditadas

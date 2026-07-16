@@ -52,8 +52,10 @@ RS. No extrae editais (eso es F6).
 - **2c 🔄 Cierre RS** (pasos F2.P1-P8 del PLAN_MAESTRO): fixes mecánicos ✅ →
   política de índice ✅ → fixture envenenado ✅ → R4 golden ✅ (30/36, 0 FP) →
   adjudicación humana ✅ (30/36 ratificado por Luis, 0 FP) → **holdout ciego
-  de 50 (F2.P6, paso actual)** → sonda de cuota → corrida de los 497 con
-  auditoría muestral.
+  de 50 ejecutado (F2.P6): 21/88 confirmadas, 0 FP duros auditados; cobertura
+  insuficiente → diagnóstico completo (autoridad 39% · render 27% · citas 19%
+  · transporte 6%) activa el refuerzo F3 antes de re-intentar** → sonda de
+  cuota → corrida de los 497 con auditoría muestral.
 - **Gate de salida**: mapa RS completo con provenance, FP=0 auditado por
   muestreo, tasa de revisión humana ≤~25%.
 

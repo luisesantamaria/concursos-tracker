@@ -113,7 +113,7 @@ def test_model_calls_are_auditable_by_model_unit_attempt_and_tokens() -> None:
         "bucket": "concurso_publico",
         "stage": "A",
         "model": "fixture-model",
-        "provider": "gemini_free",
+        "provider": "gemini_free_1",
         "attempt": 1,
         "status": "ok",
         "error_class": "",

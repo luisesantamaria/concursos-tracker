@@ -115,6 +115,12 @@ CitationExtractor = Callable[[Mapping[str, Any]], tuple[Citation, ...]]
 CitationRequirement = Callable[[Mapping[str, Any]], bool]
 OutputInvariant = Callable[[Mapping[str, Any]], None]
 OutputPreparer = Callable[[EvidenceSnapshot, Mapping[str, Any]], Mapping[str, Any]]
+RepairableReasonPredicate = Callable[[str], bool]
+RepairInstructionBuilder = Callable[[BaseException], str]
+
+
+def _is_citation_reason(reason: str) -> bool:
+    return reason.startswith("citation_")
 
 
 _API_UNSUPPORTED_SCHEMA_KEYS = frozenset({
@@ -175,6 +181,8 @@ class AgentRunner:
         estimated_tokens: int = 4_000,
         tool_limits: ToolLimits | None = None,
         tools: str | None = "local_snapshot",
+        repairable_reason: RepairableReasonPredicate | None = None,
+        repair_instruction: RepairInstructionBuilder | None = None,
     ) -> None:
         for name, value in (
             ("max_steps", max_steps),
@@ -198,6 +206,15 @@ class AgentRunner:
         if tools not in {None, "local_snapshot"}:
             raise ValueError("tools must be None or local_snapshot")
         self.tools = tools
+        # Role-generic hook (default preserves the original citation-only
+        # repair contract exactly: only reasons starting with "citation_"
+        # get one repair round in _run_direct, see
+        # test_non_citation_rejection_never_triggers_repair). A role may
+        # widen the repairable set (e.g. certifier's item-evidence gate) by
+        # passing its own predicate/instruction pair without base.py ever
+        # naming a role-specific reason string.
+        self._is_repairable_reason = repairable_reason or _is_citation_reason
+        self._repair_instruction_for = repair_instruction or self._citation_repair_instruction
 
     def _direct_contents(self, snapshot: EvidenceSnapshot, task: str) -> list[dict[str, Any]]:
         remaining = MAX_DIRECT_SNAPSHOT_CHARS
@@ -366,10 +383,11 @@ class AgentRunner:
         self, *, snapshot: EvidenceSnapshot, task: str
     ) -> AgentRunResult | SnapshotInvalidOutput:
         # Politica 12-jul (aprobada por Luis): ante rechazo del anclaje de citas
-        # (quote_ambiguous/quote_not_found/formato), UNA sola re-invocacion con
-        # el detalle exacto del fallo. El validador determinista re-verifica
-        # completo; si la reparacion tambien falla, fail-closed tipado. Los
-        # rechazos NO relacionados con citas jamas se reparan ni reintentan.
+        # (quote_not_found/formato -- quote_ambiguous ya NO rechaza, ver
+        # snapshot.anchor_citation), UNA sola re-invocacion con el detalle
+        # exacto del fallo. El validador determinista re-verifica completo; si
+        # la reparacion tambien falla, fail-closed tipado. Los rechazos NO
+        # relacionados con citas jamas se reparan ni reintentan.
         contents = self._direct_contents(snapshot, task)
         raw: Any | None = None
         repair_used = False
@@ -404,7 +422,7 @@ class AgentRunner:
                 if (
                     not repair_used
                     and isinstance(exc, AgentOutputRejected)
-                    and reason.startswith("citation_")
+                    and self._is_repairable_reason(reason)
                     and isinstance(raw, Mapping)
                 ):
                     repair_used = True
@@ -413,7 +431,7 @@ class AgentRunner:
                             "text": json.dumps(raw, ensure_ascii=False),
                         }]},
                         {"role": "user", "parts": [{
-                            "text": self._citation_repair_instruction(exc),
+                            "text": self._repair_instruction_for(exc),
                         }]},
                     ]
                     raw = None

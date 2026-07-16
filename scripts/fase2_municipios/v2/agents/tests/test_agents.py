@@ -104,7 +104,9 @@ def snapshot_with_marker(marker: str = "PRIVATE-CERTIFIER-TOOL-MARKER"):
             source_id="title",
             url="https://example.invalid/index#title",
             retrieved_at=RETRIEVED_AT,
-            content="Concursos Públicos",
+            # R-T1 iteracion 2: item-positive (keyword + numero/ano), no solo
+            # una etiqueta de categoria -- ver certifier._is_item_positive_quote.
+            content="Concurso Público 001/2026",
         ),
     ])
 
@@ -150,11 +152,11 @@ def certifier_output(*, quote: str = "Official index", citations: bool = True, d
             },
             {
                 "dimension": "bucket",
-                "quote": "Concursos Públicos",
+                "quote": "Concurso Público 001/2026",
                 "source_field": "title",
                 "source_id": "title",
                 "start": 0,
-                "end": len("Concursos Públicos"),
+                "end": len("Concurso Público 001/2026"),
             },
             {
                 "dimension": "stability",

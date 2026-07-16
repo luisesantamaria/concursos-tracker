@@ -38,7 +38,13 @@ from scripts.fase2_municipios.v2.gemini.schema_validation import (
 from scripts.fase2_municipios.v2.snapshot import CitationVerificationError, SnapshotError
 
 
-AUTHORIZED_CREDENTIAL_NAMES = ("GEMINI_API_KEY_FREE", "GEMINI_API_KEY")
+AUTHORIZED_CREDENTIAL_NAMES = (
+    "GEMINI_API_KEY_FREE",
+    "GEMINI_API_KEY_FREE_2",
+    "GEMINI_API_KEY",
+)
+REQUIRED_CREDENTIAL_NAMES = ("GEMINI_API_KEY_FREE", "GEMINI_API_KEY")
+PROVIDER_NAMES = ("gemini_free_1", "gemini_free_2", "gemini_paid")
 MIN_PROVIDER_ATTEMPT_SECONDS = 0.1
 
 
@@ -123,6 +129,16 @@ def _status_code(exc: BaseException) -> int | None:
             value = getattr(response, name, None)
             if isinstance(value, int) and not isinstance(value, bool):
                 return value
+    # google-genai exposes structured ``code`` on its own concrete error
+    # classes, often without an HTTP response object. Never trust a generic
+    # exception's similarly named attribute (that could rotate on a local bug).
+    error_type = type(exc)
+    if error_type.__module__.startswith("google.genai.errors") and error_type.__name__ in {
+        "ClientError", "ServerError", "APIError"
+    }:
+        value = getattr(exc, "code", None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
     return None
 
 
@@ -192,7 +208,7 @@ def classify_error(exc: BaseException) -> ClassifiedError:
 
 
 def load_model_credentials(path: Path) -> dict[str, str]:
-    """Read only the two authorized KEY=VALUE names; ignore every other entry."""
+    """Read the three authorized names; FREE2 is backward-compatible optional."""
 
     path = Path(path).expanduser()
     try:
@@ -213,7 +229,7 @@ def load_model_credentials(path: Path) -> dict[str, str]:
             value = value[1:-1]
         if value:
             loaded[name] = value
-    missing = [name for name in AUTHORIZED_CREDENTIAL_NAMES if not loaded.get(name)]
+    missing = [name for name in REQUIRED_CREDENTIAL_NAMES if not loaded.get(name)]
     if missing:
         raise CredentialConfigError("gemini_authorized_credentials_missing:" + ",".join(missing))
     return loaded
@@ -235,6 +251,9 @@ class ModelPolicyTelemetry:
         self.backoff_events: list[dict[str, Any]] = []
         self._calls: deque[tuple[float, int]] = deque()
         self._model_usage: dict[str, Counter[str]] = {}
+        self._provider_usage: dict[str, Counter[str]] = {
+            provider: Counter() for provider in PROVIDER_NAMES
+        }
 
     def set_observer(self, observer: Callable[[Mapping[str, Any]], None] | None) -> None:
         self.observer = observer
@@ -256,7 +275,11 @@ class ModelPolicyTelemetry:
         status: str = "ok",
         error_class: str = "",
     ) -> None:
-        if provider == "gemini_free":
+        if provider == "gemini_free":  # compatibility for injected legacy wrappers
+            provider = "gemini_free_1"
+        if provider not in PROVIDER_NAMES:
+            raise ValueError(f"unknown_model_provider:{provider}")
+        if provider in {"gemini_free_1", "gemini_free_2"}:
             self.free_calls += 1
         else:
             self.paid_calls += 1
@@ -269,9 +292,20 @@ class ModelPolicyTelemetry:
             self.cost += float(cost)
             self.cost_reported = True
         self._calls.append((time.monotonic(), tokens))
+        provider_usage = self._provider_usage[provider]
+        provider_usage["calls"] += 1
+        provider_usage["tokens"] += tokens
+        if status == "error":
+            provider_usage["errors"] += 1
+            if error_class == ErrorCategory.QUOTA_429.value:
+                provider_usage["quota_rate"] += 1
         if model:
             usage = self._model_usage.setdefault(model, Counter())
-            usage["free_calls" if provider == "gemini_free" else "paid_calls"] += 1
+            usage[
+                "free_calls"
+                if provider in {"gemini_free_1", "gemini_free_2"}
+                else "paid_calls"
+            ] += 1
             usage["tokens"] += tokens
         self._emit({
             "event": "model_call",
@@ -296,7 +330,8 @@ class ModelPolicyTelemetry:
         self._emit({"event": "backoff", **event})
 
     def record_fallback(self, *, category: ErrorCategory, **context: Any) -> None:
-        self.paid_fallback_reasons[category.value] += 1
+        if context.get("to_provider") == "gemini_paid" or context.get("provider") == "gemini_paid":
+            self.paid_fallback_reasons[category.value] += 1
         event = {"cause": category.value, **context}
         self.fallback_events.append(event)
         self._emit({"event": "fallback", **event})
@@ -314,6 +349,15 @@ class ModelPolicyTelemetry:
             "approx_rpm": len(self._calls),
             "approx_tpm": sum(tokens for _, tokens in self._calls),
             "approx_rpd": self.free_calls + self.paid_calls,
+            "providers": {
+                provider: {
+                    "calls": self._provider_usage[provider]["calls"],
+                    "tokens": self._provider_usage[provider]["tokens"],
+                    "errors": self._provider_usage[provider]["errors"],
+                    "quota_rate": self._provider_usage[provider]["quota_rate"],
+                }
+                for provider in PROVIDER_NAMES
+            },
             "models": {
                 model: {
                     "free_calls": usage["free_calls"],
@@ -385,13 +429,14 @@ def _invoke_isolated(
 
 
 class PolicyTransport:
-    """Two free attempts, then one paid attempt only for eligible failures."""
+    """FREE1 -> optional FREE2 -> PAID, only across eligible failures."""
 
     def __init__(
         self,
         *,
         free_transport: Any,
-        paid_transport: Any,
+        paid_transport: Any | None,
+        free_2_transport: Any | None = None,
         model: str,
         stage: str,
         telemetry: ModelPolicyTelemetry,
@@ -403,6 +448,7 @@ class PolicyTransport:
         if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
             raise ValueError("gemini_timeout_must_be_positive")
         self.free_transport = free_transport
+        self.free_2_transport = free_2_transport
         self.paid_transport = paid_transport
         self.model = model
         self.stage = stage
@@ -438,21 +484,36 @@ class PolicyTransport:
     def generate(self, model: str, contents: Any, config: Mapping[str, Any]) -> RawResponse:
         deadline = time.monotonic() + self.timeout_seconds
         last: ClassifiedError | None = None
-        for attempt in (1, 2):
-            context = self._context(provider="gemini_free", attempt=attempt)
+        # If both free keys belong to the same Google project they probably
+        # share quota; FREE2 then improves resilience, not available capacity.
+        free_steps = (
+            (("gemini_free_1", self.free_transport), ("gemini_free_2", self.free_2_transport))
+            if self.free_2_transport is not None
+            else (("gemini_free_1", self.free_transport), ("gemini_free_1", self.free_transport))
+        )
+        for attempt, (provider, selected_transport) in enumerate(free_steps, start=1):
+            context = self._context(provider=provider, attempt=attempt)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise PolicyCallError(
                     ErrorCategory.LOCAL_BUG, original_type="GlobalDeadline"
                 )
+            if attempt > 1:
+                assert last is not None
+                self.telemetry.record_fallback(
+                    category=last.category,
+                    from_provider=free_steps[attempt - 2][0],
+                    to_provider=provider,
+                    **{key: value for key, value in context.items() if key != "provider"},
+                )
             try:
                 response = self._call(
-                    self.free_transport, model, contents, config, remaining
+                    selected_transport, model, contents, config, remaining
                 )
             except BaseException as exc:
                 last = classify_error(exc)
                 self.telemetry.record_call(
-                    "gemini_free",
+                    provider,
                     municipio=self.municipio,
                     bucket=self.bucket,
                     stage=self.stage,
@@ -470,6 +531,8 @@ class PolicyTransport:
                         original_type=type(exc).__name__,
                     ) from exc
                 if attempt == 1:
+                    next_provider = free_steps[1][0]
+                if attempt == 1 and next_provider == provider:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise PolicyCallError(
@@ -482,10 +545,12 @@ class PolicyTransport:
                     self.telemetry.record_backoff(seconds=delay, category=last.category, **context)
                     self.sleep(delay)
                     continue
+                if attempt == 1:
+                    continue
                 break
             else:
                 self.telemetry.record_call(
-                    "gemini_free",
+                    provider,
                     response,
                     municipio=self.municipio,
                     bucket=self.bucket,
@@ -497,13 +562,25 @@ class PolicyTransport:
                 return response
 
         assert last is not None and last.fallback_eligible
+        if self.paid_transport is None:
+            raise PolicyCallError(
+                last.category,
+                status_code=last.status_code,
+                retry_after=last.retry_after,
+                original_type="FreeOnlyProvidersExhausted",
+            )
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROVIDER_ATTEMPT_SECONDS:
             raise PolicyCallError(
                 ErrorCategory.LOCAL_BUG, original_type="GlobalDeadline"
             )
         paid_context = self._context(provider="gemini_paid", attempt=3)
-        self.telemetry.record_fallback(category=last.category, **paid_context)
+        self.telemetry.record_fallback(
+            category=last.category,
+            from_provider=free_steps[-1][0],
+            to_provider="gemini_paid",
+            **{key: value for key, value in paid_context.items() if key != "provider"},
+        )
         try:
             response = self._call(
                 self.paid_transport, model, contents, config, remaining

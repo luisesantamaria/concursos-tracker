@@ -7,12 +7,25 @@ snapshot normalization is therefore identity; offsets are Python character
 indices over that same string, never byte offsets.
 Empty source content is allowed and receives the standard SHA-256 of ``b""``;
 it remains reproducible evidence but cannot support a non-empty citation.
+
+Citation comparison precedence (SUB-CAUSA 1/2, holdout 12-jul):
+- Unicode form: stored content arrives NFC-canonical from the decode layer
+  (``eval/live_abc_adapter.py``); a foreign quote (model output) may arrive in
+  a different normal form (e.g. NFD). Every literal search/compare below
+  normalizes the quote to NFC before matching -- never the stored content, so
+  offsets stay exact indices into the untouched string.
+- Ambiguity: a quote existing 2+ times in the source proves EXISTENCE of
+  evidence; offset ambiguity alone is not grounds to reject it. Omitted-offset
+  anchoring resolves to the first literal occurrence and records
+  ``ambiguous_occurrences`` informationally. Only a quote that does not exist
+  at all fails closed (``quote_not_found``).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -62,9 +75,11 @@ class CitationVerificationError(SnapshotError):
         self.source_id = source_id
         self.reason = reason
         self.quote_preview = _quote_preview(quote)
-        # Only populated for reason=quote_ambiguous today: the real count of
-        # non-overlapping literal occurrences of ``quote`` in the source, so
-        # repair guidance can be specific instead of a binary "it repeats".
+        # Historical: occurrence_count used to accompany the (now-removed)
+        # quote_ambiguous failure. Ambiguity no longer fails closed (see
+        # Citation.ambiguous_occurrences), but the field stays on this
+        # exception/CitationFailure for any other reason that wants to carry
+        # a real occurrence count instead of a binary signal.
         self.occurrence_count = occurrence_count
         preview = f", quote_preview={self.quote_preview!r}" if quote else ""
         occurrence = (
@@ -212,6 +227,12 @@ class Citation:
     start: int
     end: int
     quote: str
+    # Informational only (never a rejection reason): set when this citation was
+    # anchored without explicit offsets and its quote occurred 2+ times in the
+    # source. Holds the real non-overlapping occurrence count; None means the
+    # citation was unambiguous (or its offsets were given explicitly, which
+    # already pins one occurrence and skips the ambiguity check entirely).
+    ambiguous_occurrences: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_id, str) or not self.source_id.strip():
@@ -244,10 +265,13 @@ def anchor_citation(
     *,
     require_offsets: bool = False,
 ) -> Citation:
-    """Hydrate omitted offsets only for one unique literal occurrence.
+    """Hydrate omitted offsets by anchoring to the first literal occurrence.
 
     Unknown envelope fields are ignored. ``source_id`` and ``quote`` are always
-    mandatory. Both offsets may be omitted only at the model-response seam.
+    mandatory. Both offsets may be omitted only at the model-response seam. A
+    quote repeated in the source anchors to its first occurrence and is not
+    rejected for that alone (see ``Citation.ambiguous_occurrences``); only a
+    quote that does not exist in the source fails closed.
     """
     if not isinstance(raw, Mapping):
         raise CitationVerificationError(
@@ -289,22 +313,30 @@ def anchor_citation(
         raise CitationVerificationError(
             source_id=source_id, reason="empty_source", quote=quote
         )
-    position = text.find(quote)
+    # NFC precedence (see module docstring): the stored source is assumed
+    # already NFC-canonical (decode layer); the foreign quote is normalized
+    # here before searching so accented literals in a different Unicode
+    # normal form (e.g. NFD) still match. Only the search copy is normalized;
+    # ``position``/offsets remain exact indices into ``text`` because NFC is
+    # idempotent on already-NFC content (normalize(text) == text in that case).
+    normalized_quote = unicodedata.normalize("NFC", quote)
+    position = text.find(normalized_quote)
     if position < 0:
         raise CitationVerificationError(
             source_id=source_id, reason="quote_not_found", quote=quote
         )
-    if text.find(quote, position + 1) >= 0:
-        # str.count matches text.find's left-to-right, non-overlapping scan,
-        # so this is the exact number of ambiguous anchor candidates a repair
-        # attempt is choosing between (not just "more than one").
-        raise CitationVerificationError(
-            source_id=source_id,
-            reason="quote_ambiguous",
-            quote=quote,
-            occurrence_count=text.count(quote),
-        )
-    citation = Citation(source_id, position, position + len(quote), quote)
+    # Existencia de evidencia es el requisito, no unicidad de offset (SUB-CAUSA
+    # 1, holdout 12-jul): una quote que aparece 2+ veces YA prueba que el texto
+    # existe en la fuente. Ya no se rechaza -- se ancla a la primera ocurrencia
+    # (str.find's left-to-right, non-overlapping scan) y se registra un flag
+    # puramente informativo con el conteo real, nunca un motivo de fallo.
+    occurrence_count = None
+    if text.find(normalized_quote, position + 1) >= 0:
+        occurrence_count = text.count(normalized_quote)
+    citation = Citation(
+        source_id, position, position + len(normalized_quote), quote,
+        ambiguous_occurrences=occurrence_count,
+    )
     verify_citation(snapshot, citation)
     return citation
 
@@ -331,13 +363,23 @@ def verify_citation(
             reason="offset_out_of_bounds",
             quote=citation.quote,
         )
-    if text[citation.start:citation.end] != citation.quote:
-        reason = "offset_quote_mismatch" if citation.quote in text else "quote_not_found"
-        raise CitationVerificationError(
-            source_id=citation.source_id,
-            reason=reason,
-            quote=citation.quote,
-        )
+    slice_ = text[citation.start:citation.end]
+    if slice_ != citation.quote:
+        # NFC precedence (see module docstring): a citation carried through
+        # from anchor_citation, or re-verified downstream (e.g. the strict
+        # final gate), may still hold its quote in a different Unicode normal
+        # form than the (already-NFC) snapshot slice. Only fall back to NFC
+        # comparison when the raw slice-equality fails, so the common already-
+        # matching case pays no extra normalization cost.
+        if unicodedata.normalize("NFC", slice_) != unicodedata.normalize(
+            "NFC", citation.quote
+        ):
+            reason = "offset_quote_mismatch" if citation.quote in text else "quote_not_found"
+            raise CitationVerificationError(
+                source_id=citation.source_id,
+                reason=reason,
+                quote=citation.quote,
+            )
 
 
 @dataclass(frozen=True)

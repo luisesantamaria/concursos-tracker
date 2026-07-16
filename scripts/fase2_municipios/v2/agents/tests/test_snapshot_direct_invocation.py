@@ -145,6 +145,73 @@ def test_direct_certifier_factory_uses_role_schema_without_dialect_marker() -> N
     assert "APPLICATION AGENTSTEP PROTOCOL" not in rendered
 
 
+def test_imbe_real_raw_invented_authority_url_is_rejected_against_portal_snapshot() -> None:
+    """Imbe/PSS run_r2 raw: provenance URL is not literal snapshot content."""
+
+    from scripts.fase2_municipios.v2.agents import build_certifier_agent
+    from scripts.fase2_municipios.v2.agents.tests import test_agents as fixtures
+
+    raw = {
+        "authority": "confirmada",
+        "bucket": "processo_seletivo",
+        "candidate_id": "v1:887d645eb948a49f834a0460c95dc3f249d0dde6",
+        "citations": [
+            {
+                "dimension": "authority",
+                "quote": "https://www.imbe.rs.gov.br/processos-seletivos",
+                "source_field": "provenance",
+                "source_id": "main",
+            },
+            {
+                "dimension": "identity",
+                "quote": "Portal",
+                "source_field": "heading",
+                "source_id": "main",
+            },
+        ],
+        "confidence": "low",
+        "decision": "revisar",
+        "evidence_state": "completa",
+        "identity": "confirmada",
+        "insufficiency": "snapshot_incompleto",
+        "learning_proposal": None,
+        "page_role": "desconocido",
+        "reason": (
+            "O conteúdo do snapshot está vazio ou truncado (apenas a palavra "
+            "'Portal'), impossibilitando a verificação da estrutura de índice."
+        ),
+        "source_kind": "dominio_oficial_prefeitura",
+        "tool_request": None,
+    }
+    snapshot = build_snapshot((EvidenceSource(
+        source_id="main",
+        url="https://www.imbe.rs.gov.br/processos-seletivos",
+        retrieved_at=datetime(2026, 7, 13, 3, 32, 20, tzinfo=timezone.utc),
+        content="Portal",
+    ),))
+    # The direct runner offers one citation-repair round. Replaying the same
+    # real raw output proves both attempts remain fail-closed.
+    transport = fixtures.FakeTransport([raw, raw])
+    limiter, _clock = fixtures.limiter_with_fake_clock()
+    agent = build_certifier_agent(
+        transport=transport,
+        limiter=limiter,
+        repo_root=fixtures.REPO_ROOT,
+        invocation_mode="direct",
+    )
+
+    result = agent.certify(snapshot=snapshot, task="Certify Imbé PSS.")
+
+    assert isinstance(result, base.SnapshotInvalidOutput)
+    assert result.code == "AgentOutputRejected"
+    assert result.original_exception.reason == "citation_verification_failed:1"
+    failures = result.original_exception.__cause__.failures
+    assert [(failure.reason, failure.quote_preview) for failure in failures] == [
+        ("quote_not_found", "https://www.imbe.rs.gov.br/processos-seletivos"[:48])
+    ]
+    assert len(transport.requests) == 2
+
+
 def test_truncated_inline_snapshot_can_never_support_affirmative_output() -> None:
     content = "Official index" + ("x" * 400_001)
     snapshot = build_snapshot((EvidenceSource(
@@ -250,38 +317,39 @@ def _ambiguous_snapshot():
     ),))
 
 
-def test_ambiguous_citation_triggers_single_repair_and_succeeds() -> None:
-    first = {
+def test_ambiguous_citation_anchors_immediately_without_repair() -> None:
+    """SUB-CAUSA 1 fix (12-jul): existencia de evidencia alcanza -- una quote
+    duplicada ('Concurso 01' aparece en el cuerpo Y en el rodape) ya no
+    dispara la ronda de reparacion, ancla a la primera ocurrencia en el
+    primer intento."""
+    ambiguous = {
         "decision": "indice_oficial",
         "citations": [{"source_id": "main", "quote": "Concurso 01"}],
     }
-    fixed = {
-        "decision": "indice_oficial",
-        "citations": [{"source_id": "main", "quote": "Concurso 01 aberto"}],
-    }
-    client = SequencedClient([first, fixed])
+    client = SequencedClient([ambiguous])
     result = _repair_runner(client).run(
         snapshot=_ambiguous_snapshot(), task="certify fixture"
     )
 
     assert isinstance(result, base.AgentRunResult)
-    assert len(client.calls) == 2
-    repair_text = client.calls[1][0][-1]["parts"][0]["text"]
-    assert "CITATION_REPAIR" in repair_text
-    assert "quote_ambiguous" in repair_text
+    assert len(client.calls) == 1
     hydrated = result.output["citations"][0]
     snapshot = _ambiguous_snapshot()
     text = snapshot.sources[0].content
-    assert text[hydrated["start"]:hydrated["end"]] == "Concurso 01 aberto"
-    assert result.steps == 2
+    assert hydrated["start"] == text.index("Concurso 01")
+    assert text[hydrated["start"]:hydrated["end"]] == "Concurso 01"
+    assert result.steps == 1
 
 
 def test_repair_is_bounded_to_one_attempt_then_fail_closed() -> None:
-    still_ambiguous = {
+    """La cita ambigua ya no dispara reparacion (ver test arriba); el techo
+    de UNA sola reparacion sigue vigente para fallos que SI son reales
+    (quote_not_found persistente tras el reintento)."""
+    still_missing = {
         "decision": "indice_oficial",
-        "citations": [{"source_id": "main", "quote": "Concurso 01"}],
+        "citations": [{"source_id": "main", "quote": "no existe en el snapshot"}],
     }
-    client = SequencedClient([still_ambiguous, dict(still_ambiguous)])
+    client = SequencedClient([still_missing, dict(still_missing)])
     result = _repair_runner(client).run(
         snapshot=_ambiguous_snapshot(), task="certify fixture"
     )
