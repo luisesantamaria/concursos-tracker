@@ -80,7 +80,11 @@ RESTRICTED_PATTERN = re.compile(
 )
 SENSITIVE_ERROR_VALUE_PATTERN = re.compile(
     r"(?i)(?P<prefix>(?:api[_-]?key|access[_-]?token|authorization|secret|password)"
-    r"\s*(?:=|:)\s*)(?P<value>[^\s&;,]+)"
+    r"\s*(?:=|:)\s*)(?:bearer\s+)?(?P<value>[^\s&;,]+)"
+)
+DOWNLOAD_ERROR_PATTERN = re.compile(
+    r"(?:download(?:ing)?|\.pdf(?:\b|$)|navigation\s+is\s+interrupted\s+by\s+download)",
+    re.IGNORECASE,
 )
 ABSENCE_PATTERN = re.compile(
     r"\b(?:nenhum resultado|nenhum registro|nao encontrado|não encontrado|"
@@ -119,6 +123,15 @@ def exception_detail(exc: Exception) -> str:
         lambda match: f"{match.group('prefix')}<redacted>", message
     )
     return f"{type(exc).__name__}: {redacted}"
+
+
+def discardable_branch_failure(requested_url: str, exc: Exception) -> bool:
+    """Whether a failed child is certainly irrelevant to index discovery."""
+
+    return bool(
+        DETAIL_URL_PATTERN.search(canonicalize_url(requested_url))
+        or DOWNLOAD_ERROR_PATTERN.search(str(exc))
+    )
 
 
 def fold_text(value: str) -> str:
@@ -530,6 +543,29 @@ async def navigate_unit(
     additional_pages = 0
     restricted = False
     failure_stage = "inicio"
+    incomplete_failure: tuple[str, str] | None = None
+
+    def record_navigation_failure(
+        exc: Exception,
+        *,
+        requested_url: str,
+        stage: str,
+        discarded: bool,
+    ) -> str:
+        detail = exception_detail(exc)
+        audit.record(
+            "branch_navigation_error",
+            municipio=unit.municipio,
+            bucket=unit.bucket,
+            requested_url=requested_url,
+            stage=stage,
+            failure_stage=stage,
+            error_type=type(exc).__name__,
+            message=detail,
+            detail=detail,
+            discarded=discarded,
+        )
+        return detail
 
     async def explore(
         requested_url: str,
@@ -538,7 +574,8 @@ async def navigate_unit(
         from_url: str | None,
         via_text: str | None,
     ) -> None:
-        nonlocal interaction_count, additional_pages, restricted, failure_stage
+        nonlocal interaction_count, additional_pages, restricted
+        nonlocal failure_stage, incomplete_failure
         if restricted or depth > MAX_DEPTH:
             return
         if depth > 0 and additional_pages >= MAX_ADDITIONAL_PAGES:
@@ -598,11 +635,6 @@ async def navigate_unit(
         if candidate is not None:
             if related_to_official(candidate.url, unit.site_base):
                 candidates.append(candidate)
-                # This phase discovers the stable listing surface.  Following
-                # item/detail/download links from an already evaluable surface
-                # adds no useful candidate and can make Playwright abort a
-                # whole unit (for example when navigation starts a PDF download).
-                return
 
         if depth >= MAX_DEPTH:
             return
@@ -639,7 +671,19 @@ async def navigate_unit(
                 href=href,
                 exact_text=link.text,
             )
-            await explore(href, depth + 1, current_path, state.url, link.text)
+            try:
+                await explore(href, depth + 1, current_path, state.url, link.text)
+            except Exception as exc:
+                stage = failure_stage
+                discarded = discardable_branch_failure(href, exc)
+                detail = record_navigation_failure(
+                    exc,
+                    requested_url=href,
+                    stage=stage,
+                    discarded=discarded,
+                )
+                if not discarded and incomplete_failure is None:
+                    incomplete_failure = (stage, detail)
 
     try:
         await explore(unit.site_base, 0, [], None, None)
@@ -647,6 +691,18 @@ async def navigate_unit(
             return NavigationOutcome(
                 result="REVISAR",
                 reason="REVISION_HUMANA_ACCESO_RESTRINGIDO",
+                final_path=[],
+                explored=explored,
+                snapshots=snapshots,
+                citations=[],
+                interaction_count=interaction_count,
+                additional_pages=additional_pages,
+            )
+        if incomplete_failure is not None:
+            stage, detail = incomplete_failure
+            return NavigationOutcome(
+                result="REVISAR",
+                reason=f"exploracion_incompleta:{stage}:{detail}",
                 final_path=[],
                 explored=explored,
                 snapshots=snapshots,
@@ -683,40 +739,14 @@ async def navigate_unit(
             municipio=unit.municipio,
             bucket=unit.bucket,
             stage=failure_stage,
+            failure_stage=failure_stage,
             error_type=type(exc).__name__,
             message=detail,
             detail=detail,
         )
-        selected, selection_reason = choose_candidate(candidates)
-        if selected is not None:
-            audit.record(
-                "unit_navigation_recovered",
-                municipio=unit.municipio,
-                bucket=unit.bucket,
-                stage=failure_stage,
-                detail=detail,
-                selected_url=selected.url,
-            )
-            return NavigationOutcome(
-                result=selected.url,
-                reason=None,
-                final_path=selected.path,
-                explored=explored,
-                snapshots=snapshots,
-                citations=selected.quotes,
-                interaction_count=interaction_count,
-                additional_pages=additional_pages,
-            )
-        if candidates:
-            reason = (
-                f"error_estado_con_superficie_candidata:{failure_stage}:{detail}; "
-                f"seleccion:{selection_reason}"
-            )
-        else:
-            reason = f"error_navegacion:{failure_stage}:{detail}"
         return NavigationOutcome(
             result="REVISAR",
-            reason=reason,
+            reason=f"error_navegacion:{failure_stage}:{detail}",
             final_path=[],
             explored=explored,
             snapshots=snapshots,
